@@ -173,15 +173,7 @@ The dashboard is available at `http://localhost:7913/` — shows projects, messa
 
 #### Systemd (Linux)
 
-A unit file is included in each release archive:
-
-```bash
-sudo cp claude-mail-gateway.service /etc/systemd/system/
-sudo mkdir -p /etc/claude-mail
-sudo cp crates/gateway/.env.example /etc/claude-mail/gateway.env
-# edit /etc/claude-mail/gateway.env with your values
-sudo systemctl enable --now claude-mail-gateway
-```
+For a full production setup on Linux (dedicated service user, hardened unit file, journald logging) see **[docs/gateway-setup.md](docs/gateway-setup.md)**.
 
 ---
 
