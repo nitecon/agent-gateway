@@ -231,7 +231,6 @@ pub struct ProjectStats {
     pub ident: String,
     pub channel_name: String,
     pub room_id: String,
-    pub created_at: i64,
     pub total_messages: i64,
     pub unread_count: i64,
 }
@@ -261,7 +260,7 @@ pub fn get_dashboard_data(conn: &Connection) -> Result<DashboardData> {
     )?;
 
     let mut stmt = conn.prepare_cached(
-        "SELECT p.ident, p.channel_name, p.room_id, p.created_at,
+        "SELECT p.ident, p.channel_name, p.room_id,
                 COUNT(m.id),
                 (SELECT COUNT(*) FROM messages m2
                  WHERE m2.project_ident = p.ident
@@ -279,9 +278,8 @@ pub fn get_dashboard_data(conn: &Connection) -> Result<DashboardData> {
                 ident: r.get(0)?,
                 channel_name: r.get(1)?,
                 room_id: r.get(2)?,
-                created_at: r.get(3)?,
-                total_messages: r.get(4)?,
-                unread_count: r.get(5)?,
+                total_messages: r.get(3)?,
+                unread_count: r.get(4)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

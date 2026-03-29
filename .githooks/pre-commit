@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# claude-mail pre-commit hook
+# Automatically formats staged Rust files and runs Clippy before every commit.
+# Install with: git config core.hooksPath .githooks
+set -e
+
+# ── 1. Auto-format ────────────────────────────────────────────────────────────
+echo "▶ cargo fmt"
+cargo fmt --all
+
+# Re-add any Rust files that were already staged (fmt may have changed them).
+STAGED_RS=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.rs$' || true)
+if [ -n "$STAGED_RS" ]; then
+    echo "$STAGED_RS" | xargs git add
+fi
+
+# ── 2. Lint ───────────────────────────────────────────────────────────────────
+echo "▶ cargo clippy"
+cargo clippy --workspace --all-targets -- -D warnings
+
+echo "✓ Pre-commit checks passed"

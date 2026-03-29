@@ -10,7 +10,7 @@ pub fn sanitize_ident(raw: &str) -> String {
 
     // 2. Take the last path segment (handle both '/' and '\')
     let basename = trimmed
-        .rsplit(|c| c == '/' || c == '\\')
+        .rsplit(['/', '\\'])
         .find(|s| !s.is_empty())
         .unwrap_or(trimmed);
 

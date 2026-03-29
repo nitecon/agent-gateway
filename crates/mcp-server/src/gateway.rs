@@ -1,3 +1,7 @@
+// Response structs mirror the full server schema; not every field is consumed by
+// the current tool set, but they should be kept for completeness / future use.
+#![allow(dead_code)]
+
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};

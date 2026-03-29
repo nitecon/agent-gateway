@@ -27,14 +27,14 @@ jobs:
             target: aarch64-unknown-linux-gnu
             cargo: cross
 
-          # macOS Intel — native on macos-13 runner
-          - os: macos-13
-            target: x86_64-apple-darwin
-            cargo: cargo
-
           # macOS Apple Silicon — native on ARM runner
           - os: macos-latest
             target: aarch64-apple-darwin
+            cargo: cargo
+
+          # macOS Intel — cross-compiled on ARM runner (same macOS SDK supports both arches)
+          - os: macos-latest
+            target: x86_64-apple-darwin
             cargo: cargo
 
           # Windows x86_64 — native
@@ -43,7 +43,7 @@ jobs:
             cargo: cargo
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
