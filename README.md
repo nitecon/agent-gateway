@@ -51,23 +51,28 @@ Each release ships archives for all major platforms. Each archive contains three
 - `claude-mail-gateway` — Gateway service
 - `claude-mail-skills` — Skills management CLI
 
-**Linux / macOS**
+**Linux x86_64**
 
 ```bash
-# Get the latest release tag
-VERSION=$(curl -fsSL https://api.github.com/repos/nitecon/claude-mail/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
+VERSION=$(curl -fsSL https://api.github.com/repos/nitecon/claude-mail/releases/latest | grep '"tag_name"' | cut -d'"' -f4) && curl -fsSL "https://github.com/nitecon/claude-mail/releases/download/${VERSION}/claude-mail-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" | tar xz --strip-components=1
+```
 
-# Linux x86_64
-curl -fsSL "https://github.com/nitecon/claude-mail/releases/download/${VERSION}/claude-mail-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" | tar xz --strip-components=1
+**Linux ARM64**
 
-# Linux ARM64
-curl -fsSL "https://github.com/nitecon/claude-mail/releases/download/${VERSION}/claude-mail-${VERSION}-aarch64-unknown-linux-gnu.tar.gz" | tar xz --strip-components=1
+```bash
+VERSION=$(curl -fsSL https://api.github.com/repos/nitecon/claude-mail/releases/latest | grep '"tag_name"' | cut -d'"' -f4) && curl -fsSL "https://github.com/nitecon/claude-mail/releases/download/${VERSION}/claude-mail-${VERSION}-aarch64-unknown-linux-gnu.tar.gz" | tar xz --strip-components=1
+```
 
-# macOS Apple Silicon
-curl -fsSL "https://github.com/nitecon/claude-mail/releases/download/${VERSION}/claude-mail-${VERSION}-aarch64-apple-darwin.tar.gz" | tar xz --strip-components=1
+**macOS Apple Silicon**
 
-# macOS Intel
-curl -fsSL "https://github.com/nitecon/claude-mail/releases/download/${VERSION}/claude-mail-${VERSION}-x86_64-apple-darwin.tar.gz" | tar xz --strip-components=1
+```bash
+VERSION=$(curl -fsSL https://api.github.com/repos/nitecon/claude-mail/releases/latest | grep '"tag_name"' | cut -d'"' -f4) && curl -fsSL "https://github.com/nitecon/claude-mail/releases/download/${VERSION}/claude-mail-${VERSION}-aarch64-apple-darwin.tar.gz" | tar xz --strip-components=1
+```
+
+**macOS Intel**
+
+```bash
+VERSION=$(curl -fsSL https://api.github.com/repos/nitecon/claude-mail/releases/latest | grep '"tag_name"' | cut -d'"' -f4) && curl -fsSL "https://github.com/nitecon/claude-mail/releases/download/${VERSION}/claude-mail-${VERSION}-x86_64-apple-darwin.tar.gz" | tar xz --strip-components=1
 ```
 
 **Windows (PowerShell)**
