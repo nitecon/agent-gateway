@@ -136,7 +136,17 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "7913".into())
         .parse()
         .context("GATEWAY_PORT must be a u16")?;
-    let db_path = std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/claude-mail.db".into());
+    let db_path = std::env::var("DATABASE_PATH").unwrap_or_else(|_| {
+        dirs::home_dir()
+            .map(|h| {
+                h.join(".claude")
+                    .join("claude-mail")
+                    .join("claude-mail.db")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_else(|| "./data/claude-mail.db".into())
+    });
     let retention_days: u64 = std::env::var("MESSAGE_RETENTION_DAYS")
         .unwrap_or_else(|_| "30".into())
         .parse()
