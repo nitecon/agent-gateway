@@ -1,0 +1,14 @@
+# Force LF line endings for all text files — no exceptions.
+* text=auto eol=lf
+
+# Explicitly mark binary formats so Git never touches their bytes.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.gz binary
+*.zip binary
+*.tar binary
+*.exe binary
+*.dll binary
