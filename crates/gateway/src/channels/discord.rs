@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use serenity::{
     all::{
         ChannelId, ChannelType, Context as SerenityCtx, CreateChannel, CreateMessage, EventHandler,
-        GatewayIntents, GetMessages, GuildChannel, GuildId, Message, MessageId, Ready,
+        GatewayIntents, GetMessages, GuildChannel, GuildId, Message, MessageId, Ready, UserId,
     },
     Client,
 };
@@ -86,6 +86,8 @@ impl ChannelPlugin for DiscordPlugin {
         let handler = DiscordHandler {
             rooms: std::sync::Arc::new(Mutex::new(rooms_snapshot)),
             tx,
+            guild_id: self.config.guild_id,
+            bot_id: OnceLock::new(),
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES
@@ -191,24 +193,28 @@ struct DiscordHandler {
     /// Local copy of the room map for this gateway session.
     rooms: std::sync::Arc<Mutex<HashMap<u64, Option<String>>>>,
     tx: mpsc::Sender<PluginEvent>,
+    guild_id: u64,
+    bot_id: OnceLock<UserId>,
 }
 
 #[async_trait]
 impl EventHandler for DiscordHandler {
     async fn ready(&self, ctx: SerenityCtx, ready: Ready) {
+        let _ = self.bot_id.set(ready.user.id);
         info!("Discord bot connected as {}", ready.user.name);
 
         // Clone room map before any await so we never hold the guard across one.
         let rooms: Vec<(u64, Option<String>)> =
             self.rooms.lock().unwrap().clone().into_iter().collect();
 
-        for (channel_id, last_msg_id) in rooms {
+        // ── Backfill missed messages ──────────────────────────────────────────
+        for (channel_id, last_msg_id) in &rooms {
             let after = match last_msg_id.as_deref().and_then(|s| s.parse::<u64>().ok()) {
                 Some(id) => id,
                 None => continue,
             };
 
-            let ch = ChannelId::new(channel_id);
+            let ch = ChannelId::new(*channel_id);
             match ch
                 .messages(
                     &ctx.http,
@@ -235,9 +241,47 @@ impl EventHandler for DiscordHandler {
                 Err(e) => warn!("backfill error for channel {channel_id}: {e}"),
             }
         }
+
+        // ── Online announcement ───────────────────────────────────────────────
+        let online_msg = "🟢 **claude-mail gateway** is online.";
+        let known_ids: Vec<u64> = rooms.iter().map(|(id, _)| *id).collect();
+
+        // Post to every registered project channel.
+        for channel_id in &known_ids {
+            let ch = ChannelId::new(*channel_id);
+            if let Err(e) = ch
+                .send_message(&ctx.http, CreateMessage::new().content(online_msg))
+                .await
+            {
+                warn!("online announcement failed for channel {channel_id}: {e}");
+            }
+        }
+
+        // Also post to #general if it exists and isn't already a project room.
+        let guild = GuildId::new(self.guild_id);
+        match guild.channels(&ctx.http).await {
+            Ok(channels) => {
+                if let Some(general) = channels
+                    .values()
+                    .find(|c| c.name == "general" && c.kind == ChannelType::Text)
+                {
+                    let general_id = general.id.get();
+                    if !known_ids.contains(&general_id) {
+                        if let Err(e) = general
+                            .id
+                            .send_message(&ctx.http, CreateMessage::new().content(online_msg))
+                            .await
+                        {
+                            warn!("online announcement failed for #general: {e}");
+                        }
+                    }
+                }
+            }
+            Err(e) => warn!("could not fetch guild channels for online announcement: {e}"),
+        }
     }
 
-    async fn message(&self, _ctx: SerenityCtx, msg: Message) {
+    async fn message(&self, ctx: SerenityCtx, msg: Message) {
         if msg.author.bot {
             return;
         }
@@ -247,6 +291,26 @@ impl EventHandler for DiscordHandler {
         // Drop the guard before any await.
         let is_known = self.rooms.lock().unwrap().contains_key(&channel_id);
         if !is_known {
+            // If the bot is @mentioned in a non-project channel, tell the user.
+            let bot_mentioned = self
+                .bot_id
+                .get()
+                .map(|id| msg.mentions.iter().any(|u| u.id == *id))
+                .unwrap_or(false);
+            if bot_mentioned {
+                if let Err(e) = msg
+                    .channel_id
+                    .send_message(
+                        &ctx.http,
+                        CreateMessage::new().content(
+                            "This is not a project channel — I don't forward mail here.",
+                        ),
+                    )
+                    .await
+                {
+                    warn!("failed to send non-project reply: {e}");
+                }
+            }
             return;
         }
 
