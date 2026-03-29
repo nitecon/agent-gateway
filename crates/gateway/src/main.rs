@@ -124,7 +124,7 @@ async fn main() -> Result<()> {
         std::env::var("DEFAULT_CHANNEL").unwrap_or_else(|_| "discord".into());
     let host = std::env::var("GATEWAY_HOST").unwrap_or_else(|_| "0.0.0.0".into());
     let port: u16 = std::env::var("GATEWAY_PORT")
-        .unwrap_or_else(|_| "3000".into())
+        .unwrap_or_else(|_| "7913".into())
         .parse()
         .context("GATEWAY_PORT must be a u16")?;
     let db_path =
@@ -228,14 +228,20 @@ async fn main() -> Result<()> {
         api_key,
     };
 
-    let app = Router::new()
+    // API routes require bearer auth.
+    let api = Router::new()
         .route("/v1/projects", post(routes::register_project))
         .route("/v1/projects/{ident}/messages", post(routes::send_message))
         .route(
             "/v1/projects/{ident}/messages/unread",
             get(routes::get_unread_messages),
         )
-        .layer(middleware::from_fn_with_state(state.clone(), bearer_auth))
+        .layer(middleware::from_fn_with_state(state.clone(), bearer_auth));
+
+    // Dashboard at / is public (local admin page, no auth required).
+    let app = Router::new()
+        .route("/", get(routes::dashboard))
+        .merge(api)
         .with_state(state);
 
     let addr: SocketAddr = format!("{host}:{port}")
