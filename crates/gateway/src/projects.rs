@@ -81,8 +81,8 @@ mod tests {
 
     #[test]
     fn replaces_invalid_chars() {
-        assert_eq!(sanitize_ident("My Project!"), "my-project-");
-        // trailing hyphen stripped
+        // trailing '!' becomes '-', which is then stripped by step 6
+        assert_eq!(sanitize_ident("My Project!"), "my-project");
         assert_eq!(sanitize_ident("hello world"), "hello-world");
     }
 
