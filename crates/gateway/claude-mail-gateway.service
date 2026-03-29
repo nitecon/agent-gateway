@@ -1,0 +1,33 @@
+[Unit]
+Description=claude-mail Gateway
+Documentation=https://github.com/your-org/claude-mail
+After=network.target
+
+[Service]
+Type=simple
+User=claude-mail
+Group=claude-mail
+
+# Secrets and config live in /etc/claude-mail/gateway.env (not world-readable).
+# Copy crates/gateway/.env.example to /etc/claude-mail/gateway.env and fill in values.
+EnvironmentFile=/etc/claude-mail/gateway.env
+
+ExecStart=/usr/local/bin/claude-mail-gateway
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+# Logging goes to the system journal: journalctl -u claude-mail-gateway -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=claude-mail-gateway
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/claude-mail
+
+[Install]
+WantedBy=multi-user.target

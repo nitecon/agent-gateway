@@ -224,3 +224,73 @@ pub fn now_ms() -> i64 {
         .unwrap_or_default()
         .as_millis() as i64
 }
+
+// ── Dashboard ─────────────────────────────────────────────────────────────────
+
+pub struct ProjectStats {
+    pub ident: String,
+    pub channel_name: String,
+    pub room_id: String,
+    pub created_at: i64,
+    pub total_messages: i64,
+    pub unread_count: i64,
+}
+
+pub struct DashboardData {
+    pub project_count: i64,
+    pub total_messages: i64,
+    pub agent_messages: i64,
+    pub user_messages: i64,
+    pub projects: Vec<ProjectStats>,
+}
+
+pub fn get_dashboard_data(conn: &Connection) -> Result<DashboardData> {
+    let project_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))?;
+    let total_messages: i64 =
+        conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?;
+    let agent_messages: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM messages WHERE source='agent'",
+        [],
+        |r| r.get(0),
+    )?;
+    let user_messages: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM messages WHERE source='user'",
+        [],
+        |r| r.get(0),
+    )?;
+
+    let mut stmt = conn.prepare_cached(
+        "SELECT p.ident, p.channel_name, p.room_id, p.created_at,
+                COUNT(m.id),
+                (SELECT COUNT(*) FROM messages m2
+                 WHERE m2.project_ident = p.ident
+                   AND m2.id > COALESCE(
+                         (SELECT last_read_id FROM cursors WHERE project_ident = p.ident), 0)
+                   AND m2.source = 'user')
+         FROM projects p
+         LEFT JOIN messages m ON m.project_ident = p.ident
+         GROUP BY p.ident
+         ORDER BY p.created_at DESC",
+    )?;
+    let projects = stmt
+        .query_map([], |r| {
+            Ok(ProjectStats {
+                ident: r.get(0)?,
+                channel_name: r.get(1)?,
+                room_id: r.get(2)?,
+                created_at: r.get(3)?,
+                total_messages: r.get(4)?,
+                unread_count: r.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(DashboardData {
+        project_count,
+        total_messages,
+        agent_messages,
+        user_messages,
+        projects,
+    })
+}

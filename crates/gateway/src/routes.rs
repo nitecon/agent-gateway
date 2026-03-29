@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -162,6 +162,106 @@ pub async fn send_message(
         message_id: row_id,
         external_message_id: external_id,
     }))
+}
+
+// ── GET / (dashboard) ─────────────────────────────────────────────────────────
+
+fn he(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
+    let db = state.db.clone();
+    let data = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::get_dashboard_data(&conn)
+    })
+    .await??;
+
+    let rows = data
+        .projects
+        .iter()
+        .map(|p| {
+            let unread_cell = if p.unread_count > 0 {
+                format!("<span style='color:#e53e3e;font-weight:600'>{}</span>", p.unread_count)
+            } else {
+                "0".into()
+            };
+            format!(
+                "<tr><td>{}</td><td>{}</td><td class='muted'>{}</td><td>{}</td><td>{}</td></tr>",
+                he(&p.ident),
+                he(&p.channel_name),
+                he(&p.room_id),
+                p.total_messages,
+                unread_cell,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let empty_row = if data.project_count == 0 {
+        "<tr><td colspan='5' style='text-align:center;color:#a0aec0;padding:2rem'>No projects registered yet</td></tr>"
+    } else {
+        ""
+    };
+
+    let html = format!(
+        r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>claude-mail Gateway</title>
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{font-family:system-ui,sans-serif;background:#f7fafc;color:#1a202c;padding:2rem 1rem}}
+  .wrap{{max-width:960px;margin:0 auto}}
+  header{{margin-bottom:1.5rem}}
+  h1{{font-size:1.4rem;font-weight:700}}
+  .sub{{color:#718096;font-size:0.9rem;margin-top:0.2rem}}
+  .stats{{display:flex;flex-wrap:wrap;gap:1rem;margin:1.5rem 0}}
+  .card{{background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:1rem 1.5rem;min-width:140px}}
+  .card-n{{font-size:2rem;font-weight:700;line-height:1.1}}
+  .card-l{{font-size:0.75rem;color:#718096;text-transform:uppercase;letter-spacing:0.05em;margin-top:0.3rem}}
+  .section{{background:#fff;border:1px solid #e2e8f0;border-radius:8px;overflow:hidden}}
+  .section-head{{padding:0.75rem 1rem;border-bottom:1px solid #e2e8f0;font-size:0.8rem;font-weight:600;color:#4a5568;text-transform:uppercase;letter-spacing:0.05em}}
+  table{{width:100%;border-collapse:collapse}}
+  th{{text-align:left;padding:0.6rem 1rem;font-size:0.78rem;font-weight:600;color:#4a5568;text-transform:uppercase;letter-spacing:0.04em;background:#f7fafc;border-bottom:1px solid #e2e8f0}}
+  td{{padding:0.65rem 1rem;font-size:0.88rem;border-bottom:1px solid #edf2f7}}
+  tr:last-child td{{border-bottom:none}}
+  tr:hover td{{background:#f7fafc}}
+  .muted{{color:#718096;font-size:0.8rem}}
+</style></head>
+<body><div class="wrap">
+<header>
+  <h1>claude-mail Gateway</h1>
+  <div class="sub">Channel plugin dashboard</div>
+</header>
+<div class="stats">
+  <div class="card"><div class="card-n">{}</div><div class="card-l">Projects</div></div>
+  <div class="card"><div class="card-n">{}</div><div class="card-l">Total messages</div></div>
+  <div class="card"><div class="card-n">{}</div><div class="card-l">Agent</div></div>
+  <div class="card"><div class="card-n">{}</div><div class="card-l">User</div></div>
+</div>
+<div class="section">
+  <div class="section-head">Projects</div>
+  <table>
+  <thead><tr>
+    <th>Project</th><th>Channel</th><th>Room ID</th><th>Messages</th><th>Unread</th>
+  </tr></thead>
+  <tbody>{}{}</tbody>
+  </table>
+</div>
+</div></body></html>"#,
+        data.project_count,
+        data.total_messages,
+        data.agent_messages,
+        data.user_messages,
+        rows,
+        empty_row,
+    );
+
+    Ok(Html(html))
 }
 
 // ── GET /v1/projects/:ident/messages/unread ───────────────────────────────────

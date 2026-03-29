@@ -1,0 +1,126 @@
+name: Release Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 — native
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            cargo: cargo
+
+          # Linux ARM64 — cross-compiled via Docker
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cargo: cross
+
+          # macOS Intel — native on macos-13 runner
+          - os: macos-13
+            target: x86_64-apple-darwin
+            cargo: cargo
+
+          # macOS Apple Silicon — native on ARM runner
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            cargo: cargo
+
+          # Windows x86_64 — native
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cargo: cargo
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross (ARM Linux only)
+        if: matrix.cargo == 'cross'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build workspace
+        run: ${{ matrix.cargo }} build --release --workspace --target ${{ matrix.target }}
+
+      # ── Unix packaging (tar.gz) ────────────────────────────────────────────
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          REF="${{ github.ref_name }}"
+          STAGING="claude-mail-${REF}-${{ matrix.target }}"
+          mkdir "$STAGING"
+
+          # Binaries
+          cp "target/${{ matrix.target }}/release/claude-mail" "$STAGING/claude-mail"
+          cp "target/${{ matrix.target }}/release/gateway"     "$STAGING/claude-mail-gateway"
+
+          # Extras
+          cp crates/gateway/claude-mail-gateway.service "$STAGING/"
+
+          tar czf "${STAGING}.tar.gz" "$STAGING"
+          echo "ASSET=${STAGING}.tar.gz" >> "$GITHUB_ENV"
+
+      # ── Windows packaging (zip) ────────────────────────────────────────────
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ref = "${{ github.ref_name }}"
+          $staging = "claude-mail-${ref}-${{ matrix.target }}"
+          New-Item -ItemType Directory $staging | Out-Null
+
+          Copy-Item "target/${{ matrix.target }}/release/claude-mail.exe"  "$staging/claude-mail.exe"
+          Copy-Item "target/${{ matrix.target }}/release/gateway.exe"       "$staging/claude-mail-gateway.exe"
+
+          Compress-Archive -Path $staging -DestinationPath "${staging}.zip"
+          echo "ASSET=${staging}.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ASSET }}
+
+  # ── Create GitHub Release (tag pushes only) ────────────────────────────────
+  release:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
