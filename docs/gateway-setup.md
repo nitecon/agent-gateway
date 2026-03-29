@@ -6,13 +6,57 @@ To set up claude-mail on linux we first have to create the user for the service 
 
 ```bash
 useradd -m -d /etc/cmail --shell /bin/false cmail
-mkdir -p /etc/cmail && vim /etc/cmail/gateway.env
+mkdir -p /etc/cmail
 chown -R cmail:cmail /etc/cmail
 mkdir -p /var/lib/claude-mail
 chown -R cmail:cmail /var/lib/claude-mail
 ```
 
 As seen above we also create the var lib directory for app storage.
+
+## Configure the environment file
+
+Create `/etc/cmail/gateway.env` and fill in your values:
+
+```bash
+sudo vim /etc/cmail/gateway.env
+```
+
+Paste and edit the following (a full reference is also at `.env.example` in the repository root):
+
+```ini
+# Discord bot token from https://discord.com/developers/applications
+DISCORD_BOT_TOKEN=
+
+# The Guild (server) ID where project channels will be created
+DISCORD_GUILD_ID=
+
+# Optional: category channel ID to group project channels under
+DISCORD_CATEGORY_ID=
+
+# Shared secret — MCP clients must send this in Authorization: Bearer <key>
+GATEWAY_API_KEY=your-secret-key-here
+
+# HTTP listen config
+GATEWAY_HOST=0.0.0.0
+GATEWAY_PORT=7913
+
+# SQLite database path
+DATABASE_PATH=/var/lib/claude-mail/claude-mail.db
+
+# Delete messages older than N days that are behind the read cursor
+MESSAGE_RETENTION_DAYS=30
+
+# Log level: error | warn | info | debug | trace
+RUST_LOG=info
+```
+
+Restrict permissions so only the service user can read it:
+
+```bash
+sudo chown cmail:cmail /etc/cmail/gateway.env
+sudo chmod 640 /etc/cmail/gateway.env
+```
 
 ## Copy the downloaded binaries
 
