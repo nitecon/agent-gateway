@@ -10,8 +10,8 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
-    name = "claude-mail-skills",
-    about = "Manage shared Claude Code skills on the gateway"
+    name = "sync",
+    about = "Sync shared Claude Code skills and data with the gateway"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -130,11 +130,11 @@ fn require_client(
     timeout_ms: u64,
 ) -> Result<SkillsClient> {
     let url = url.unwrap_or_else(|| {
-        eprintln!("Missing --url / GATEWAY_URL (run `claude-mail init` to configure)");
+        eprintln!("Missing --url / GATEWAY_URL (run `agent-comms init` to configure)");
         std::process::exit(1);
     });
     let api_key = api_key.unwrap_or_else(|| {
-        eprintln!("Missing --api-key / GATEWAY_API_KEY (run `claude-mail init` to configure)");
+        eprintln!("Missing --api-key / GATEWAY_API_KEY (run `agent-comms init` to configure)");
         std::process::exit(1);
     });
     SkillsClient::new(url, api_key, timeout_ms)
@@ -531,8 +531,8 @@ async fn cmd_sync(client: &SkillsClient, dir: PathBuf) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Config loading: ~/.claude/claude-mail.conf → .env → env vars → CLI flags.
-    let conf_path = home_dir().join(".claude").join("claude-mail.conf");
+    // Config loading: ~/.claude/agent-comms.conf → .env → env vars → CLI flags.
+    let conf_path = home_dir().join(".claude").join("agent-comms.conf");
     let _ = dotenvy::from_path(&conf_path);
     let _ = dotenvy::dotenv();
 
@@ -550,8 +550,8 @@ async fn main() -> Result<()> {
                 println!("Already up to date (v{}).", current);
             }
             Some(version) => {
-                println!("Updating claude-mail-skills {} -> {}...", current, version);
-                updater::perform_update(&http, &version, "claude-mail-skills").await?;
+                println!("Updating sync {} -> {}...", current, version);
+                updater::perform_update(&http, &version, "sync").await?;
             }
         }
         return Ok(());

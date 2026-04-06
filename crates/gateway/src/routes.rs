@@ -29,7 +29,7 @@ impl IntoResponse for AppError {
 impl<E: Into<anyhow::Error>> From<E> for AppError {
     fn from(e: E) -> Self {
         let err = e.into();
-        AppError(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+        AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}"))
     }
 }
 
@@ -615,6 +615,23 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
     })
     .await??;
 
+    // Build the update banner if a newer version is available.
+    let current_version = env!("CARGO_PKG_VERSION");
+    let update_banner = {
+        let guard = state.update_available.lock().unwrap();
+        match guard.as_deref() {
+            Some(version) => format!(
+                r#"<div style="background:#fefcbf;border:1px solid #ecc94b;border-radius:8px;padding:0.75rem 1rem;margin-bottom:1.5rem;color:#744210;font-size:0.9rem">
+  <strong>Update available:</strong> {} (current: v{})
+  <div style="margin-top:0.3rem;font-size:0.82rem;color:#975a16">Run: <code style="background:#fefce8;padding:0.15rem 0.4rem;border-radius:4px">gateway update</code></div>
+</div>"#,
+                he(version),
+                he(current_version),
+            ),
+            None => String::new(),
+        }
+    };
+
     let rows = data
         .projects
         .iter()
@@ -648,7 +665,7 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
     let html = format!(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>claude-mail Gateway</title>
+<title>agent-comms Gateway</title>
 <style>
   *{{box-sizing:border-box;margin:0;padding:0}}
   body{{font-family:system-ui,sans-serif;background:#f7fafc;color:#1a202c;padding:2rem 1rem}}
@@ -670,8 +687,9 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
   .muted{{color:#718096;font-size:0.8rem}}
 </style></head>
 <body><div class="wrap">
+{}
 <header>
-  <h1>claude-mail Gateway</h1>
+  <h1>agent-comms Gateway</h1>
   <div class="sub">Channel plugin dashboard</div>
 </header>
 <div class="stats">
@@ -691,6 +709,7 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
   </table>
 </div>
 </div></body></html>"#,
+        update_banner,
         data.project_count,
         data.total_messages,
         data.agent_messages,

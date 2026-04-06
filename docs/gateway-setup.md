@@ -1,23 +1,27 @@
 # Gateway Setup (Linux)
 
-## Setup
+## Install
 
-To set up claude-mail on linux we first have to create the user for the service to run as use the following:
+The install script downloads the latest release and places the gateway binary in `/opt/agentic/bin/`:
 
 ```bash
-sudo useradd --system --no-create-home --shell /bin/false cmail
-sudo mkdir -p /etc/cmail /var/lib/claude-mail
-sudo chown -R cmail:cmail /etc/cmail /var/lib/claude-mail
+curl -fsSL https://raw.githubusercontent.com/nitecon/agent-comms/main/install-gateway.sh | sudo bash
 ```
 
-As seen above we also create the var lib directory for app storage.
+## Create the service user and directories
+
+```bash
+sudo useradd --system --no-create-home --shell /bin/false agent-comms
+sudo mkdir -p /etc/agent-comms /var/lib/agent-comms
+sudo chown -R agent-comms:agent-comms /etc/agent-comms /var/lib/agent-comms
+```
 
 ## Configure the environment file
 
-Create `/etc/cmail/gateway.env` and fill in your values:
+Create `/etc/agent-comms/gateway.env` and fill in your values:
 
 ```bash
-sudo vim /etc/cmail/gateway.env
+sudo vim /etc/agent-comms/gateway.env
 ```
 
 Paste and edit the following (a full reference is also at `.env.example` in the repository root):
@@ -40,7 +44,7 @@ GATEWAY_HOST=0.0.0.0
 GATEWAY_PORT=7913
 
 # SQLite database path
-DATABASE_PATH=/var/lib/claude-mail/claude-mail.db
+DATABASE_PATH=/var/lib/agent-comms/agent-comms.db
 
 # Delete messages older than N days that are behind the read cursor
 MESSAGE_RETENTION_DAYS=30
@@ -52,79 +56,69 @@ RUST_LOG=info
 Restrict permissions so only the service user can read it:
 
 ```bash
-sudo chown cmail:cmail /etc/cmail/gateway.env
-sudo chmod 640 /etc/cmail/gateway.env
+sudo chown agent-comms:agent-comms /etc/agent-comms/gateway.env
+sudo chmod 640 /etc/agent-comms/gateway.env
 ```
 
-## Copy the downloaded binaries
+## Systemd Setup
 
-Under the releases directory you will now need to download the latest release of claude-mail from the github repository like so:
+Create the service file:
 
 ```bash
-wget https://github.com/nitecon/claude-mail/releases/download/v0.1.1/claude-mail-v0.1.1-x86_64-unknown-linux-gnu.tar.gz
-tar xf claude-mail-v0.1.1-x86_64-unknown-linux-gnu.tar.gz
-sudo cp -f claude-mail-v0.1.1-x86_64-unknown-linux-gnu/claude-mail /usr/local/bin/
-sudo cp -f claude-mail-v0.1.1-x86_64-unknown-linux-gnu/claude-mail-gateway /usr/local/bin/
+sudo vim /etc/systemd/system/gateway.service
 ```
 
-## System-D Setup
-
-Now we have to setup the systemd service file with:
-
-```bash
-sudo vim /etc/systemd/system/claude-mail-gateway.service
-```
-
-Paste the following in to make sure we have a proper service file (adjust to handle your changes...)
+Paste the following:
 
 ```ini
 [Unit]
-Description=claude-mail Gateway
-Documentation=https://github.com/nitecon/claude-mail
+Description=agent-comms Gateway
+Documentation=https://github.com/nitecon/agent-comms
 After=network.target
 
 [Service]
 Type=simple
-User=cmail
-Group=cmail
+User=agent-comms
+Group=agent-comms
 
-EnvironmentFile=/etc/cmail/gateway.env
+EnvironmentFile=/etc/agent-comms/gateway.env
 
-ExecStart=/usr/local/bin/claude-mail-gateway
+ExecStartPre=/usr/local/bin/gateway update
+ExecStart=/usr/local/bin/gateway
 
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=10
 
-# Logging goes to the system journal: journalctl -u claude-mail-gateway -f
+# Logging goes to the system journal: journalctl -u gateway -f
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=claude-mail-gateway
+SyslogIdentifier=gateway
 
 # Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/claude-mail
+ReadWritePaths=/var/lib/agent-comms
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-## Configure systemd
+The `ExecStartPre` line runs `gateway update` before every start, which automatically downloads the latest binaries.
 
-Now we will reload and install it to restart on boot
+## Enable and start the service
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable claude-mail-gateway.service
-sudo systemctl restart claude-mail-gateway
+sudo systemctl enable gateway.service
+sudo systemctl start gateway
 ```
 
 ## Troubleshoot
 
-To validate it is working and to look at the logs run the following:
+To validate it is working and to look at the logs:
 
 ```bash
-journalctl -fu claude-mail-gateway
+journalctl -fu gateway
 ```

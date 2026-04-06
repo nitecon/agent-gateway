@@ -1,8 +1,8 @@
-# claude-mail
+# agent-comms
 
 Async communication between AI agents and humans via Discord, with cross-machine skill sharing.
 
-AI agents (Claude, Gemini, Codex, etc.) often run unattended for extended periods. claude-mail gives them a way to send you messages and check for your replies — without you needing to watch a terminal. Each project gets its own Discord channel, messages are persisted locally, and multiple agent sessions across different machines share the same channel.
+AI agents (Claude, Gemini, Codex, etc.) often run unattended for extended periods. agent-comms gives them a way to send you messages and check for your replies — without you needing to watch a terminal. Each project gets its own Discord channel, messages are persisted locally, and multiple agent sessions across different machines share the same channel.
 
 ## How it works
 
@@ -10,7 +10,7 @@ AI agents (Claude, Gemini, Codex, etc.) often run unattended for extended period
 AI Agent (Claude Code, etc.)
     │  MCP stdio protocol
     ▼
-claude-mail binary          ← installed per machine
+agent-comms binary          ← installed per machine
     │  HTTP + Bearer token
     ▼
 Gateway service             ← one persistent service on your network
@@ -33,70 +33,50 @@ Multiple machines running agents on the same project share the same channel and 
 ## Project layout
 
 ```
-claude-mail/
+agent-comms/
 ├── crates/
 │   ├── gateway/        # Persistent HTTP service + Discord bot
 │   ├── mcp-server/     # stdio MCP server (installed per machine)
-│   └── skills-cli/     # CLI for pushing/pulling shared skills
+│   └── sync-cli/       # CLI for pushing/pulling shared skills
 ```
 
 ---
 
 ## Installation
 
-### Pre-built binaries
+### Install scripts (recommended)
 
-Each release ships archives for all major platforms. Each archive contains three binaries:
-- `claude-mail` — MCP server (per-machine)
-- `claude-mail-gateway` — Gateway service
-- `claude-mail-skills` — Skills management CLI
+The install scripts automatically detect your platform, download the latest release, and place the binaries in `/opt/agentic/bin/`.
 
-**Linux x86_64**
+**Linux / macOS**
 
 ```bash
-VERSION=$(curl -fsSL https://api.github.com/repos/nitecon/claude-mail/releases/latest | grep '"tag_name"' | cut -d'"' -f4) && curl -fsSL "https://github.com/nitecon/claude-mail/releases/download/${VERSION}/claude-mail-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" | tar xz --strip-components=1
-```
-
-**Linux ARM64**
-
-```bash
-VERSION=$(curl -fsSL https://api.github.com/repos/nitecon/claude-mail/releases/latest | grep '"tag_name"' | cut -d'"' -f4) && curl -fsSL "https://github.com/nitecon/claude-mail/releases/download/${VERSION}/claude-mail-${VERSION}-aarch64-unknown-linux-gnu.tar.gz" | tar xz --strip-components=1
-```
-
-**macOS Apple Silicon**
-
-```bash
-VERSION=$(curl -fsSL https://api.github.com/repos/nitecon/claude-mail/releases/latest | grep '"tag_name"' | cut -d'"' -f4) && curl -fsSL "https://github.com/nitecon/claude-mail/releases/download/${VERSION}/claude-mail-${VERSION}-aarch64-apple-darwin.tar.gz" | tar xz --strip-components=1
-```
-
-**macOS Intel**
-
-```bash
-VERSION=$(curl -fsSL https://api.github.com/repos/nitecon/claude-mail/releases/latest | grep '"tag_name"' | cut -d'"' -f4) && curl -fsSL "https://github.com/nitecon/claude-mail/releases/download/${VERSION}/claude-mail-${VERSION}-x86_64-apple-darwin.tar.gz" | tar xz --strip-components=1
+curl -fsSL https://raw.githubusercontent.com/nitecon/agent-comms/main/install.sh | sudo bash
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-$version = (Invoke-RestMethod https://api.github.com/repos/nitecon/claude-mail/releases/latest).tag_name
-Invoke-WebRequest -Uri "https://github.com/nitecon/claude-mail/releases/download/$version/claude-mail-$version-x86_64-pc-windows-msvc.zip" -OutFile "claude-mail-$version.zip"
-Expand-Archive -Path "claude-mail-$version.zip" -DestinationPath "." -Force
+irm https://raw.githubusercontent.com/nitecon/agent-comms/main/install.ps1 | iex
 ```
 
-Move the extracted binaries somewhere on your `PATH` (e.g. `/usr/local/bin` on Linux/macOS, or `C:\Tools` on Windows).
+This installs three binaries:
+- `agent-comms` — MCP server (per-machine)
+- `gateway` — Gateway service
+- `sync` — Skills management CLI
 
 ### Build from source
 
 ```bash
-git clone https://github.com/nitecon/claude-mail
-cd claude-mail
+git clone https://github.com/nitecon/agent-comms
+cd agent-comms
 cargo build --release
 ```
 
 Binaries:
 - `target/release/gateway`
-- `target/release/claude-mail`
-- `target/release/claude-mail-skills`
+- `target/release/agent-comms`
+- `target/release/sync`
 
 ---
 
@@ -150,7 +130,7 @@ DISCORD_CATEGORY_ID=                  # optional — leave blank for top-level c
 GATEWAY_API_KEY=choose-a-long-random-secret
 GATEWAY_HOST=0.0.0.0
 GATEWAY_PORT=7913
-DATABASE_PATH=./data/claude-mail.db
+DATABASE_PATH=./data/agent-comms.db
 MESSAGE_RETENTION_DAYS=30
 RUST_LOG=info
 ```
@@ -162,14 +142,14 @@ RUST_LOG=info
 ### 4. Start the gateway
 
 ```bash
-./claude-mail-gateway
+./gateway
 # or from source: cargo run --release -p gateway
 ```
 
 You should see:
 
 ```
-INFO gateway: SQLite database opened at ./data/claude-mail.db
+INFO gateway: SQLite database opened at ./data/agent-comms.db
 INFO gateway: Gateway listening on http://0.0.0.0:7913
 INFO gateway::discord: Discord bot connected as YourBotName#1234
 ```
@@ -187,18 +167,28 @@ For a full production setup on Linux (dedicated service user, hardened unit file
 On each machine where agents will run:
 
 ```bash
-claude-mail init
+agent-comms init
 ```
 
-This prompts for your gateway URL and API key, then writes `~/.claude/claude-mail.conf`.
+This prompts for your gateway URL and API key, then writes `~/.claude/agent-comms.conf`.
 
-To add claude-mail to Claude Code:
+To add agent-comms to Claude Code:
 
 ```bash
-claude mcp add claude-mail -- /path/to/claude-mail
-# or with an explicit URL override:
-claude mcp add claude-mail -- /path/to/claude-mail --url=http://your-gateway:7913
+claude mcp add agent-comms -- /opt/agentic/bin/agent-comms
 ```
+
+> **Note:** `agent-comms` is a **stdio MCP server** — Claude Code spawns it as a local subprocess and communicates over stdin/stdout. There is no HTTP SSE endpoint. The binary makes outbound HTTP calls to the gateway on your behalf.
+
+If you skipped `agent-comms init` or want to override the URL / key inline:
+
+```bash
+claude mcp add agent-comms -- /opt/agentic/bin/agent-comms \
+  --url=https://your-gateway.example.com \
+  --api-key=YOUR_GATEWAY_API_KEY
+```
+
+Behind a reverse proxy (nginx/Caddy/etc.) just use the HTTPS URL with no port — the binary will connect to it like any other HTTPS endpoint.
 
 ---
 
@@ -209,7 +199,7 @@ Add something like this to your project's `CLAUDE.md`:
 ```markdown
 ## Communication
 
-Use the `claude-mail` MCP server to stay in contact with the user.
+Use the `agent-comms` MCP server to stay in contact with the user.
 
 1. At the start of each session, call `set_identity` with the project identity.
    Use the git remote URL if available (e.g. `github.com/nitecon/bruce.git`),
@@ -240,31 +230,31 @@ Use the `claude-mail` MCP server to stay in contact with the user.
 
 ---
 
-## Skills CLI reference
+## Sync CLI reference
 
-`claude-mail-skills` manages shared Claude Code skills on the gateway. A skill is any directory containing a `SKILL.md` file.
+`sync` manages shared Claude Code skills on the gateway. A skill is any directory containing a `SKILL.md` file.
 
 ```bash
 # Upload a skill directory to the gateway
-claude-mail-skills push ~/.claude/skills/my-skill
+sync push ~/.claude/skills/my-skill
 
 # Download a skill from the gateway
-claude-mail-skills pull my-skill --to ~/.claude/skills
+sync pull my-skill --to ~/.claude/skills
 
 # List all skills on the gateway
-claude-mail-skills list
+sync list
 
 # Delete a skill from the gateway
-claude-mail-skills delete my-skill
+sync delete my-skill
 
 # Bidirectional sync: push new/changed local, pull new remote
-claude-mail-skills sync --dir ~/.claude/skills
+sync sync --dir ~/.claude/skills
 ```
 
-Configuration uses the same `~/.claude/claude-mail.conf` written by `claude-mail init`, or CLI flags:
+Configuration uses the same `~/.claude/agent-comms.conf` written by `agent-comms init`, or CLI flags:
 
 ```bash
-claude-mail-skills --url http://your-gateway:7913 --api-key <key> list
+sync --url http://your-gateway:7913 --api-key <key> list
 ```
 
 ---
@@ -305,7 +295,7 @@ Both instances share:
 - The same message history
 - The same read cursor (last `get_messages` call from either machine advances it for both)
 
-Skills on the gateway are also accessible from all machines — `claude-mail-skills sync` keeps every machine's skill set up to date.
+Skills on the gateway are also accessible from all machines — `sync sync` keeps every machine's skill set up to date.
 
 ---
 

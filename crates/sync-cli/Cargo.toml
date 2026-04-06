@@ -1,10 +1,10 @@
 [package]
-name = "skills-cli"
+name = "sync-cli"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "claude-mail-skills"
+name = "sync"
 path = "src/main.rs"
 
 [dependencies]

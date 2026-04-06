@@ -20,26 +20,31 @@ jobs:
           # Linux x86_64 — native
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            platform: linux-x86_64
             cargo: cargo
 
           # Linux ARM64 — cross-compiled via Docker
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
+            platform: linux-aarch64
             cargo: cross
 
           # macOS Apple Silicon — native on ARM runner
           - os: macos-latest
             target: aarch64-apple-darwin
+            platform: macos-aarch64
             cargo: cargo
 
           # macOS Intel — cross-compiled on ARM runner (same macOS SDK supports both arches)
           - os: macos-latest
             target: x86_64-apple-darwin
+            platform: macos-x86_64
             cargo: cargo
 
           # Windows x86_64 — native
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            platform: windows-x86_64
             cargo: cargo
 
     steps:
@@ -70,16 +75,16 @@ jobs:
         shell: bash
         run: |
           REF="${{ github.ref_name }}"
-          STAGING="claude-mail-${REF}-${{ matrix.target }}"
+          STAGING="agent-comms-${REF}-${{ matrix.platform }}"
           mkdir "$STAGING"
 
-          # Binaries
-          cp "target/${{ matrix.target }}/release/claude-mail" "$STAGING/claude-mail"
-          cp "target/${{ matrix.target }}/release/gateway"             "$STAGING/claude-mail-gateway"
-          cp "target/${{ matrix.target }}/release/claude-mail-skills" "$STAGING/claude-mail-skills"
+          # Binaries (new names from Cargo.toml)
+          cp "target/${{ matrix.target }}/release/agent-comms" "$STAGING/agent-comms"
+          cp "target/${{ matrix.target }}/release/gateway" "$STAGING/gateway"
+          cp "target/${{ matrix.target }}/release/sync" "$STAGING/sync"
 
           # Extras
-          cp crates/gateway/claude-mail-gateway.service "$STAGING/"
+          cp crates/gateway/gateway.service "$STAGING/"
 
           tar czf "${STAGING}.tar.gz" "$STAGING"
           echo "ASSET=${STAGING}.tar.gz" >> "$GITHUB_ENV"
@@ -90,12 +95,12 @@ jobs:
         shell: pwsh
         run: |
           $ref = "${{ github.ref_name }}"
-          $staging = "claude-mail-${ref}-${{ matrix.target }}"
+          $staging = "agent-comms-${ref}-${{ matrix.platform }}"
           New-Item -ItemType Directory $staging | Out-Null
 
-          Copy-Item "target/${{ matrix.target }}/release/claude-mail.exe"  "$staging/claude-mail.exe"
-          Copy-Item "target/${{ matrix.target }}/release/gateway.exe"             "$staging/claude-mail-gateway.exe"
-          Copy-Item "target/${{ matrix.target }}/release/claude-mail-skills.exe" "$staging/claude-mail-skills.exe"
+          Copy-Item "target/${{ matrix.target }}/release/agent-comms.exe" "$staging/agent-comms.exe"
+          Copy-Item "target/${{ matrix.target }}/release/gateway.exe" "$staging/gateway.exe"
+          Copy-Item "target/${{ matrix.target }}/release/sync.exe" "$staging/sync.exe"
 
           Compress-Archive -Path $staging -DestinationPath "${staging}.zip"
           echo "ASSET=${staging}.zip" | Out-File -FilePath $env:GITHUB_ENV -Append

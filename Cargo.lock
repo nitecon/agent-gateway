@@ -20,6 +20,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-comms"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dotenvy",
+ "hex",
+ "reqwest 0.13.2",
+ "rmcp",
+ "rpassword",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "updater",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -359,27 +380,6 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
-
-[[package]]
-name = "claude-mail"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "dotenvy",
- "hex",
- "reqwest 0.13.2",
- "rmcp",
- "rpassword",
- "schemars 0.8.22",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "updater",
-]
 
 [[package]]
 name = "cmake"
@@ -807,6 +807,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "clap",
  "dirs",
  "dotenvy",
  "hex",
@@ -2361,24 +2362,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
 
 [[package]]
-name = "skills-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "dotenvy",
- "hex",
- "reqwest 0.13.2",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "updater",
- "walkdir",
- "zip",
-]
-
-[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2439,6 +2422,24 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "sync-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dotenvy",
+ "hex",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "updater",
+ "walkdir",
+ "zip",
 ]
 
 [[package]]

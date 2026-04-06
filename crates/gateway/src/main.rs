@@ -13,12 +13,28 @@ use axum::{
     routing::{get, post, put},
     Router,
 };
+use clap::{Parser, Subcommand};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{sync::mpsc, task::spawn_blocking};
 use tracing::info;
 
 use channel::{ChannelPlugin, PluginEvent};
 use db::Db;
+
+// ── CLI ──────────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+#[command(name = "gateway", about = "agent-comms gateway server")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Check for a newer version and update all agent-comms binaries in place
+    Update,
+}
 
 // ── App state ─────────────────────────────────────────────────────────────────
 
@@ -28,6 +44,8 @@ pub struct AppState {
     pub plugins: Arc<HashMap<String, Arc<dyn ChannelPlugin>>>,
     pub default_channel: String,
     pub api_key: String,
+    /// Set by the background update checker when a newer release is available.
+    pub update_available: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
@@ -109,22 +127,64 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // ── Background update check (non-blocking) ────────────────────────────────
+    // ── CLI parsing ──────────────────────────────────────────────────────────
+    let cli = Cli::parse();
+
+    if let Some(Command::Update) = cli.command {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .context("build http client")?;
+        let current = env!("CARGO_PKG_VERSION");
+        match updater::check_update(&client, current).await? {
+            None => {
+                println!("Already up to date (v{}).", current);
+            }
+            Some(version) => {
+                println!("Updating agent-comms {} -> {}...", current, version);
+                let install_dir = std::path::Path::new("/opt/agentic/bin");
+                for bin_name in &["agent-comms", "gateway", "sync"] {
+                    let path = install_dir.join(bin_name);
+                    if path.exists() {
+                        match updater::perform_update_at(&client, &version, bin_name, &path).await {
+                            Ok(()) => println!("  Updated {}", bin_name),
+                            Err(e) => eprintln!("  Failed to update {}: {}", bin_name, e),
+                        }
+                    }
+                }
+                // Also self-update if not in /opt/agentic/bin
+                let current_exe = std::env::current_exe().unwrap_or_default();
+                if !current_exe.starts_with(install_dir) {
+                    updater::perform_update(&client, &version, "gateway").await?;
+                }
+                println!("Updated to {}.", version);
+            }
+        }
+        return Ok(());
+    }
+
+    // ── Recurring background update check ────────────────────────────────────
+    let update_available: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
     {
+        let update_state = update_available.clone();
         let check_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_default();
+        let current = env!("CARGO_PKG_VERSION").to_string();
         tokio::spawn(async move {
-            match updater::check_update(&check_client, env!("CARGO_PKG_VERSION")).await {
-                Ok(Some(v)) => tracing::warn!(
-                    "A new version of claude-mail is available: {} (current: {}). \
-                     Visit https://github.com/nitecon/claude-mail/releases",
-                    v,
-                    env!("CARGO_PKG_VERSION")
-                ),
-                Ok(None) => {}
-                Err(e) => tracing::debug!("Update check failed: {e}"),
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                match updater::check_update(&check_client, &current).await {
+                    Ok(Some(v)) => {
+                        tracing::info!("Update available: {} (current: {})", v, current);
+                        *update_state.lock().unwrap() = Some(v);
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::debug!("Update check failed: {e}"),
+                }
             }
         });
     }
@@ -141,12 +201,12 @@ async fn main() -> Result<()> {
         dirs::home_dir()
             .map(|h| {
                 h.join(".claude")
-                    .join("claude-mail")
-                    .join("claude-mail.db")
+                    .join("agent-comms")
+                    .join("agent-comms.db")
                     .to_string_lossy()
                     .into_owned()
             })
-            .unwrap_or_else(|| "./data/claude-mail.db".into())
+            .unwrap_or_else(|| "./data/agent-comms.db".into())
     });
     let retention_days: u64 = std::env::var("MESSAGE_RETENTION_DAYS")
         .unwrap_or_else(|_| "30".into())
@@ -252,6 +312,7 @@ async fn main() -> Result<()> {
         plugins: Arc::new(plugins),
         default_channel,
         api_key,
+        update_available,
     };
 
     // API routes require bearer auth.

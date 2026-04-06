@@ -206,7 +206,7 @@ impl MailServer {
 impl ServerHandler for MailServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "claude-mail: communicate with the user via a configured channel (Discord, Slack, \
+            "agent-comms: communicate with the user via a configured channel (Discord, Slack, \
                  email, etc.). Call set_identity first (once per session), then use send_message \
                  to notify the user and get_messages to poll for replies. \
                  IMPORTANT: After calling get_messages, you MUST call confirm_read for each \

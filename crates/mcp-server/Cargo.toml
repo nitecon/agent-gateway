@@ -1,10 +1,10 @@
 [package]
-name = "claude-mail"
+name = "agent-comms"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "claude-mail"
+name = "agent-comms"
 path = "src/main.rs"
 
 [dependencies]

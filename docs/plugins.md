@@ -2,7 +2,7 @@
 
 Plugins are how the gateway delivers messages to the user. Each plugin implements one communication medium — Discord, Slack, email, etc. One plugin is assigned per project at registration time; all inbound and outbound messages for that project flow exclusively through that plugin.
 
-The MCP server (`claude-mail` binary) is completely unaware of plugins. It only speaks HTTP to the gateway. Adding a new plugin requires changes only inside `crates/gateway/`.
+The MCP server (`agent-comms` binary) is completely unaware of plugins. It only speaks HTTP to the gateway. Adding a new plugin requires changes only inside `crates/gateway/`.
 
 ---
 
