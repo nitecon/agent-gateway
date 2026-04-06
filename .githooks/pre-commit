@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# claude-mail pre-commit hook
+# agent-comms pre-commit hook
 # Automatically formats staged Rust files and runs Clippy before every commit.
 # Install with: git config core.hooksPath .githooks
 set -e

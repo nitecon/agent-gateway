@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO="nitecon/agent-comms"
+INSTALL_DIR="/opt/agentic/bin"
+BINARY_NAME="gateway"
+SYMLINK="/usr/local/bin/gateway"
+SERVICE_USER="agent-comms"
+SERVICE_GROUP="agent-comms"
+CONFIG_DIR="/etc/agent-comms"
+DATA_DIR="/var/lib/agent-comms"
+SERVICE_NAME="gateway.service"
+
+# --- Helpers ----------------------------------------------------------------
+
+info()  { printf '\033[1;32m[INFO]\033[0m  %s\n' "$*"; }
+warn()  { printf '\033[1;33m[WARN]\033[0m  %s\n' "$*"; }
+error() { printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# --- Pre-flight checks ------------------------------------------------------
+
+if [ "$(id -u)" -ne 0 ]; then
+  error "This script must be run as root. Try: curl -fsSL <url> | sudo bash"
+fi
+
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m)
+
+case "$OS" in
+  linux)  PLATFORM="linux" ;;
+  *)      error "Gateway server setup is only supported on Linux. Got: $OS" ;;
+esac
+
+case "$ARCH" in
+  x86_64)        ARCH="x86_64" ;;
+  aarch64|arm64) ARCH="aarch64" ;;
+  *)             error "Unsupported architecture: $ARCH" ;;
+esac
+
+# --- Resolve latest version -------------------------------------------------
+
+info "Resolving latest release..."
+if command -v curl &>/dev/null; then
+  DOWNLOAD="curl -fsSL"
+  DOWNLOAD_OUT="curl -fsSL -o"
+elif command -v wget &>/dev/null; then
+  DOWNLOAD="wget -qO-"
+  DOWNLOAD_OUT="wget -qO"
+else
+  error "Neither curl nor wget found. Install one and retry."
+fi
+
+LATEST_TAG=$($DOWNLOAD "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
+
+if [ -z "$LATEST_TAG" ]; then
+  error "Could not determine latest release from GitHub."
+fi
+
+info "Latest version: ${LATEST_TAG}"
+
+ARCHIVE_NAME="agent-comms-${LATEST_TAG}-${PLATFORM}-${ARCH}.tar.gz"
+DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/${ARCHIVE_NAME}"
+
+# --- Check existing installation --------------------------------------------
+
+if [ -f "${INSTALL_DIR}/${BINARY_NAME}" ]; then
+  CURRENT_VERSION=$(${INSTALL_DIR}/${BINARY_NAME} --version 2>/dev/null || echo "unknown")
+  info "Existing installation found: ${CURRENT_VERSION}"
+  info "Upgrading to ${LATEST_TAG}..."
+else
+  info "No existing installation found. Installing fresh."
+fi
+
+# --- Download and extract ---------------------------------------------------
+
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+
+info "Downloading ${ARCHIVE_NAME}..."
+$DOWNLOAD_OUT "${TMPDIR}/${ARCHIVE_NAME}" "$DOWNLOAD_URL"
+
+info "Extracting..."
+tar xzf "${TMPDIR}/${ARCHIVE_NAME}" -C "$TMPDIR"
+
+# --- Install binary ---------------------------------------------------------
+
+mkdir -p "$INSTALL_DIR"
+
+BIN_PATH=$(find "$TMPDIR" -name "$BINARY_NAME" -type f ! -name "*.tar.gz" ! -name "*.service" | head -1)
+if [ -z "$BIN_PATH" ]; then
+  error "Binary '${BINARY_NAME}' not found in archive."
+fi
+
+mv "$BIN_PATH" "${INSTALL_DIR}/${BINARY_NAME}"
+chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+ln -sf "${INSTALL_DIR}/${BINARY_NAME}" "$SYMLINK"
+info "Installed ${INSTALL_DIR}/${BINARY_NAME} (symlinked to ${SYMLINK})"
+
+# --- Create system user and group -------------------------------------------
+
+if ! getent group "$SERVICE_GROUP" >/dev/null 2>&1; then
+  groupadd --system "$SERVICE_GROUP"
+  info "Created system group: ${SERVICE_GROUP}"
+fi
+
+if ! getent passwd "$SERVICE_USER" >/dev/null 2>&1; then
+  useradd --system --gid "$SERVICE_GROUP" --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
+  info "Created system user: ${SERVICE_USER}"
+fi
+
+# --- Create directories -----------------------------------------------------
+
+mkdir -p "$CONFIG_DIR"
+chmod 750 "$CONFIG_DIR"
+chown root:"$SERVICE_GROUP" "$CONFIG_DIR"
+info "Config directory: ${CONFIG_DIR}"
+
+mkdir -p "$DATA_DIR"
+chown "$SERVICE_USER":"$SERVICE_GROUP" "$DATA_DIR"
+chmod 750 "$DATA_DIR"
+info "Data directory: ${DATA_DIR}"
+
+# --- Install systemd service ------------------------------------------------
+
+SERVICE_SRC=$(find "$TMPDIR" -name "${SERVICE_NAME}" -type f | head -1)
+if [ -n "$SERVICE_SRC" ]; then
+  cp "$SERVICE_SRC" "/etc/systemd/system/${SERVICE_NAME}"
+  info "Installed systemd service: /etc/systemd/system/${SERVICE_NAME}"
+else
+  warn "Service file not found in archive. You may need to create it manually."
+fi
+
+# --- Install template env file (don't overwrite existing) -------------------
+
+if [ ! -f "${CONFIG_DIR}/gateway.env" ]; then
+  cat > "${CONFIG_DIR}/gateway.env" <<'ENVEOF'
+# agent-comms Gateway Configuration
+# Fill in the required values and uncomment as needed.
+
+GATEWAY_API_KEY=CHANGE_ME
+GATEWAY_HOST=0.0.0.0
+GATEWAY_PORT=7913
+
+# Discord integration
+# DISCORD_BOT_TOKEN=
+# DISCORD_GUILD_ID=
+# DISCORD_CATEGORY_ID=
+
+# Database
+DATABASE_PATH=/var/lib/agent-comms/agent-comms.db
+
+# Message retention (days)
+MESSAGE_RETENTION_DAYS=30
+
+# Default channel plugin
+DEFAULT_CHANNEL=discord
+ENVEOF
+  chmod 640 "${CONFIG_DIR}/gateway.env"
+  chown root:"$SERVICE_GROUP" "${CONFIG_DIR}/gateway.env"
+  info "Created template config: ${CONFIG_DIR}/gateway.env"
+else
+  info "Existing config preserved: ${CONFIG_DIR}/gateway.env"
+fi
+
+# --- Reload systemd ---------------------------------------------------------
+
+systemctl daemon-reload
+info "Reloaded systemd daemon"
+
+# --- Done -------------------------------------------------------------------
+
+echo ""
+info "Gateway installation complete!"
+echo ""
+echo "  Binary:   ${INSTALL_DIR}/${BINARY_NAME}"
+echo "  Symlink:  ${SYMLINK}"
+echo "  Service:  /etc/systemd/system/${SERVICE_NAME}"
+echo "  Config:   ${CONFIG_DIR}/gateway.env"
+echo "  Data:     ${DATA_DIR}/"
+echo "  Version:  ${LATEST_TAG}"
+echo ""
+echo "Next steps:"
+echo "  1. Edit ${CONFIG_DIR}/gateway.env and set your API key and Discord tokens"
+echo "  2. Enable and start the service:"
+echo "     systemctl enable --now gateway"
+echo "  3. Check status:"
+echo "     systemctl status gateway"
+echo "     journalctl -u gateway -f"
+echo ""

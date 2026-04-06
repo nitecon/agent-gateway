@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::io::Read;
 
 const REPO_OWNER: &str = "nitecon";
-const REPO_NAME: &str = "claude-mail";
+const REPO_NAME: &str = "agent-comms";
 
 #[derive(Deserialize)]
 struct GithubRelease {
@@ -19,7 +19,7 @@ pub async fn check_update(client: &reqwest::Client, current: &str) -> Result<Opt
     );
     let resp = client
         .get(&url)
-        .header("User-Agent", format!("claude-mail/{}", current))
+        .header("User-Agent", format!("agent-comms/{}", current))
         .send()
         .await
         .context("query GitHub releases")?;
@@ -56,15 +56,15 @@ fn is_newer(latest: &str, current: &str) -> bool {
 /// Detect the current platform's Rust target triple.
 pub fn current_target() -> Option<&'static str> {
     if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
-        Some("x86_64-unknown-linux-gnu")
+        Some("linux-x86_64")
     } else if cfg!(target_os = "linux") && cfg!(target_arch = "aarch64") {
-        Some("aarch64-unknown-linux-gnu")
+        Some("linux-aarch64")
     } else if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
-        Some("aarch64-apple-darwin")
+        Some("macos-aarch64")
     } else if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
-        Some("x86_64-apple-darwin")
+        Some("macos-x86_64")
     } else if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
-        Some("x86_64-pc-windows-msvc")
+        Some("windows-x86_64")
     } else {
         None
     }
@@ -75,7 +75,7 @@ pub fn current_target() -> Option<&'static str> {
 pub async fn perform_update(
     client: &reqwest::Client,
     version: &str,  // e.g. "v0.2.0"
-    bin_name: &str, // e.g. "claude-mail-skills"
+    bin_name: &str, // e.g. "sync"
 ) -> Result<()> {
     let target = current_target().context("unsupported platform for auto-update")?;
 
@@ -84,7 +84,7 @@ pub async fn perform_update(
     } else {
         "tar.gz"
     };
-    let archive_name = format!("claude-mail-{}-{}.{}", version, target, ext);
+    let archive_name = format!("agent-comms-{}-{}.{}", version, target, ext);
     let url = format!(
         "https://github.com/{}/{}/releases/download/{}/{}",
         REPO_OWNER, REPO_NAME, version, archive_name
@@ -93,7 +93,7 @@ pub async fn perform_update(
     eprintln!("Downloading {}...", url);
     let resp = client
         .get(&url)
-        .header("User-Agent", "claude-mail/updater")
+        .header("User-Agent", "agent-comms/updater")
         .send()
         .await
         .context("download release archive")?;
@@ -130,6 +130,72 @@ pub async fn perform_update(
     let _ = std::fs::remove_file(&tmp_path);
 
     eprintln!("Updated to {}. Please restart.", version);
+    Ok(())
+}
+
+/// Download the release archive for `version`, extract `bin_name`,
+/// and write it to `install_path` (resolving symlinks first).
+///
+/// Unlike [`perform_update`], this does **not** use `self_replace` and is
+/// intended for updating binaries that are *not* the currently-running
+/// executable (e.g. sibling binaries in `/opt/agentic/bin`).
+pub async fn perform_update_at(
+    client: &reqwest::Client,
+    version: &str,
+    bin_name: &str,
+    install_path: &std::path::Path,
+) -> Result<()> {
+    let target = current_target().context("unsupported platform for auto-update")?;
+    let ext = if cfg!(target_os = "windows") {
+        "zip"
+    } else {
+        "tar.gz"
+    };
+    let archive_name = format!("agent-comms-{}-{}.{}", version, target, ext);
+    let url = format!(
+        "https://github.com/{}/{}/releases/download/{}/{}",
+        REPO_OWNER, REPO_NAME, version, archive_name
+    );
+
+    eprintln!("Downloading {}...", url);
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "agent-comms/updater")
+        .send()
+        .await
+        .context("download release archive")?;
+
+    if !resp.status().is_success() {
+        bail!("download failed: HTTP {}", resp.status());
+    }
+
+    let bytes = resp.bytes().await.context("read archive bytes")?;
+    eprintln!("Downloaded {} bytes, extracting...", bytes.len());
+
+    let binary_bytes = if cfg!(target_os = "windows") {
+        extract_from_zip(&bytes, bin_name)?
+    } else {
+        extract_from_targz(&bytes, bin_name)?
+    };
+
+    // Resolve symlinks to get the actual file path
+    let target_path =
+        std::fs::canonicalize(install_path).unwrap_or_else(|_| install_path.to_path_buf());
+    let tmp_path = target_path.with_extension("new");
+
+    {
+        let mut f = std::fs::File::create(&tmp_path).context("create temp binary")?;
+        std::io::Write::write_all(&mut f, &binary_bytes).context("write new binary")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o755))
+                .context("set executable permission")?;
+        }
+    }
+
+    std::fs::rename(&tmp_path, &target_path).context("replace binary")?;
+    eprintln!("Updated {} to {}.", bin_name, version);
     Ok(())
 }
 

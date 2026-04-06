@@ -131,10 +131,10 @@ impl ChannelPlugin for DiscordPlugin {
             builder = builder.category(cat);
         }
 
-        let channel = guild
-            .create_channel(http, builder)
-            .await
-            .context("create Discord channel")?;
+        let channel = guild.create_channel(http, builder).await.map_err(|e| {
+            error!("Discord channel creation failed for '{project_ident}': {e}");
+            anyhow::anyhow!("create Discord channel: {e}")
+        })?;
 
         let room_id = channel.id.get().to_string();
         self.register_room(&room_id, None);
@@ -243,7 +243,7 @@ impl EventHandler for DiscordHandler {
         }
 
         // ── Online announcement ───────────────────────────────────────────────
-        let online_msg = "🟢 **claude-mail gateway** is online.";
+        let online_msg = "🟢 **agent-comms gateway** is online.";
         let known_ids: Vec<u64> = rooms.iter().map(|(id, _)| *id).collect();
 
         // Post to every registered project channel.

@@ -11,7 +11,7 @@ use tools::MailServer;
 // ── CLI definition ────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "claude-mail", about = "claude-mail MCP server")]
+#[command(name = "agent-comms", about = "agent-comms MCP server")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -35,7 +35,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Interactive setup — creates ~/.claude/claude-mail.conf
+    /// Interactive setup — creates ~/.claude/agent-comms.conf
     Init,
     /// Check for a newer version and update the binary in place
     Update,
@@ -61,7 +61,7 @@ fn prompt(label: &str) -> Result<String> {
 // ── `init` subcommand ─────────────────────────────────────────────────────────
 
 fn run_init() -> Result<()> {
-    println!("claude-mail setup\n");
+    println!("agent-comms setup\n");
 
     let url = {
         let v = prompt("Gateway URL [http://localhost:7913]: ")?;
@@ -91,7 +91,7 @@ fn run_init() -> Result<()> {
     // Write config file.
     let claude_dir = home_dir().join(".claude");
     std::fs::create_dir_all(&claude_dir).context("create ~/.claude directory")?;
-    let conf_path = claude_dir.join("claude-mail.conf");
+    let conf_path = claude_dir.join("agent-comms.conf");
 
     let mut conf =
         format!("GATEWAY_URL={url}\nGATEWAY_API_KEY={api_key}\nGATEWAY_TIMEOUT_MS={timeout_ms}\n");
@@ -103,9 +103,9 @@ fn run_init() -> Result<()> {
 
     println!("\nConfig written to {}", conf_path.display());
     println!("\nAdd the MCP server to Claude Code:");
-    println!("  claude mcp add claude-mail -- /path/to/claude-mail");
+    println!("  claude mcp add agent-comms -- /opt/agentic/bin/agent-comms");
     println!("\nOr with an explicit URL override:");
-    println!("  claude mcp add claude-mail -- /path/to/claude-mail --url={url}");
+    println!("  claude mcp add agent-comms -- /opt/agentic/bin/agent-comms --url={url}");
 
     Ok(())
 }
@@ -115,14 +115,14 @@ fn run_init() -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     // Config loading priority (lowest to highest):
-    //   1. ~/.claude/claude-mail.conf  (written by `claude-mail init`)
+    //   1. ~/.claude/agent-comms.conf  (written by `agent-comms init`)
     //   2. .env in current directory
     //   3. Environment variables already set in the shell
     //   4. CLI flags
     //
     // dotenvy::from_path / dotenvy::dotenv do NOT override variables that are
     // already set in the environment, so env vars and CLI flags always win.
-    let conf_path = home_dir().join(".claude").join("claude-mail.conf");
+    let conf_path = home_dir().join(".claude").join("agent-comms.conf");
     let _ = dotenvy::from_path(&conf_path);
     let _ = dotenvy::dotenv();
 
@@ -139,8 +139,8 @@ async fn main() -> Result<()> {
                 println!("Already up to date (v{}).", current);
             }
             Some(version) => {
-                println!("Updating claude-mail {} -> {}...", current, version);
-                updater::perform_update(&client, &version, "claude-mail").await?;
+                println!("Updating agent-comms {} -> {}...", current, version);
+                updater::perform_update(&client, &version, "agent-comms").await?;
             }
         }
         return Ok(());
@@ -155,16 +155,16 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_env("RUST_LOG")
-                .add_directive("claude_mail=info".parse()?),
+                .add_directive("agent_comms=info".parse()?),
         )
         .init();
 
     let url = cli.url.unwrap_or_else(|| {
-        eprintln!("Missing --url / GATEWAY_URL (run `claude-mail init` to configure)");
+        eprintln!("Missing --url / GATEWAY_URL (run `agent-comms init` to configure)");
         std::process::exit(1);
     });
     let api_key = cli.api_key.unwrap_or_else(|| {
-        eprintln!("Missing --api-key / GATEWAY_API_KEY (run `claude-mail init` to configure)");
+        eprintln!("Missing --api-key / GATEWAY_API_KEY (run `agent-comms init` to configure)");
         std::process::exit(1);
     });
 
@@ -194,7 +194,7 @@ async fn main() -> Result<()> {
         let current = env!("CARGO_PKG_VERSION");
         tokio::spawn(async move {
             if let Ok(Some(v)) = updater::check_update(&check_client, current).await {
-                eprintln!("claude-mail update available: {} (current: {})", v, current);
+                eprintln!("agent-comms update available: {} (current: {})", v, current);
             }
         });
     }
