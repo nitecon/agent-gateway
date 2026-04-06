@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::io::Read;
 
 const REPO_OWNER: &str = "nitecon";
-const REPO_NAME: &str = "agent-comms";
+const REPO_NAME: &str = "agent-gateway";
 
 #[derive(Deserialize)]
 struct GithubRelease {
@@ -19,7 +19,7 @@ pub async fn check_update(client: &reqwest::Client, current: &str) -> Result<Opt
     );
     let resp = client
         .get(&url)
-        .header("User-Agent", format!("agent-comms/{}", current))
+        .header("User-Agent", format!("agent-gateway/{}", current))
         .send()
         .await
         .context("query GitHub releases")?;
@@ -84,7 +84,7 @@ pub async fn perform_update(
     } else {
         "tar.gz"
     };
-    let archive_name = format!("agent-comms-{}-{}.{}", version, target, ext);
+    let archive_name = format!("agent-gateway-{}-{}.{}", version, target, ext);
     let url = format!(
         "https://github.com/{}/{}/releases/download/{}/{}",
         REPO_OWNER, REPO_NAME, version, archive_name
@@ -93,7 +93,7 @@ pub async fn perform_update(
     eprintln!("Downloading {}...", url);
     let resp = client
         .get(&url)
-        .header("User-Agent", "agent-comms/updater")
+        .header("User-Agent", "agent-gateway/updater")
         .send()
         .await
         .context("download release archive")?;
@@ -151,7 +151,7 @@ pub async fn perform_update_at(
     } else {
         "tar.gz"
     };
-    let archive_name = format!("agent-comms-{}-{}.{}", version, target, ext);
+    let archive_name = format!("agent-gateway-{}-{}.{}", version, target, ext);
     let url = format!(
         "https://github.com/{}/{}/releases/download/{}/{}",
         REPO_OWNER, REPO_NAME, version, archive_name
@@ -160,7 +160,7 @@ pub async fn perform_update_at(
     eprintln!("Downloading {}...", url);
     let resp = client
         .get(&url)
-        .header("User-Agent", "agent-comms/updater")
+        .header("User-Agent", "agent-gateway/updater")
         .send()
         .await
         .context("download release archive")?;

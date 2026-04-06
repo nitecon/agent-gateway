@@ -5,23 +5,23 @@
 The install script downloads the latest release and places the gateway binary in `/opt/agentic/bin/`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nitecon/agent-comms/main/install-gateway.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/nitecon/agent-gateway/main/install-gateway.sh | sudo bash
 ```
 
 ## Create the service user and directories
 
 ```bash
-sudo useradd --system --no-create-home --shell /bin/false agent-comms
-sudo mkdir -p /etc/agent-comms /var/lib/agent-comms
-sudo chown -R agent-comms:agent-comms /etc/agent-comms /var/lib/agent-comms
+sudo useradd --system --no-create-home --shell /bin/false agent-gateway
+sudo mkdir -p /etc/agent-gateway /var/lib/agent-gateway
+sudo chown -R agent-gateway:agent-gateway /etc/agent-gateway /var/lib/agent-gateway
 ```
 
 ## Configure the environment file
 
-Create `/etc/agent-comms/gateway.env` and fill in your values:
+Create `/etc/agent-gateway/gateway.env` and fill in your values:
 
 ```bash
-sudo vim /etc/agent-comms/gateway.env
+sudo vim /etc/agent-gateway/gateway.env
 ```
 
 Paste and edit the following (a full reference is also at `.env.example` in the repository root):
@@ -44,7 +44,7 @@ GATEWAY_HOST=0.0.0.0
 GATEWAY_PORT=7913
 
 # SQLite database path
-DATABASE_PATH=/var/lib/agent-comms/agent-comms.db
+DATABASE_PATH=/var/lib/agent-gateway/agent-gateway.db
 
 # Delete messages older than N days that are behind the read cursor
 MESSAGE_RETENTION_DAYS=30
@@ -56,8 +56,8 @@ RUST_LOG=info
 Restrict permissions so only the service user can read it:
 
 ```bash
-sudo chown agent-comms:agent-comms /etc/agent-comms/gateway.env
-sudo chmod 640 /etc/agent-comms/gateway.env
+sudo chown agent-gateway:agent-gateway /etc/agent-gateway/gateway.env
+sudo chmod 640 /etc/agent-gateway/gateway.env
 ```
 
 ## Systemd Setup
@@ -72,16 +72,16 @@ Paste the following:
 
 ```ini
 [Unit]
-Description=agent-comms Gateway
-Documentation=https://github.com/nitecon/agent-comms
+Description=agent-gateway
+Documentation=https://github.com/nitecon/agent-gateway
 After=network.target
 
 [Service]
 Type=simple
-User=agent-comms
-Group=agent-comms
+User=agent-gateway
+Group=agent-gateway
 
-EnvironmentFile=/etc/agent-comms/gateway.env
+EnvironmentFile=/etc/agent-gateway/gateway.env
 
 ExecStartPre=/usr/local/bin/gateway update
 ExecStart=/usr/local/bin/gateway
@@ -99,7 +99,7 @@ SyslogIdentifier=gateway
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/agent-comms
+ReadWritePaths=/var/lib/agent-gateway
 
 [Install]
 WantedBy=multi-user.target

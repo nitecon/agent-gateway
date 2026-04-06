@@ -243,7 +243,7 @@ impl EventHandler for DiscordHandler {
         }
 
         // ── Online announcement ───────────────────────────────────────────────
-        let online_msg = "🟢 **agent-comms gateway** is online.";
+        let online_msg = "🟢 **agent-gateway** is online.";
         let known_ids: Vec<u64> = rooms.iter().map(|(id, _)| *id).collect();
 
         // Post to every registered project channel.

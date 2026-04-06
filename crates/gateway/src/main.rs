@@ -24,7 +24,7 @@ use db::Db;
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "gateway", about = "agent-comms gateway server")]
+#[command(name = "gateway", about = "agent-gateway server")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -32,7 +32,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Check for a newer version and update all agent-comms binaries in place
+    /// Check for a newer version and update the gateway binary in place
     Update,
 }
 
@@ -141,9 +141,9 @@ async fn main() -> Result<()> {
                 println!("Already up to date (v{}).", current);
             }
             Some(version) => {
-                println!("Updating agent-comms {} -> {}...", current, version);
+                println!("Updating agent-gateway {} -> {}...", current, version);
                 let install_dir = std::path::Path::new("/opt/agentic/bin");
-                for bin_name in &["agent-comms", "gateway", "agent-sync"] {
+                for bin_name in &["gateway"] {
                     let path = install_dir.join(bin_name);
                     if path.exists() {
                         match updater::perform_update_at(&client, &version, bin_name, &path).await {
@@ -200,13 +200,13 @@ async fn main() -> Result<()> {
     let db_path = std::env::var("DATABASE_PATH").unwrap_or_else(|_| {
         dirs::home_dir()
             .map(|h| {
-                h.join(".claude")
-                    .join("agent-comms")
-                    .join("agent-comms.db")
+                h.join(".agentic")
+                    .join("gateway")
+                    .join("agent-gateway.db")
                     .to_string_lossy()
                     .into_owned()
             })
-            .unwrap_or_else(|| "./data/agent-comms.db".into())
+            .unwrap_or_else(|| "./data/agent-gateway.db".into())
     });
     let retention_days: u64 = std::env::var("MESSAGE_RETENTION_DAYS")
         .unwrap_or_else(|_| "30".into())

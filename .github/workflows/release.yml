@@ -75,13 +75,11 @@ jobs:
         shell: bash
         run: |
           REF="${{ github.ref_name }}"
-          STAGING="agent-comms-${REF}-${{ matrix.platform }}"
+          STAGING="agent-gateway-${REF}-${{ matrix.platform }}"
           mkdir "$STAGING"
 
-          # Binaries (new names from Cargo.toml)
-          cp "target/${{ matrix.target }}/release/agent-comms" "$STAGING/agent-comms"
+          # Gateway binary
           cp "target/${{ matrix.target }}/release/gateway" "$STAGING/gateway"
-          cp "target/${{ matrix.target }}/release/agent-sync" "$STAGING/agent-sync"
 
           # Extras
           cp crates/gateway/gateway.service "$STAGING/"
@@ -95,12 +93,10 @@ jobs:
         shell: pwsh
         run: |
           $ref = "${{ github.ref_name }}"
-          $staging = "agent-comms-${ref}-${{ matrix.platform }}"
+          $staging = "agent-gateway-${ref}-${{ matrix.platform }}"
           New-Item -ItemType Directory $staging | Out-Null
 
-          Copy-Item "target/${{ matrix.target }}/release/agent-comms.exe" "$staging/agent-comms.exe"
           Copy-Item "target/${{ matrix.target }}/release/gateway.exe" "$staging/gateway.exe"
-          Copy-Item "target/${{ matrix.target }}/release/agent-sync.exe" "$staging/agent-sync.exe"
 
           Compress-Archive -Path $staging -DestinationPath "${staging}.zip"
           echo "ASSET=${staging}.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
