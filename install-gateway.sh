@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="nitecon/agent-comms"
+REPO="nitecon/agent-gateway"
 INSTALL_DIR="/opt/agentic/bin"
 BINARY_NAME="gateway"
 SYMLINK="/usr/local/bin/gateway"
-SERVICE_USER="agent-comms"
-SERVICE_GROUP="agent-comms"
-CONFIG_DIR="/etc/agent-comms"
-DATA_DIR="/var/lib/agent-comms"
+SERVICE_USER="agent-gateway"
+SERVICE_GROUP="agent-gateway"
+CONFIG_DIR="/etc/agent-gateway"
+DATA_DIR="/var/lib/agent-gateway"
 SERVICE_NAME="gateway.service"
 
 # --- Helpers ----------------------------------------------------------------
@@ -58,7 +58,7 @@ fi
 
 info "Latest version: ${LATEST_TAG}"
 
-ARCHIVE_NAME="agent-comms-${LATEST_TAG}-${PLATFORM}-${ARCH}.tar.gz"
+ARCHIVE_NAME="agent-gateway-${LATEST_TAG}-${PLATFORM}-${ARCH}.tar.gz"
 DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/${ARCHIVE_NAME}"
 
 # --- Check existing installation --------------------------------------------
@@ -134,7 +134,7 @@ fi
 
 if [ ! -f "${CONFIG_DIR}/gateway.env" ]; then
   cat > "${CONFIG_DIR}/gateway.env" <<'ENVEOF'
-# agent-comms Gateway Configuration
+# agent-gateway Configuration
 # Fill in the required values and uncomment as needed.
 
 GATEWAY_API_KEY=CHANGE_ME
@@ -147,7 +147,7 @@ GATEWAY_PORT=7913
 # DISCORD_CATEGORY_ID=
 
 # Database
-DATABASE_PATH=/var/lib/agent-comms/agent-comms.db
+DATABASE_PATH=/var/lib/agent-gateway/agent-gateway.db
 
 # Message retention (days)
 MESSAGE_RETENTION_DAYS=30

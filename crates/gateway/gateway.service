@@ -1,16 +1,16 @@
 [Unit]
-Description=agent-comms Gateway
-Documentation=https://github.com/nitecon/agent-comms
+Description=agent-gateway
+Documentation=https://github.com/nitecon/agent-gateway
 After=network.target
 
 [Service]
 Type=simple
-User=agent-comms
-Group=agent-comms
+User=agent-gateway
+Group=agent-gateway
 
-# Secrets and config live in /etc/agent-comms/gateway.env (not world-readable).
-# Copy crates/gateway/.env.example to /etc/agent-comms/gateway.env and fill in values.
-EnvironmentFile=/etc/agent-comms/gateway.env
+# Secrets and config live in /etc/agent-gateway/gateway.env (not world-readable).
+# Copy crates/gateway/.env.example to /etc/agent-gateway/gateway.env and fill in values.
+EnvironmentFile=/etc/agent-gateway/gateway.env
 
 ExecStartPre=/usr/local/bin/gateway update
 ExecStart=/usr/local/bin/gateway
@@ -22,13 +22,13 @@ TimeoutStopSec=10
 # Logging goes to the system journal: journalctl -u gateway -f
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=agent-comms-gateway
+SyslogIdentifier=agent-gateway
 
 # Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/agent-comms
+ReadWritePaths=/var/lib/agent-gateway
 
 [Install]
 WantedBy=multi-user.target
