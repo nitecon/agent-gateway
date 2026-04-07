@@ -199,6 +199,11 @@ ENVEOF
   chmod 640 "${CONFIG_DIR}/gateway.env"
   info "Created template config: ${CONFIG_DIR}/gateway.env"
 else
+  # Migrate DATABASE_PATH from old location if still pointing there
+  if grep -q '/var/lib/agent-gateway' "${CONFIG_DIR}/gateway.env" 2>/dev/null; then
+    sed -i 's|/var/lib/agent-gateway|/opt/agentic/gateway|g' "${CONFIG_DIR}/gateway.env"
+    info "Updated DATABASE_PATH in existing config to /opt/agentic/gateway"
+  fi
   info "Existing config preserved: ${CONFIG_DIR}/gateway.env"
 fi
 
