@@ -8,8 +8,6 @@ Type=simple
 User=agentic
 Group=agentic
 
-# Secrets and config live in /etc/agent-gateway/gateway.env (not world-readable).
-# Copy crates/gateway/.env.example to /etc/agent-gateway/gateway.env and fill in values.
 EnvironmentFile=/etc/agent-gateway/gateway.env
 
 ExecStartPre=/usr/local/bin/gateway update
@@ -19,7 +17,6 @@ Restart=on-failure
 RestartSec=5
 TimeoutStopSec=10
 
-# Logging goes to the system journal: journalctl -u gateway -f
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=agent-gateway
@@ -28,7 +25,7 @@ SyslogIdentifier=agent-gateway
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/agent-gateway /opt/agentic/bin
+ReadWritePaths=/opt/agentic
 
 [Install]
 WantedBy=multi-user.target

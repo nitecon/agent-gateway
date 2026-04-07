@@ -8,7 +8,7 @@ SYMLINK="/usr/local/bin/gateway"
 SVC_USER="agentic"
 SVC_GROUP="agentic"
 CONFIG_DIR="/etc/agent-gateway"
-DATA_DIR="/var/lib/agent-gateway"
+DATA_DIR="/opt/agentic/gateway"
 SERVICE_NAME="gateway.service"
 
 # --- Helpers ----------------------------------------------------------------
@@ -61,7 +61,7 @@ done < /etc/passwd
 
 # --- Set /opt/agentic ownership ---------------------------------------------
 
-mkdir -p /opt/agentic/bin
+mkdir -p /opt/agentic/bin "$DATA_DIR"
 chown -R "${SVC_USER}:${SVC_GROUP}" /opt/agentic
 chmod -R 775 /opt/agentic
 info "Set /opt/agentic ownership to ${SVC_USER}:${SVC_GROUP}"
@@ -124,32 +124,49 @@ chmod 775 "${INSTALL_DIR}/${BINARY_NAME}"
 ln -sf "${INSTALL_DIR}/${BINARY_NAME}" "$SYMLINK"
 info "Installed ${INSTALL_DIR}/${BINARY_NAME} (symlinked to ${SYMLINK})"
 
-# --- Create directories -----------------------------------------------------
+# --- Create config directory ------------------------------------------------
 
 mkdir -p "$CONFIG_DIR"
 chown root:"$SVC_GROUP" "$CONFIG_DIR"
 chmod 750 "$CONFIG_DIR"
 info "Config directory: ${CONFIG_DIR}"
 
-mkdir -p "$DATA_DIR"
-chown "${SVC_USER}:${SVC_GROUP}" "$DATA_DIR"
-chmod 750 "$DATA_DIR"
-info "Data directory: ${DATA_DIR}"
+# --- Install systemd service (embedded, always up to date) ------------------
 
-# Ensure any existing DB files are owned correctly on upgrades
-if ls "${DATA_DIR}"/*.db* &>/dev/null; then
-  chown "${SVC_USER}:${SVC_GROUP}" "${DATA_DIR}"/*.db*
-fi
+cat > "/etc/systemd/system/${SERVICE_NAME}" <<'SVCEOF'
+[Unit]
+Description=agent-gateway
+Documentation=https://github.com/nitecon/agent-gateway
+After=network.target
 
-# --- Install systemd service ------------------------------------------------
+[Service]
+Type=simple
+User=agentic
+Group=agentic
 
-SERVICE_SRC=$(find "$TMPDIR" -name "${SERVICE_NAME}" -type f | head -1)
-if [ -n "$SERVICE_SRC" ]; then
-  cp "$SERVICE_SRC" "/etc/systemd/system/${SERVICE_NAME}"
-  info "Installed systemd service: /etc/systemd/system/${SERVICE_NAME}"
-else
-  warn "Service file not found in archive. You may need to create it manually."
-fi
+EnvironmentFile=/etc/agent-gateway/gateway.env
+
+ExecStartPre=/usr/local/bin/gateway update
+ExecStart=/usr/local/bin/gateway
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agent-gateway
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/agentic
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+info "Installed systemd service: /etc/systemd/system/${SERVICE_NAME}"
 
 # --- Install template env file (don't overwrite existing) -------------------
 
@@ -168,7 +185,7 @@ GATEWAY_PORT=7913
 # DISCORD_CATEGORY_ID=
 
 # Database
-DATABASE_PATH=/var/lib/agent-gateway/agent-gateway.db
+DATABASE_PATH=/opt/agentic/gateway/agent-gateway.db
 
 # Message retention (days)
 MESSAGE_RETENTION_DAYS=30
@@ -181,6 +198,16 @@ ENVEOF
   info "Created template config: ${CONFIG_DIR}/gateway.env"
 else
   info "Existing config preserved: ${CONFIG_DIR}/gateway.env"
+fi
+
+# --- Migrate old data directory if present ----------------------------------
+
+OLD_DATA_DIR="/var/lib/agent-gateway"
+if [ -d "$OLD_DATA_DIR" ] && [ "$(ls -A "$OLD_DATA_DIR" 2>/dev/null)" ]; then
+  info "Migrating data from ${OLD_DATA_DIR} to ${DATA_DIR}..."
+  cp -a "${OLD_DATA_DIR}/." "${DATA_DIR}/"
+  chown -R "${SVC_USER}:${SVC_GROUP}" "${DATA_DIR}"
+  info "Migration complete. Old directory preserved at ${OLD_DATA_DIR} (safe to remove)"
 fi
 
 # --- Reload systemd ---------------------------------------------------------
