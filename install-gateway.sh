@@ -79,7 +79,9 @@ else
   error "Neither curl nor wget found. Install one and retry."
 fi
 
-LATEST_TAG=$($DOWNLOAD "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
+# Resolve via redirect header — avoids GitHub API rate limits entirely
+LATEST_TAG=$(curl -sI "https://github.com/${REPO}/releases/latest" \
+  | grep -i '^location:' | sed -E 's|.*/tag/([^ \r]+).*|\1|' | tr -d '[:space:]') || true
 
 if [ -z "$LATEST_TAG" ]; then
   error "Could not determine latest release from GitHub."
