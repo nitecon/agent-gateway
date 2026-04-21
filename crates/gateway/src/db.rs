@@ -151,7 +151,43 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // ── Settings: simple key/value store for UI prefs (theme, etc.) ──────────
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );",
+    )?;
+
     Ok(())
+}
+
+// ── Settings ─────────────────────────────────────────────────────────────────
+
+pub fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>> {
+    let mut stmt = conn.prepare_cached("SELECT value FROM settings WHERE key = ?1")?;
+    let mut rows = stmt.query_map(params![key], |r| r.get::<_, String>(0))?;
+    Ok(rows.next().transpose()?)
+}
+
+pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+/// Default theme used when nothing is stored yet.
+pub const DEFAULT_THEME: &str = "dark";
+
+pub fn get_theme(conn: &Connection) -> Result<String> {
+    Ok(get_setting(conn, "theme")?.unwrap_or_else(|| DEFAULT_THEME.to_string()))
+}
+
+pub fn set_theme(conn: &Connection, theme: &str) -> Result<()> {
+    set_setting(conn, "theme", theme)
 }
 
 // ── Projects ─────────────────────────────────────────────────────────────────

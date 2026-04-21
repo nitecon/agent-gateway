@@ -138,7 +138,7 @@ async fn main() -> Result<()> {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .context("build http client")?;
-        let current = env!("CARGO_PKG_VERSION");
+        let current = env!("AGENT_GATEWAY_VERSION");
         match updater::check_update(&client, current).await? {
             None => {
                 println!("Already up to date (v{}).", current);
@@ -187,7 +187,7 @@ async fn main() -> Result<()> {
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_default();
-        let current = env!("CARGO_PKG_VERSION").to_string();
+        let current = env!("AGENT_GATEWAY_VERSION").to_string();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(300));
             loop {
@@ -355,6 +355,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/", get(routes::dashboard))
         .route("/manage", get(routes::manage_page))
+        .route("/theme", get(routes::get_theme).post(routes::set_theme))
         .merge(api)
         .with_state(state);
 

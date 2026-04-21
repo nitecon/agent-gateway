@@ -68,6 +68,8 @@ jobs:
 
       - name: Build workspace
         run: ${{ matrix.cargo }} build --release --workspace --target ${{ matrix.target }}
+        env:
+          AGENT_GATEWAY_VERSION: ${{ github.ref_name }}
 
       # ── Unix packaging (tar.gz) ────────────────────────────────────────────
       - name: Package (Unix)

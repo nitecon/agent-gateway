@@ -1,0 +1,2 @@
+[build.env]
+passthrough = ["AGENT_GATEWAY_VERSION"]
