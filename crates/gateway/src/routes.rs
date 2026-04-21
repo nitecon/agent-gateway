@@ -44,6 +44,49 @@ fn extract_agent_id(headers: &HeaderMap) -> String {
         .to_string()
 }
 
+// ── Theme (GET/POST /theme) ──────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct ThemeResponse {
+    pub theme: String,
+}
+
+#[derive(Deserialize)]
+pub struct ThemeRequest {
+    pub theme: String,
+}
+
+pub async fn get_theme(State(state): State<AppState>) -> Result<Json<ThemeResponse>> {
+    let db = state.db.clone();
+    let theme = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::get_theme(&conn)
+    })
+    .await??;
+    Ok(Json(ThemeResponse { theme }))
+}
+
+pub async fn set_theme(
+    State(state): State<AppState>,
+    Json(body): Json<ThemeRequest>,
+) -> Result<Json<ThemeResponse>> {
+    let theme = body.theme.trim().to_lowercase();
+    if theme != "light" && theme != "dark" {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            format!("unsupported theme '{}': must be 'light' or 'dark'", theme),
+        ));
+    }
+    let db = state.db.clone();
+    let t = theme.clone();
+    spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::set_theme(&conn, &t)
+    })
+    .await??;
+    Ok(Json(ThemeResponse { theme }))
+}
+
 // ── POST /v1/projects ─────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -407,216 +450,243 @@ pub async fn get_skill_content(
 
 // ── GET /manage ──────────────────────────────────────────────────────────────
 
-pub async fn manage_page(State(state): State<AppState>) -> Html<String> {
+pub async fn manage_page(State(state): State<AppState>) -> Result<Html<String>> {
     let api_key = he(&state.api_key);
-    Html(format!(
+    let db = state.db.clone();
+    let theme = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::get_theme(&conn)
+    })
+    .await??;
+
+    Ok(Html(format!(
         r##"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>agent-gateway — Manage</title>
-<style>
-*{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:system-ui,sans-serif;background:#f7fafc;color:#1a202c;padding:2rem 1rem}}
-.wrap{{max-width:1060px;margin:0 auto}}
-header{{margin-bottom:1.5rem;display:flex;justify-content:space-between;align-items:center}}
-h1{{font-size:1.4rem;font-weight:700}}
-.sub{{color:#718096;font-size:0.9rem;margin-top:0.2rem}}
-a.back{{color:#4a5568;text-decoration:none;font-size:0.85rem}}
-a.back:hover{{text-decoration:underline}}
-.tabs{{display:flex;gap:0;margin-bottom:1rem}}
-.tab{{padding:0.5rem 1.2rem;cursor:pointer;border:1px solid #e2e8f0;background:#fff;font-size:0.85rem;font-weight:600;color:#4a5568;transition:all 0.15s}}
-.tab:first-child{{border-radius:6px 0 0 6px}}
-.tab:last-child{{border-radius:0 6px 6px 0}}
-.tab.active{{background:#4a5568;color:#fff;border-color:#4a5568}}
-.section{{background:#fff;border:1px solid #e2e8f0;border-radius:8px;overflow:hidden}}
-.section-head{{padding:0.75rem 1rem;border-bottom:1px solid #e2e8f0;display:flex;justify-content:space-between;align-items:center}}
-.section-head span{{font-size:0.8rem;font-weight:600;color:#4a5568;text-transform:uppercase;letter-spacing:0.05em}}
-table{{width:100%;border-collapse:collapse}}
-th{{text-align:left;padding:0.6rem 1rem;font-size:0.78rem;font-weight:600;color:#4a5568;text-transform:uppercase;background:#f7fafc;border-bottom:1px solid #e2e8f0}}
-td{{padding:0.55rem 1rem;font-size:0.85rem;border-bottom:1px solid #edf2f7}}
-tr:last-child td{{border-bottom:none}}
-tr:hover td{{background:#f7fafc}}
-.muted{{color:#718096;font-size:0.8rem}}
-.btn{{padding:0.35rem 0.75rem;border:1px solid #e2e8f0;border-radius:4px;background:#fff;cursor:pointer;font-size:0.78rem;font-weight:500;transition:all 0.15s}}
-.btn:hover{{background:#edf2f7}}
-.btn-primary{{background:#4a5568;color:#fff;border-color:#4a5568}}
-.btn-primary:hover{{background:#2d3748}}
-.btn-danger{{color:#e53e3e;border-color:#fed7d7}}
-.btn-danger:hover{{background:#fff5f5}}
-.btn-sm{{padding:0.25rem 0.5rem;font-size:0.75rem}}
-.actions{{display:flex;gap:0.4rem}}
-.editor{{display:none;padding:1rem;border-top:1px solid #e2e8f0;background:#fafbfc}}
-.editor.visible{{display:block}}
-.editor textarea{{width:100%;min-height:300px;font-family:'SF Mono',Monaco,monospace;font-size:0.85rem;padding:0.75rem;border:1px solid #e2e8f0;border-radius:6px;resize:vertical;line-height:1.5}}
-.editor-bar{{display:flex;justify-content:space-between;align-items:center;margin-top:0.75rem}}
-.editor-title{{font-weight:600;font-size:0.9rem}}
-.create-form{{display:none;padding:1rem;border-top:1px solid #e2e8f0;background:#fafbfc}}
-.create-form.visible{{display:block}}
-.form-row{{display:flex;gap:0.75rem;margin-bottom:0.75rem;align-items:center}}
-.form-row label{{font-size:0.8rem;font-weight:600;color:#4a5568;min-width:60px}}
-.form-row input[type=text]{{flex:1;padding:0.4rem 0.6rem;border:1px solid #e2e8f0;border-radius:4px;font-size:0.85rem}}
-.form-row input[type=file]{{flex:1;font-size:0.85rem}}
-.msg{{padding:0.5rem 1rem;margin-bottom:0.75rem;border-radius:4px;font-size:0.85rem;display:none}}
-.msg.ok{{display:block;background:#f0fff4;color:#276749;border:1px solid #c6f6d5}}
-.msg.err{{display:block;background:#fff5f5;color:#c53030;border:1px solid #fed7d7}}
-</style></head>
-<body><div class="wrap">
-<header>
-  <div><h1>agent-gateway — Manage</h1><div class="sub">Skills, Commands &amp; Agents</div></div>
-  <a class="back" href="/">&larr; Dashboard</a>
+{ndesign_head}
+</head>
+<body>
+<header class="nd-flex nd-flex-between nd-p-md">
+  <div>
+    <h1>agent-gateway — Manage</h1>
+    <div class="nd-text-muted nd-text-sm">Skills, Commands &amp; Agents</div>
+  </div>
+  <div class="nd-flex nd-gap-sm">
+    <a class="nd-btn-secondary" href="/">Dashboard</a>
+    {theme_toggle}
+  </div>
 </header>
-<div id="msg" class="msg"></div>
-<div class="tabs">
-  <div class="tab active" onclick="setTab('command')">Commands</div>
-  <div class="tab" onclick="setTab('agent')">Agents</div>
-  <div class="tab" onclick="setTab('skill')">Skills</div>
-</div>
-<div class="section">
-  <div class="section-head">
-    <span id="section-title">Commands</span>
-    <div class="actions">
-      <button class="btn btn-primary btn-sm" onclick="toggleCreate()">+ New</button>
+<main class="nd-p-lg">
+  <nav class="nd-tabs nd-mb-md" role="tablist" id="tabs">
+    <button role="tab" aria-selected="true"  data-tab="command" class="nd-active">Commands</button>
+    <button role="tab" aria-selected="false" data-tab="agent">Agents</button>
+    <button role="tab" aria-selected="false" data-tab="skill">Skills</button>
+  </nav>
+
+  <section class="nd-card">
+    <div class="nd-card-header nd-flex nd-flex-between">
+      <strong id="section-title">Commands</strong>
+      <button class="nd-btn-primary nd-btn-sm" id="btn-toggle-create">+ New</button>
     </div>
-  </div>
-  <div id="create-form" class="create-form">
-    <div class="form-row"><label>Name</label><input type="text" id="create-name" placeholder="my-item"></div>
-    <div id="create-text-row" class="form-row" style="align-items:flex-start"><label>Content</label><textarea id="create-content" style="flex:1;min-height:150px;font-family:monospace;font-size:0.85rem;padding:0.5rem;border:1px solid #e2e8f0;border-radius:4px" placeholder="Markdown content..."></textarea></div>
-    <div id="create-file-row" class="form-row" style="display:none"><label>Zip file</label><input type="file" id="create-file" accept=".zip"></div>
-    <div class="form-row"><label></label><button class="btn btn-primary" onclick="doCreate()">Create</button><button class="btn" onclick="toggleCreate()" style="margin-left:0.5rem">Cancel</button></div>
-  </div>
-  <table>
-    <thead><tr><th>Name</th><th>Size</th><th>Updated</th><th style="width:120px">Actions</th></tr></thead>
-    <tbody id="list-body"><tr><td colspan="4" class="muted" style="text-align:center;padding:2rem">Loading...</td></tr></tbody>
-  </table>
-  <div id="editor" class="editor">
-    <div class="editor-bar"><span class="editor-title" id="editor-title">Editing: —</span><button class="btn" onclick="closeEditor()">Close</button></div>
-    <textarea id="editor-content" style="margin-top:0.75rem"></textarea>
-    <div class="editor-bar"><span class="muted" id="editor-hint"></span><button class="btn btn-primary" onclick="doSave()">Save</button></div>
-  </div>
-</div>
+
+    <div id="create-form" class="nd-card-body" hidden>
+      <div class="nd-form-group">
+        <label for="create-name">Name</label>
+        <input type="text" id="create-name" placeholder="my-item">
+      </div>
+      <div class="nd-form-group" id="create-text-row">
+        <label for="create-content">Content</label>
+        <textarea id="create-content" rows="8" placeholder="Markdown content..."></textarea>
+      </div>
+      <div class="nd-form-group" id="create-file-row" hidden>
+        <label for="create-file">Zip file</label>
+        <input type="file" id="create-file" accept=".zip">
+      </div>
+      <div class="nd-flex nd-gap-sm">
+        <button class="nd-btn-primary" id="btn-create">Create</button>
+        <button class="nd-btn-ghost" id="btn-cancel-create">Cancel</button>
+      </div>
+    </div>
+
+    <div class="nd-card-body nd-p-0">
+      <table class="nd-table nd-table-hover">
+        <thead><tr><th>Name</th><th>Size</th><th>Updated</th><th style="width:160px">Actions</th></tr></thead>
+        <tbody id="list-body"><tr><td colspan="4" class="nd-text-muted" style="text-align:center">Loading…</td></tr></tbody>
+      </table>
+    </div>
+
+    <div id="editor" class="nd-card-body" hidden>
+      <div class="nd-flex nd-flex-between nd-mb-sm">
+        <strong id="editor-title">Editing: —</strong>
+        <button class="nd-btn-ghost nd-btn-sm" id="btn-close-editor">Close</button>
+      </div>
+      <textarea id="editor-content" rows="16"></textarea>
+      <div class="nd-flex nd-flex-between nd-mt-sm">
+        <span class="nd-text-muted nd-text-sm" id="editor-hint"></span>
+        <button class="nd-btn-primary" id="btn-save">Save</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+{ndesign_scripts}
 <script>
-const K='{api_key}';
-const H={{'Authorization':'Bearer '+K}};
-let tab='command', editName=null;
+  // Manage-page glue. Uses NDesign.toast for feedback; no custom styles.
+  (() => {{
+    const K = {api_key_json};
+    const H = {{ 'Authorization': 'Bearer ' + K }};
+    let tab = 'command', editName = null;
 
-function setTab(t){{
-  tab=t;
-  document.querySelectorAll('.tab').forEach(el=>el.classList.remove('active'));
-  document.querySelector('.tab[onclick*="\''+t+'\'"]').classList.add('active');
-  document.getElementById('section-title').textContent=t==='command'?'Commands':t==='agent'?'Agents':'Skills';
-  document.getElementById('create-text-row').style.display=t==='skill'?'none':'flex';
-  document.getElementById('create-file-row').style.display=t==='skill'?'flex':'none';
-  closeEditor();hideCreate();loadList();
-}}
+    const $ = (id) => document.getElementById(id);
+    const toast = (m, type) => window.NDesign && NDesign.toast
+      ? NDesign.toast(m, type || 'info')
+      : console.log(`[${{type||'info'}}] ${{m}}`);
 
-function showMsg(text,ok){{
-  const el=document.getElementById('msg');
-  el.textContent=text;el.className='msg '+(ok?'ok':'err');
-  setTimeout(()=>{{el.className='msg'}},4000);
-}}
+    const fmtDate = (ms) => {{
+      const d = new Date(ms);
+      const p = (n) => String(n).padStart(2, '0');
+      return `${{d.getUTCFullYear()}}-${{p(d.getUTCMonth()+1)}}-${{p(d.getUTCDate())}} ${{p(d.getUTCHours())}}:${{p(d.getUTCMinutes())}}`;
+    }};
+    const fmtSize = (b) => b < 1024 ? `${{b}} B` : b < 1048576 ? `${{(b/1024).toFixed(1)}} KB` : `${{(b/1048576).toFixed(1)}} MB`;
+    const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
 
-function fmtDate(ms){{
-  const d=new Date(ms);
-  return d.getUTCFullYear()+'-'+String(d.getUTCMonth()+1).padStart(2,'0')+'-'+String(d.getUTCDate()).padStart(2,'0')+' '+String(d.getUTCHours()).padStart(2,'0')+':'+String(d.getUTCMinutes()).padStart(2,'0');
-}}
+    function setTab(t) {{
+      tab = t;
+      document.querySelectorAll('#tabs [role=tab]').forEach((el) => {{
+        const active = el.dataset.tab === t;
+        el.classList.toggle('nd-active', active);
+        el.setAttribute('aria-selected', active ? 'true' : 'false');
+      }});
+      $('section-title').textContent = t === 'command' ? 'Commands' : t === 'agent' ? 'Agents' : 'Skills';
+      $('create-text-row').hidden = t === 'skill';
+      $('create-file-row').hidden = t !== 'skill';
+      closeEditor();
+      hideCreate();
+      loadList();
+    }}
 
-function fmtSize(b){{
-  if(b<1024)return b+' B';
-  if(b<1048576)return (b/1024).toFixed(1)+' KB';
-  return (b/1048576).toFixed(1)+' MB';
-}}
+    async function loadList() {{
+      const resp = await fetch('/v1/skills', {{ headers: H }});
+      if (!resp.ok) {{ toast('Failed to load list', 'error'); return; }}
+      const items = (await resp.json()).filter((s) => s.kind === tab);
+      const tbody = $('list-body');
+      if (!items.length) {{
+        tbody.innerHTML = `<tr><td colspan="4" class="nd-text-muted" style="text-align:center">No ${{tab}}s yet</td></tr>`;
+        return;
+      }}
+      tbody.innerHTML = items.map((s) => `<tr>
+        <td>${{esc(s.name)}}</td>
+        <td class="nd-text-muted">${{fmtSize(s.size)}}</td>
+        <td class="nd-text-muted">${{fmtDate(s.uploaded_at)}}</td>
+        <td>
+          ${{tab !== 'skill'
+            ? `<button class="nd-btn-secondary nd-btn-sm" data-act="edit" data-name="${{esc(s.name)}}">Edit</button>`
+            : `<a class="nd-btn-secondary nd-btn-sm" href="/v1/skills/${{encodeURIComponent(s.name)}}" target="_blank">Download</a>`}}
+          <button class="nd-btn-danger nd-btn-sm" data-act="delete" data-name="${{esc(s.name)}}">Delete</button>
+        </td>
+      </tr>`).join('');
+    }}
 
-async function loadList(){{
-  const resp=await fetch('/v1/skills',{{headers:H}});
-  if(!resp.ok){{showMsg('Failed to load list',false);return;}}
-  const items=(await resp.json()).filter(s=>s.kind===tab);
-  const tbody=document.getElementById('list-body');
-  if(!items.length){{
-    tbody.innerHTML='<tr><td colspan="4" class="muted" style="text-align:center;padding:2rem">No '+tab+'s yet</td></tr>';
-    return;
-  }}
-  tbody.innerHTML=items.map(s=>`<tr>
-    <td>${{s.name}}</td>
-    <td class="muted">${{fmtSize(s.size)}}</td>
-    <td class="muted">${{fmtDate(s.uploaded_at)}}</td>
-    <td><div class="actions">
-      ${{tab!=='skill'?`<button class="btn btn-sm" onclick="doEdit('${{s.name}}')">Edit</button>`:`<a class="btn btn-sm" href="/v1/skills/${{s.name}}" target="_blank">Download</a>`}}
-      <button class="btn btn-sm btn-danger" onclick="doDelete('${{s.name}}')">Delete</button>
-    </div></td>
-  </tr>`).join('');
-}}
+    async function doEdit(name) {{
+      editName = name;
+      const resp = await fetch('/v1/skills/' + encodeURIComponent(name) + '/content', {{ headers: H }});
+      if (!resp.ok) {{ toast('Failed to load content', 'error'); return; }}
+      const data = await resp.json();
+      if (data.content === null) {{ toast('Binary skill — download to edit', 'warning'); return; }}
+      $('editor-title').textContent = 'Editing: ' + name;
+      $('editor-content').value = data.content;
+      $('editor-hint').textContent = data.kind;
+      $('editor').hidden = false;
+    }}
 
-async function doEdit(name){{
-  editName=name;
-  const resp=await fetch('/v1/skills/'+encodeURIComponent(name)+'/content',{{headers:H}});
-  if(!resp.ok){{showMsg('Failed to load content',false);return;}}
-  const data=await resp.json();
-  if(data.content===null){{showMsg('Binary skill — download to edit',false);return;}}
-  document.getElementById('editor-title').textContent='Editing: '+name;
-  document.getElementById('editor-content').value=data.content;
-  document.getElementById('editor-hint').textContent=data.kind;
-  document.getElementById('editor').classList.add('visible');
-}}
+    function closeEditor() {{
+      editName = null;
+      $('editor').hidden = true;
+    }}
 
-function closeEditor(){{
-  editName=null;
-  document.getElementById('editor').classList.remove('visible');
-}}
+    async function doSave() {{
+      if (!editName) return;
+      const content = $('editor-content').value;
+      const resp = await fetch('/v1/skills/' + encodeURIComponent(editName), {{
+        method: 'PUT',
+        headers: {{ ...H, 'Content-Type': 'text/markdown', 'X-Kind': tab }},
+        body: content,
+      }});
+      if (resp.ok) {{ toast('Saved ' + editName, 'success'); loadList(); }}
+      else {{ const e = await resp.json().catch(() => ({{}})); toast(e.error || 'Save failed', 'error'); }}
+    }}
 
-async function doSave(){{
-  if(!editName)return;
-  const content=document.getElementById('editor-content').value;
-  const resp=await fetch('/v1/skills/'+encodeURIComponent(editName),{{
-    method:'PUT',headers:{{...H,'Content-Type':'text/markdown','X-Kind':tab}},body:content
-  }});
-  if(resp.ok){{showMsg('Saved '+editName,true);loadList();}}
-  else{{const e=await resp.json().catch(()=>({{}}));showMsg(e.error||'Save failed',false);}}
-}}
+    async function doDelete(name) {{
+      if (!confirm('Delete "' + name + '"?')) return;
+      const resp = await fetch('/v1/skills/' + encodeURIComponent(name), {{ method: 'DELETE', headers: H }});
+      if (resp.ok || resp.status === 204) {{ toast('Deleted ' + name, 'success'); closeEditor(); loadList(); }}
+      else {{ toast('Delete failed', 'error'); }}
+    }}
 
-async function doDelete(name){{
-  if(!confirm('Delete "'+name+'"?'))return;
-  const resp=await fetch('/v1/skills/'+encodeURIComponent(name),{{method:'DELETE',headers:H}});
-  if(resp.ok||resp.status===204){{showMsg('Deleted '+name,true);closeEditor();loadList();}}
-  else{{showMsg('Delete failed',false);}}
-}}
+    function toggleCreate() {{
+      const el = $('create-form');
+      el.hidden = !el.hidden;
+      if (el.hidden) {{ $('create-name').value = ''; $('create-content').value = ''; }}
+    }}
+    function hideCreate() {{ $('create-form').hidden = true; }}
 
-function toggleCreate(){{
-  const el=document.getElementById('create-form');
-  el.classList.toggle('visible');
-  if(!el.classList.contains('visible')){{
-    document.getElementById('create-name').value='';
-    document.getElementById('create-content').value='';
-  }}
-}}
-function hideCreate(){{document.getElementById('create-form').classList.remove('visible');}}
+    async function doCreate() {{
+      const name = $('create-name').value.trim();
+      if (!name) {{ toast('Name is required', 'error'); return; }}
+      let resp;
+      if (tab === 'skill') {{
+        const file = $('create-file').files[0];
+        if (!file) {{ toast('Select a zip file', 'error'); return; }}
+        const buf = await file.arrayBuffer();
+        resp = await fetch('/v1/skills/' + encodeURIComponent(name), {{
+          method: 'PUT',
+          headers: {{ ...H, 'Content-Type': 'application/zip', 'X-Kind': 'skill' }},
+          body: buf,
+        }});
+      }} else {{
+        const content = $('create-content').value;
+        if (!content.trim()) {{ toast('Content is required', 'error'); return; }}
+        resp = await fetch('/v1/skills/' + encodeURIComponent(name), {{
+          method: 'PUT',
+          headers: {{ ...H, 'Content-Type': 'text/markdown', 'X-Kind': tab }},
+          body: content,
+        }});
+      }}
+      if (resp.ok) {{ toast('Created ' + (tab === 'skill' ? 'skill ' : tab + ' ') + name, 'success'); hideCreate(); loadList(); }}
+      else {{ const e = await resp.json().catch(() => ({{}})); toast(e.error || 'Create failed', 'error'); }}
+    }}
 
-async function doCreate(){{
-  const name=document.getElementById('create-name').value.trim();
-  if(!name){{showMsg('Name is required',false);return;}}
-  if(tab==='skill'){{
-    const file=document.getElementById('create-file').files[0];
-    if(!file){{showMsg('Select a zip file',false);return;}}
-    const buf=await file.arrayBuffer();
-    const resp=await fetch('/v1/skills/'+encodeURIComponent(name),{{
-      method:'PUT',headers:{{...H,'Content-Type':'application/zip','X-Kind':'skill'}},body:buf
+    // Wire up event delegation.
+    document.getElementById('tabs').addEventListener('click', (e) => {{
+      const btn = e.target.closest('[role=tab]');
+      if (btn) setTab(btn.dataset.tab);
     }});
-    if(resp.ok){{showMsg('Created skill '+name,true);hideCreate();loadList();}}
-    else{{const e=await resp.json().catch(()=>({{}}));showMsg(e.error||'Create failed',false);}}
-  }} else {{
-    const content=document.getElementById('create-content').value;
-    if(!content.trim()){{showMsg('Content is required',false);return;}}
-    const resp=await fetch('/v1/skills/'+encodeURIComponent(name),{{
-      method:'PUT',headers:{{...H,'Content-Type':'text/markdown','X-Kind':tab}},body:content
+    $('list-body').addEventListener('click', (e) => {{
+      const btn = e.target.closest('button[data-act]');
+      if (!btn) return;
+      const name = btn.dataset.name;
+      if (btn.dataset.act === 'edit') doEdit(name);
+      else if (btn.dataset.act === 'delete') doDelete(name);
     }});
-    if(resp.ok){{showMsg('Created '+tab+' '+name,true);hideCreate();loadList();}}
-    else{{const e=await resp.json().catch(()=>({{}}));showMsg(e.error||'Create failed',false);}}
-  }}
-}}
+    $('btn-toggle-create').addEventListener('click', toggleCreate);
+    $('btn-cancel-create').addEventListener('click', toggleCreate);
+    $('btn-create').addEventListener('click', doCreate);
+    $('btn-close-editor').addEventListener('click', closeEditor);
+    $('btn-save').addEventListener('click', doSave);
 
-loadList();
+    loadList();
+  }})();
 </script>
-</div></body></html>"##,
-        api_key = api_key,
-    ))
+</body>
+</html>"##,
+        ndesign_head = ndesign_head(&theme),
+        ndesign_scripts = ndesign_scripts(),
+        theme_toggle = theme_toggle_button(),
+        api_key_json = serde_json::to_string(&api_key).unwrap_or_else(|_| "\"\"".into()),
+    )))
 }
 
 // ── GET / (dashboard) ─────────────────────────────────────────────────────────
@@ -630,21 +700,19 @@ fn he(s: &str) -> String {
 
 pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
     let db = state.db.clone();
-    let data = spawn_blocking(move || {
+    let (data, theme) = spawn_blocking(move || -> anyhow::Result<_> {
         let conn = db.lock().unwrap();
-        db::get_dashboard_data(&conn)
+        Ok((db::get_dashboard_data(&conn)?, db::get_theme(&conn)?))
     })
     .await??;
 
-    // Build the update banner if a newer version is available.
-    let current_version = env!("CARGO_PKG_VERSION");
+    let current_version = env!("AGENT_GATEWAY_VERSION");
     let update_banner = {
         let guard = state.update_available.lock().unwrap();
         match guard.as_deref() {
             Some(version) => format!(
-                r#"<div style="background:#fefcbf;border:1px solid #ecc94b;border-radius:8px;padding:0.75rem 1rem;margin-bottom:1.5rem;color:#744210;font-size:0.9rem">
-  <strong>Update available:</strong> {} (current: v{})
-  <div style="margin-top:0.3rem;font-size:0.82rem;color:#975a16">Run: <code style="background:#fefce8;padding:0.15rem 0.4rem;border-radius:4px">gateway update</code></div>
+                r#"<div class="nd-alert nd-alert-warning nd-mb-lg">
+  <strong>Update available:</strong> {} (current: v{}) — run <code>gateway update</code>
 </div>"#,
                 he(version),
                 he(current_version),
@@ -653,94 +721,130 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
         }
     };
 
-    let rows = data
-        .projects
-        .iter()
-        .map(|p| {
-            let unread_cell = if p.unread_count > 0 {
-                format!(
-                    "<span style='color:#e53e3e;font-weight:600'>{}</span>",
-                    p.unread_count
-                )
-            } else {
-                "0".into()
-            };
-            format!(
-                "<tr><td>{}</td><td>{}</td><td class='muted'>{}</td><td>{}</td><td>{}</td></tr>",
-                he(&p.ident),
-                he(&p.channel_name),
-                he(&p.room_id),
-                p.total_messages,
-                unread_cell,
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let empty_row = if data.project_count == 0 {
-        "<tr><td colspan='5' style='text-align:center;color:#a0aec0;padding:2rem'>No projects registered yet</td></tr>"
+    let rows = if data.project_count == 0 {
+        r#"<tr><td colspan="5" class="nd-text-muted" style="text-align:center">No projects registered yet</td></tr>"#.to_string()
     } else {
-        ""
+        data.projects
+            .iter()
+            .map(|p| {
+                let unread_cell = if p.unread_count > 0 {
+                    format!(
+                        r#"<span class="nd-badge nd-badge-sm nd-text-danger">{}</span>"#,
+                        p.unread_count
+                    )
+                } else {
+                    "0".into()
+                };
+                format!(
+                    "<tr><td>{}</td><td>{}</td><td class=\"nd-text-muted\">{}</td><td>{}</td><td>{}</td></tr>",
+                    he(&p.ident),
+                    he(&p.channel_name),
+                    he(&p.room_id),
+                    p.total_messages,
+                    unread_cell,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     };
 
     let html = format!(
-        r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>agent-gateway Gateway</title>
-<style>
-  *{{box-sizing:border-box;margin:0;padding:0}}
-  body{{font-family:system-ui,sans-serif;background:#f7fafc;color:#1a202c;padding:2rem 1rem}}
-  .wrap{{max-width:960px;margin:0 auto}}
-  header{{margin-bottom:1.5rem}}
-  h1{{font-size:1.4rem;font-weight:700}}
-  .sub{{color:#718096;font-size:0.9rem;margin-top:0.2rem}}
-  .stats{{display:flex;flex-wrap:wrap;gap:1rem;margin:1.5rem 0}}
-  .card{{background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:1rem 1.5rem;min-width:140px}}
-  .card-n{{font-size:2rem;font-weight:700;line-height:1.1}}
-  .card-l{{font-size:0.75rem;color:#718096;text-transform:uppercase;letter-spacing:0.05em;margin-top:0.3rem}}
-  .section{{background:#fff;border:1px solid #e2e8f0;border-radius:8px;overflow:hidden}}
-  .section-head{{padding:0.75rem 1rem;border-bottom:1px solid #e2e8f0;font-size:0.8rem;font-weight:600;color:#4a5568;text-transform:uppercase;letter-spacing:0.05em}}
-  table{{width:100%;border-collapse:collapse}}
-  th{{text-align:left;padding:0.6rem 1rem;font-size:0.78rem;font-weight:600;color:#4a5568;text-transform:uppercase;letter-spacing:0.04em;background:#f7fafc;border-bottom:1px solid #e2e8f0}}
-  td{{padding:0.65rem 1rem;font-size:0.88rem;border-bottom:1px solid #edf2f7}}
-  tr:last-child td{{border-bottom:none}}
-  tr:hover td{{background:#f7fafc}}
-  .muted{{color:#718096;font-size:0.8rem}}
-</style></head>
-<body><div class="wrap">
-{}
-<header>
-  <h1>agent-gateway Gateway</h1>
-  <div class="sub">Channel plugin dashboard</div>
+        r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agent-gateway</title>
+{ndesign_head}
+</head>
+<body>
+<header class="nd-flex nd-flex-between nd-p-md">
+  <div>
+    <h1>agent-gateway</h1>
+    <div class="nd-text-muted nd-text-sm">Channel plugin dashboard · v{version}</div>
+  </div>
+  <div class="nd-flex nd-gap-sm">
+    <a class="nd-btn-secondary" href="/manage">Manage</a>
+    {theme_toggle}
+  </div>
 </header>
-<div class="stats">
-  <div class="card"><div class="card-n">{}</div><div class="card-l">Projects</div></div>
-  <div class="card"><div class="card-n">{}</div><div class="card-l">Total messages</div></div>
-  <div class="card"><div class="card-n">{}</div><div class="card-l">Agent</div></div>
-  <div class="card"><div class="card-n">{}</div><div class="card-l">User</div></div>
-  <div class="card"><div class="card-n">{}</div><div class="card-l">Skills</div></div>
-</div>
-<div class="section">
-  <div class="section-head">Projects</div>
-  <table>
-  <thead><tr>
-    <th>Project</th><th>Channel</th><th>Room ID</th><th>Messages</th><th>Unread</th>
-  </tr></thead>
-  <tbody>{}{}</tbody>
-  </table>
-</div>
-</div></body></html>"#,
-        update_banner,
-        data.project_count,
-        data.total_messages,
-        data.agent_messages,
-        data.user_messages,
-        data.skill_count,
-        rows,
-        empty_row,
+<main class="nd-p-lg">
+  {banner}
+
+  <section class="nd-row nd-gap-md nd-mb-lg">
+    <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{projects}</div><div class="nd-text-xs nd-text-muted">Projects</div></div></div></div>
+    <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{total}</div><div class="nd-text-xs nd-text-muted">Total messages</div></div></div></div>
+    <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{agent}</div><div class="nd-text-xs nd-text-muted">Agent</div></div></div></div>
+    <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{user}</div><div class="nd-text-xs nd-text-muted">User</div></div></div></div>
+    <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{skills}</div><div class="nd-text-xs nd-text-muted">Skills</div></div></div></div>
+  </section>
+
+  <section class="nd-card">
+    <div class="nd-card-header"><strong>Projects</strong></div>
+    <div class="nd-card-body nd-p-0">
+      <table class="nd-table nd-table-hover">
+        <thead><tr><th>Project</th><th>Channel</th><th>Room ID</th><th>Messages</th><th>Unread</th></tr></thead>
+        <tbody>{rows}</tbody>
+      </table>
+    </div>
+  </section>
+</main>
+{ndesign_scripts}
+</body>
+</html>"##,
+        ndesign_head = ndesign_head(&theme),
+        ndesign_scripts = ndesign_scripts(),
+        theme_toggle = theme_toggle_button(),
+        banner = update_banner,
+        version = he(current_version),
+        projects = data.project_count,
+        total = data.total_messages,
+        agent = data.agent_messages,
+        user = data.user_messages,
+        skills = data.skill_count,
+        rows = rows,
     );
 
     Ok(Html(html))
+}
+
+// ── ndesign partials (shared by dashboard + manage) ──────────────────────────
+
+const NDESIGN_BASE: &str = "https://storage.googleapis.com/ndesign-cdn/ndesign/latest";
+
+fn ndesign_head(theme: &str) -> String {
+    let theme = if theme == "light" { "light" } else { "dark" };
+    format!(
+        r#"<link rel="stylesheet" href="{base}/ndesign.min.css">
+<link rel="stylesheet" class="theme" data-theme="{theme}" href="{base}/themes/{theme}.min.css">
+<meta name="nd-theme" content="light" data-href="{base}/themes/light.min.css">
+<meta name="nd-theme" content="dark" data-href="{base}/themes/dark.min.css">"#,
+        base = NDESIGN_BASE,
+        theme = theme,
+    )
+}
+
+fn ndesign_scripts() -> String {
+    format!(
+        r##"<script src="{base}/ndesign.min.js"></script>
+<script>
+  // Persist theme changes to the server so they survive reloads.
+  document.addEventListener('nd:theme-change', (e) => {{
+    const theme = e.detail && e.detail.theme;
+    if (!theme) return;
+    fetch('/theme', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{theme}})
+    }}).catch(() => {{}});
+  }});
+</script>"##,
+        base = NDESIGN_BASE,
+    )
+}
+
+fn theme_toggle_button() -> &'static str {
+    r#"<button class="nd-btn-secondary" data-nd-theme-toggle title="Toggle theme">Theme</button>"#
 }
 
 // ── GET /v1/projects/:ident/messages/unread ───────────────────────────────────
