@@ -960,7 +960,7 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
     };
 
     let rows = if data.project_count == 0 {
-        r#"<tr><td colspan="5" class="nd-text-muted" style="text-align:center">No projects registered yet</td></tr>"#.to_string()
+        r#"<tr><td colspan="5" class="nd-text-muted nd-text-center">No projects registered yet</td></tr>"#.to_string()
     } else {
         data.projects
             .iter()
@@ -986,28 +986,9 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
             .join("\n")
     };
 
-    let html = format!(
-        r##"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>agent-gateway</title>
-{ndesign_head}
-</head>
-<body>
-<header class="nd-flex nd-flex-between nd-p-md">
-  <div>
-    <h1>agent-gateway</h1>
-    <div class="nd-text-muted nd-text-sm">Channel plugin dashboard · v{version}</div>
-  </div>
-  <div class="nd-flex nd-gap-sm">
-    <a class="nd-btn-secondary" href="/manage">Manage</a>
-    {theme_toggle}
-  </div>
-</header>
-<main class="nd-p-lg">
-  {banner}
+    let content = format!(
+        r#"  {banner}
+  <p class="nd-text-muted nd-text-sm">Channel plugin dashboard · v{version}</p>
 
   <section class="nd-row nd-gap-md nd-mb-lg">
     <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{projects}</div><div class="nd-text-xs nd-text-muted">Projects</div></div></div></div>
@@ -1025,14 +1006,7 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
         <tbody>{rows}</tbody>
       </table>
     </div>
-  </section>
-</main>
-{ndesign_scripts}
-</body>
-</html>"##,
-        ndesign_head = ndesign_head(&theme),
-        ndesign_scripts = ndesign_scripts(),
-        theme_toggle = theme_toggle_button(),
+  </section>"#,
         banner = update_banner,
         version = he(current_version),
         projects = data.project_count,
@@ -1041,6 +1015,14 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
         user = data.user_messages,
         skills = data.skill_count,
         rows = rows,
+    );
+
+    let html = format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
+        head = control_panel_head("agent-gateway — Dashboard", &theme),
+        open = control_panel_open("Dashboard", "dashboard"),
+        content = content,
+        close = control_panel_close(&state.api_key),
     );
 
     Ok(Html(html))
@@ -1527,6 +1509,106 @@ fn ndesign_scripts() -> String {
 
 fn theme_toggle_button() -> &'static str {
     r#"<button class="nd-btn-secondary" data-nd-theme-toggle title="Toggle theme">Theme</button>"#
+}
+
+// ── Control-panel layout helpers (shared by dashboard + future admin pages) ───
+
+/// Render the `<head>` contents for a control-panel page.
+///
+/// Emits charset + viewport meta, the page `<title>`, ndesign base CSS, the
+/// active theme stylesheet (class `theme` so the runtime switcher can swap it),
+/// the two theme-registration meta tags, plus the `endpoint:api` and
+/// `csrf-token` meta tags the ndesign runtime expects.
+///
+/// `theme` must be `"light"` or `"dark"`; any other value falls back to
+/// `"dark"`.
+fn control_panel_head(title: &str, theme: &str) -> String {
+    let theme = if theme == "light" { "light" } else { "dark" };
+    format!(
+        r#"<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<link rel="stylesheet" href="{base}/ndesign.min.css">
+<link rel="stylesheet" class="theme" data-theme="{theme}" href="{base}/themes/{theme}.min.css">
+<meta name="nd-theme" content="light" data-href="{base}/themes/light.min.css">
+<meta name="nd-theme" content="dark" data-href="{base}/themes/dark.min.css">
+<meta name="endpoint:api" content="">
+<meta name="csrf-token" content="">"#,
+        title = he(title),
+        base = NDESIGN_BASE,
+        theme = theme,
+    )
+}
+
+/// Open the control-panel body up to the start of `<main class="app-content">`.
+///
+/// Emits `<body class="app-page">`, the app layout wrapper, the sidebar (brand
+/// plus the Main section with Dashboard / Tasks / Manage links), and the
+/// header (hamburger toggle, page title, theme toggle).
+///
+/// * `page_title` — rendered inside the header's `<h1>`.
+/// * `active` — which sidebar link receives `class="nd-active"`. Accepts
+///   `"dashboard"`, `"tasks"`, or `"manage"`. Any other value leaves all links
+///   inactive.
+fn control_panel_open(page_title: &str, active: &str) -> String {
+    let cls = |key: &str| -> &'static str {
+        if key == active {
+            r#" class="nd-active""#
+        } else {
+            ""
+        }
+    };
+    format!(
+        r#"<body class="app-page">
+<div class="app-layout nd-h-screen nd-overflow-hidden">
+  <nav class="sidebar" id="app-sidebar">
+    <span class="nd-nav-brand">agent-gateway</span>
+    <p class="nd-nav-section">Main</p>
+    <ul class="nd-nav-menu">
+      <li><a href="/"{dashboard}>Dashboard</a></li>
+      <li><a href="/tasks"{tasks}>Tasks</a></li>
+      <li><a href="/manage"{manage}>Manage</a></li>
+    </ul>
+  </nav>
+  <div class="app-body">
+    <header>
+      <div class="app-header-left">
+        <button class="hamburger" data-nd-toggle="sidebar">&#9776;</button>
+        <h1 class="app-header-title">{title}</h1>
+      </div>
+      <div class="app-header-right">
+        {theme_toggle}
+      </div>
+    </header>
+    <main class="app-content">"#,
+        dashboard = cls("dashboard"),
+        tasks = cls("tasks"),
+        manage = cls("manage"),
+        title = he(page_title),
+        theme_toggle = theme_toggle_button(),
+    )
+}
+
+/// Close the control-panel body: close `<main>`, `<div class="app-body">`,
+/// and `<div class="app-layout">`, then emit the ndesign runtime script and
+/// the `NDesign.configure` bearer-auth setup, then close `<body>` and
+/// `<html>`.
+///
+/// The bearer token is JSON-escaped via `serde_json::to_string` so it is safe
+/// to interpolate inside the inline script literal.
+fn control_panel_close(api_key: &str) -> String {
+    let api_key_json = serde_json::to_string(api_key).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"    </main>
+  </div>
+</div>
+<script src="{base}/ndesign.min.js"></script>
+<script>NDesign.configure({{ headers: {{ 'Authorization': 'Bearer ' + {api_key_json} }} }});</script>
+</body>
+</html>"#,
+        base = NDESIGN_BASE,
+        api_key_json = api_key_json,
+    )
 }
 
 // ── GET /v1/projects/:ident/messages/unread ───────────────────────────────────
