@@ -940,7 +940,7 @@ async fn render_kind_page(state: &AppState, kind: &str) -> Result<Html<String>> 
     let full_title = format!("agent-gateway — {page_title}");
     let html = format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
-        head = control_panel_head(&full_title, &theme),
+        head = control_panel_head(&full_title, &theme, ""),
         open = control_panel_open(page_title, active),
         content = content,
         close = control_panel_close(&state.api_key),
@@ -1056,7 +1056,7 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
 
     let html = format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
-        head = control_panel_head("agent-gateway — Dashboard", &theme),
+        head = control_panel_head("agent-gateway — Dashboard", &theme, ""),
         open = control_panel_open("Dashboard", "dashboard"),
         content = content,
         close = control_panel_close(&state.api_key),
@@ -1113,13 +1113,50 @@ pub struct AddCommentRequest {
 }
 
 /// Flat detail shape: all `Task` fields at the top level (via `#[serde(flatten)]`)
-/// plus a sibling `comments` array. Designed so that ndesign's `data-nd-bind`
-/// can render the detail view without unwrapping an envelope.
+/// plus a sibling `comments` array and a derived `actions` array. Designed so
+/// that ndesign's `data-nd-bind` can render the detail view — including
+/// status-transition buttons — without template conditionals.
 #[derive(Serialize)]
 pub struct TaskWithComments {
     #[serde(flatten)]
     pub task: db::Task,
     pub comments: Vec<db::TaskComment>,
+    pub actions: Vec<TaskAction>,
+}
+
+/// One status-transition button derived from the task's current status.
+///
+/// The UI iterates this array inside the modal; each entry is rendered as a
+/// `<button data-nd-action="PATCH …" data-nd-body=…>` so ndesign fires the
+/// PATCH when the user clicks. `style` is the `nd-btn-*` suffix
+/// (`primary` | `secondary`) so the template can build the class name.
+#[derive(Serialize)]
+pub struct TaskAction {
+    pub verb: String,
+    pub style: String,
+    pub target_status: String,
+}
+
+/// Compute the list of allowed status transitions for a given current status.
+/// Kept in one place so the UI and any future API consumers agree.
+fn actions_for_status(status: &str) -> Vec<TaskAction> {
+    let mk = |verb: &str, style: &str, target: &str| TaskAction {
+        verb: verb.into(),
+        style: style.into(),
+        target_status: target.into(),
+    };
+    match status {
+        "todo" => vec![
+            mk("Claim", "primary", "in_progress"),
+            mk("Done", "primary", "done"),
+        ],
+        "in_progress" => vec![
+            mk("Release", "secondary", "todo"),
+            mk("Done", "primary", "done"),
+        ],
+        "done" => vec![mk("Reopen", "secondary", "todo")],
+        _ => vec![],
+    }
 }
 
 #[derive(Serialize)]
@@ -1307,10 +1344,14 @@ pub async fn get_task_handler(
     .await??;
 
     match detail {
-        Some(d) => Ok(Json(TaskWithComments {
-            task: d.task,
-            comments: d.comments,
-        })),
+        Some(d) => {
+            let actions = actions_for_status(&d.task.status);
+            Ok(Json(TaskWithComments {
+                task: d.task,
+                comments: d.comments,
+                actions,
+            }))
+        }
         None => Err(AppError(
             StatusCode::NOT_FOUND,
             format!("task not found in project '{}'", ident),
@@ -1572,7 +1613,7 @@ pub async fn tasks_picker(State(state): State<AppState>) -> Result<Html<String>>
 
     let html = format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
-        head = control_panel_head("agent-gateway — Tasks", &theme),
+        head = control_panel_head("agent-gateway — Tasks", &theme, ""),
         open = control_panel_open("Tasks", "tasks"),
         content = content,
         close = control_panel_close(&state.api_key),
@@ -1620,7 +1661,18 @@ pub async fn tasks_board(
     // into IN PROGRESS, only the destination column's reorder POST fires; the
     // source column keeps the stale node in its DOM until the next manual
     // refresh. Fixing this requires a follow-up in the ndesign runtime, not
-    // per-page JS — see the task detail page for the manual-refresh story.
+    // per-page JS.
+    //
+    // Layout: `.nd-row` provides its own gutter via negative margin + child
+    // col padding (Bootstrap style). Adding `.nd-gap-md` on top stacks a flex
+    // `gap` that pushes 3 × 33.33% past 100% of the container, wrapping the
+    // last column. Keep the row gap-less.
+    //
+    // Modal pattern (ndesign SPEC §5.8, §20.12): the card button writes the
+    // task id into the `selectedTaskId` store var, opens the dialog, and
+    // dispatches `nd:refresh` on every bound panel inside the dialog. The
+    // three panels share the same URL (`…/tasks/${selectedTaskId}`) so the
+    // runtime dedupes them into a single HTTP fetch.
     let content = format!(
         r##"  <div class="nd-flex nd-gap-md nd-mb-md">
     <a class="nd-btn-ghost nd-btn-sm" href="/tasks">← All projects</a>
@@ -1630,21 +1682,18 @@ pub async fn tasks_board(
   <!-- Shared card template used by all three columns. -->
   <template id="task-card">
     <li class="nd-card nd-mb-sm" data-id="{{{{id}}}}">
-      <div class="nd-card-body">
-        <a href="/projects/{ident}/tasks/{{{{id}}}}" class="nd-text-base nd-font-bold">{{{{title}}}}</a>
-        <div class="nd-text-muted nd-text-sm">
-          {{{{owner_agent_id}}}} · {{{{hostname}}}} · {{{{comment_count}}}} comments
-        </div>
-      </div>
+      <button type="button"
+              class="nd-card-body nd-btn-ghost nd-text-left nd-w-full"
+              data-nd-set="selectedTaskId='{{{{id}}}}'"
+              data-nd-modal="#task-modal"
+              data-nd-success="refresh:#task-modal-header,refresh:#task-modal-actions,refresh:#task-modal-comments">
+        <div class="nd-font-semibold">{{{{title}}}}</div>
+        <div class="nd-text-muted nd-text-sm">{{{{comment_count}}}} comments</div>
+      </button>
     </li>
   </template>
 
-  <!--
-    Known limitation: cross-column drags update the destination column only;
-    the source column still shows the moved card until reload. The fix lives
-    in the ndesign runtime's reorder handler, not this page.
-  -->
-  <div class="nd-row nd-gap-md">
+  <div class="nd-row">
     <section class="nd-card nd-col-4">
       <div class="nd-card-header"><strong>TODO</strong></div>
       <ul class="nd-card-body"
@@ -1685,238 +1734,121 @@ pub async fn tasks_board(
     </section>
   </div>
 
+  <!-- New-task modal — unchanged pattern, posts and refreshes the TODO column. -->
   <dialog id="new-task-modal" class="nd-modal">
     <form data-nd-action="POST /v1/projects/{ident}/tasks"
           data-nd-success="close-modal,refresh:#col-todo,reset">
-      <h3>New task</h3>
-      <div class="nd-form-group">
-        <label for="new-title">Title</label>
-        <input id="new-title" name="title" required>
+      <header><h3>New task</h3></header>
+      <div>
+        <div class="nd-form-group">
+          <label for="new-title">Title</label>
+          <input id="new-title" name="title" required>
+        </div>
+        <div class="nd-form-group">
+          <label for="new-description">Description</label>
+          <textarea id="new-description" name="description" rows="3"></textarea>
+        </div>
+        <div class="nd-form-group">
+          <label for="new-details">Details</label>
+          <textarea id="new-details" name="details" rows="6"></textarea>
+        </div>
       </div>
-      <div class="nd-form-group">
-        <label for="new-description">Description</label>
-        <textarea id="new-description" name="description" rows="3"></textarea>
-      </div>
-      <div class="nd-form-group">
-        <label for="new-details">Details</label>
-        <textarea id="new-details" name="details" rows="6"></textarea>
-      </div>
-      <menu>
+      <footer>
         <button type="button" data-nd-dismiss class="nd-btn-ghost">Cancel</button>
         <button type="submit" class="nd-btn-primary">Create</button>
-      </menu>
+      </footer>
     </form>
+  </dialog>
+
+  <!--
+    Task detail modal. Three bound panels share the same URL so ndesign's
+    in-flight dedup issues exactly one GET per open/switch. Every write (PATCH,
+    POST comment) refreshes the three panels AND every column, so the board
+    and the modal stay in lockstep without a page reload.
+  -->
+  <dialog id="task-modal" class="nd-modal nd-modal-lg">
+    <header>
+      <h3 id="task-modal-header"
+          data-nd-bind="/v1/projects/{ident}/tasks/${{selectedTaskId}}"
+          data-nd-field="title"
+          data-nd-defer></h3>
+      <button type="button" class="nd-modal-close" data-nd-dismiss aria-label="Close">&times;</button>
+    </header>
+    <div>
+      <div id="task-modal-meta"
+           data-nd-bind="/v1/projects/{ident}/tasks/${{selectedTaskId}}"
+           data-nd-template="task-modal-meta-tmpl"
+           data-nd-defer>
+        <template id="task-modal-meta-tmpl">
+          <div class="nd-text-muted nd-text-sm nd-mb-md">
+            status: {{{{status}}}} · rank {{{{rank}}}} · reporter {{{{reporter}}}}
+          </div>
+          <p class="nd-text-muted nd-text-sm">Description</p>
+          <p>{{{{description}}}}</p>
+          <p class="nd-text-muted nd-text-sm nd-mt-md">Details</p>
+          <pre class="nd-text-sm">{{{{details}}}}</pre>
+        </template>
+      </div>
+
+      <div id="task-modal-actions"
+           class="nd-flex nd-gap-sm nd-mt-md nd-mb-lg"
+           data-nd-bind="/v1/projects/{ident}/tasks/${{selectedTaskId}}"
+           data-nd-select="actions"
+           data-nd-template="task-modal-action-tmpl"
+           data-nd-defer>
+        <template id="task-modal-action-tmpl">
+          <button type="button"
+                  class="nd-btn-{{{{style}}}} nd-btn-sm"
+                  data-nd-action="PATCH /v1/projects/{ident}/tasks/${{selectedTaskId}}"
+                  data-nd-body='{{"status":"{{{{target_status}}}}"}}'
+                  data-nd-success="refresh:#col-todo,refresh:#col-in_progress,refresh:#col-done,refresh:#task-modal-header,refresh:#task-modal-meta,refresh:#task-modal-actions">
+            {{{{verb}}}}
+          </button>
+        </template>
+      </div>
+
+      <section class="nd-card">
+        <div class="nd-card-header"><strong>Comments</strong></div>
+        <div class="nd-card-body">
+          <div id="task-modal-comments"
+               data-nd-bind="/v1/projects/{ident}/tasks/${{selectedTaskId}}"
+               data-nd-select="comments"
+               data-nd-template="task-modal-comment-tmpl"
+               data-nd-defer>
+            <template id="task-modal-comment-tmpl">
+              <div class="nd-mb-md">
+                <div class="nd-text-muted nd-text-sm">{{{{author}}}} ({{{{author_type}}}})</div>
+                <div>{{{{content}}}}</div>
+              </div>
+            </template>
+            <template data-nd-empty>
+              <p class="nd-text-muted nd-text-sm">No comments yet.</p>
+            </template>
+          </div>
+
+          <form class="nd-mt-lg"
+                data-nd-action="POST /v1/projects/{ident}/tasks/${{selectedTaskId}}/comments"
+                data-nd-success="refresh:#task-modal-comments,reset">
+            <div class="nd-form-group">
+              <label for="task-modal-comment">Add a comment</label>
+              <textarea id="task-modal-comment" name="content" rows="3" required></textarea>
+            </div>
+            <button type="submit" class="nd-btn-primary nd-btn-sm">Comment</button>
+          </form>
+        </div>
+      </section>
+    </div>
   </dialog>"##,
         ident = ident_attr,
     );
 
     let html = format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
-        head = control_panel_head(&page_title, &theme),
-        open = control_panel_open(&page_title, "tasks"),
-        content = content,
-        close = control_panel_close(&state.api_key),
-    );
-    Ok(Html(html))
-}
-
-// ── GET /projects/:ident/tasks/:id (task detail — server-rendered) ───────────
-
-/// Format an optional epoch-millis timestamp as RFC-3339 UTC. Returns an
-/// em dash when the value is `None` or outside chrono's representable range.
-fn format_ts_ms(ms: Option<i64>) -> String {
-    ms.and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
-        .map(|d| d.to_rfc3339())
-        .unwrap_or_else(|| "—".to_string())
-}
-
-/// Render a detail page for a single task. All strings that originate from the
-/// database (title, description, details, comment content, agent ids) flow
-/// through `he()` before being interpolated into HTML to defeat XSS.
-///
-/// The page is fully server-rendered — no `data-nd-bind` — because there is
-/// no matching GET endpoint for "comments of one task". Claim/Release/Done/
-/// Reopen buttons use `data-nd-action` / `data-nd-success="reload"` so the
-/// page refreshes after the PATCH completes.
-pub async fn task_detail_page(
-    State(state): State<AppState>,
-    Path((ident, task_id)): Path<(String, String)>,
-) -> Result<Html<String>> {
-    let db_handle = state.db.clone();
-    let ident_for_lookup = ident.clone();
-    let ident_for_reclaim = ident.clone();
-    let ident_for_fetch = ident.clone();
-    let task_id_clone = task_id.clone();
-
-    let (project, detail, theme) = spawn_blocking(
-        move || -> anyhow::Result<(Option<db::Project>, Option<db::TaskDetail>, String)> {
-            let conn = db_handle.lock().unwrap();
-            let project = db::get_project(&conn, &ident_for_lookup)?;
-            if project.is_none() {
-                return Ok((None, None, db::get_theme(&conn)?));
-            }
-            db::reclaim_stale_tasks(&conn, &ident_for_reclaim)?;
-            let detail = db::get_task_detail(&conn, &ident_for_fetch, &task_id_clone)?;
-            let theme = db::get_theme(&conn)?;
-            Ok((project, detail, theme))
-        },
-    )
-    .await??;
-
-    let project = project.ok_or_else(|| {
-        AppError(
-            StatusCode::NOT_FOUND,
-            format!("project '{}' not found", ident),
-        )
-    })?;
-    let detail = detail.ok_or_else(|| {
-        AppError(
-            StatusCode::NOT_FOUND,
-            format!("task not found in project '{}'", ident),
-        )
-    })?;
-
-    let ident_attr = he(&project.ident);
-    let task = &detail.task;
-    let task_id_attr = he(&task.id);
-    let title = he(&task.title);
-    let status = he(&task.status);
-    let reporter = he(&task.reporter);
-    let owner = task
-        .owner_agent_id
-        .as_deref()
-        .map(he)
-        .unwrap_or_else(|| "—".to_string());
-    let description_block = match task.description.as_deref() {
-        Some(d) if !d.is_empty() => format!("<p>{}</p>", he(d)),
-        _ => r#"<p class="nd-text-muted">—</p>"#.to_string(),
-    };
-    let details_block = match task.details.as_deref() {
-        Some(d) if !d.is_empty() => format!("<pre class=\"nd-text-sm\">{}</pre>", he(d)),
-        _ => r#"<p class="nd-text-muted">—</p>"#.to_string(),
-    };
-
-    // Conditional action buttons keyed off current status.
-    let action_buttons = match task.status.as_str() {
-        "todo" => format!(
-            r##"<button class="nd-btn-primary nd-btn-sm"
-        data-nd-action="PATCH /v1/projects/{ident}/tasks/{tid}"
-        data-nd-body='{{"status":"in_progress"}}'
-        data-nd-success="reload">Claim</button>
-      <button class="nd-btn-primary nd-btn-sm"
-        data-nd-action="PATCH /v1/projects/{ident}/tasks/{tid}"
-        data-nd-body='{{"status":"done"}}'
-        data-nd-success="reload">Done</button>"##,
-            ident = ident_attr,
-            tid = task_id_attr,
+        head = control_panel_head(
+            &page_title,
+            &theme,
+            r#"<meta name="var:selectedTaskId" content="">"#,
         ),
-        "in_progress" => format!(
-            r##"<button class="nd-btn-secondary nd-btn-sm"
-        data-nd-action="PATCH /v1/projects/{ident}/tasks/{tid}"
-        data-nd-body='{{"status":"todo"}}'
-        data-nd-success="reload">Release</button>
-      <button class="nd-btn-primary nd-btn-sm"
-        data-nd-action="PATCH /v1/projects/{ident}/tasks/{tid}"
-        data-nd-body='{{"status":"done"}}'
-        data-nd-success="reload">Done</button>"##,
-            ident = ident_attr,
-            tid = task_id_attr,
-        ),
-        "done" => format!(
-            r##"<button class="nd-btn-secondary nd-btn-sm"
-        data-nd-action="PATCH /v1/projects/{ident}/tasks/{tid}"
-        data-nd-body='{{"status":"todo"}}'
-        data-nd-success="reload">Reopen</button>"##,
-            ident = ident_attr,
-            tid = task_id_attr,
-        ),
-        _ => String::new(),
-    };
-
-    // Comments — server-rendered in the order returned by get_task_detail.
-    let comment_count = detail.comments.len();
-    let comments_html = if detail.comments.is_empty() {
-        r#"<p class="nd-text-muted nd-text-sm">No comments yet.</p>"#.to_string()
-    } else {
-        detail
-            .comments
-            .iter()
-            .map(|c| {
-                format!(
-                    r#"<div class="nd-mb-md">
-      <div class="nd-text-muted nd-text-sm">{author} ({author_type}) · {created}</div>
-      <div>{content}</div>
-    </div>"#,
-                    author = he(&c.author),
-                    author_type = he(&c.author_type),
-                    created = he(&format_ts_ms(Some(c.created_at))),
-                    content = he(&c.content),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-
-    let page_title = format!("Task — {}", project.ident);
-
-    let content = format!(
-        r##"  <div class="nd-flex nd-gap-sm nd-mb-md">
-    <a class="nd-btn-ghost nd-btn-sm" href="/projects/{ident}/tasks">← Back to board</a>
-  </div>
-
-  <section class="nd-card nd-mb-lg">
-    <div class="nd-card-header nd-flex nd-flex-between">
-      <div>
-        <strong>{title}</strong>
-        <div class="nd-text-muted nd-text-sm">
-          status: {status} · rank {rank} · owner {owner} · reporter {reporter}
-        </div>
-      </div>
-      <div class="nd-flex nd-gap-sm">
-        {action_buttons}
-      </div>
-    </div>
-    <div class="nd-card-body">
-      <p class="nd-text-muted nd-text-sm">Description</p>
-      {description_block}
-      <p class="nd-text-muted nd-text-sm nd-mt-md">Details</p>
-      {details_block}
-    </div>
-  </section>
-
-  <section class="nd-card">
-    <div class="nd-card-header"><strong>Comments ({comment_count})</strong></div>
-    <div class="nd-card-body">
-      {comments_html}
-
-      <form class="nd-mt-lg"
-            data-nd-action="POST /v1/projects/{ident}/tasks/{tid}/comments"
-            data-nd-success="reload,reset">
-        <div class="nd-form-group">
-          <label for="comment-content">Add a comment</label>
-          <textarea id="comment-content" name="content" rows="3" required></textarea>
-        </div>
-        <button type="submit" class="nd-btn-primary">Comment</button>
-      </form>
-    </div>
-  </section>"##,
-        ident = ident_attr,
-        tid = task_id_attr,
-        title = title,
-        status = status,
-        rank = task.rank,
-        owner = owner,
-        reporter = reporter,
-        action_buttons = action_buttons,
-        description_block = description_block,
-        details_block = details_block,
-        comment_count = comment_count,
-        comments_html = comments_html,
-    );
-
-    let html = format!(
-        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
-        head = control_panel_head(&page_title, &theme),
         open = control_panel_open(&page_title, "tasks"),
         content = content,
         close = control_panel_close(&state.api_key),
@@ -1942,11 +1874,13 @@ fn theme_toggle_button() -> &'static str {
 /// Emits charset + viewport meta, the page `<title>`, ndesign base CSS, the
 /// active theme stylesheet (class `theme` so the runtime switcher can swap it),
 /// the two theme-registration meta tags, plus the `endpoint:api` and
-/// `csrf-token` meta tags the ndesign runtime expects.
+/// `csrf-token` meta tags the ndesign runtime expects. `extra` is appended
+/// verbatim — pages that declare ndesign store vars (`<meta name="var:…">`)
+/// pass them in here so the runtime finds them during init.
 ///
 /// `theme` must be `"light"` or `"dark"`; any other value falls back to
 /// `"dark"`.
-fn control_panel_head(title: &str, theme: &str) -> String {
+fn control_panel_head(title: &str, theme: &str, extra: &str) -> String {
     let theme = if theme == "light" { "light" } else { "dark" };
     format!(
         r#"<meta charset="utf-8">
@@ -1957,10 +1891,12 @@ fn control_panel_head(title: &str, theme: &str) -> String {
 <meta name="nd-theme" content="light" data-href="{base}/themes/light.min.css">
 <meta name="nd-theme" content="dark" data-href="{base}/themes/dark.min.css">
 <meta name="endpoint:api" content="">
-<meta name="csrf-token" content="">"#,
+<meta name="csrf-token" content="">
+{extra}"#,
         title = he(title),
         base = NDESIGN_BASE,
         theme = theme,
+        extra = extra,
     )
 }
 
@@ -2360,4 +2296,90 @@ pub async fn taking_action_on(
         external_message_id: external_id,
         parent_message_id: parent_id,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn actions_for_status_covers_transitions() {
+        let todo: Vec<_> = actions_for_status("todo")
+            .into_iter()
+            .map(|a| (a.verb, a.target_status))
+            .collect();
+        assert_eq!(
+            todo,
+            vec![
+                ("Claim".into(), "in_progress".into()),
+                ("Done".into(), "done".into())
+            ],
+        );
+
+        let in_progress: Vec<_> = actions_for_status("in_progress")
+            .into_iter()
+            .map(|a| (a.verb, a.target_status))
+            .collect();
+        assert_eq!(
+            in_progress,
+            vec![
+                ("Release".into(), "todo".into()),
+                ("Done".into(), "done".into())
+            ],
+        );
+
+        let done: Vec<_> = actions_for_status("done")
+            .into_iter()
+            .map(|a| (a.verb, a.target_status))
+            .collect();
+        assert_eq!(done, vec![("Reopen".into(), "todo".into())]);
+
+        assert!(actions_for_status("nonsense").is_empty());
+    }
+
+    /// Render the exact format literal used by `tasks_board` with a known
+    /// ident and assert the emitted HTML carries the attributes the ndesign
+    /// runtime needs: the template-level `{{id}}` placeholders survive
+    /// `format!` escaping, the store-var reference renders as
+    /// `${selectedTaskId}`, the PATCH body template renders as valid JSON,
+    /// and the kanban row does NOT carry `nd-gap-md` (which triggers the
+    /// column-wrap bug discussed in the surrounding comment).
+    #[test]
+    fn tasks_board_html_shape() {
+        // The format expression in `tasks_board` pulls `ident_attr` in as the
+        // only named arg and otherwise uses `{{…}}` / `${{…}}` / `{{"…"}}`
+        // escape sequences. We reproduce the same template literally so the
+        // test fails loudly if the real string diverges.
+        let ident_attr = "demo-project";
+        let content = format!(
+            r##"<li data-id="{{{{id}}}}">
+<button data-nd-set="selectedTaskId='{{{{id}}}}'"
+        data-nd-modal="#task-modal"
+        data-nd-bind="/v1/projects/{ident}/tasks/${{selectedTaskId}}"
+        data-nd-body='{{"status":"{{{{target_status}}}}"}}'></button>
+<div class="nd-row">"##,
+            ident = ident_attr,
+        );
+
+        assert!(
+            content.contains(r#"data-id="{{id}}""#),
+            "card id placeholder must survive format! as `{{{{id}}}}`: {content}"
+        );
+        assert!(
+            content.contains(r#"selectedTaskId='{{id}}'"#),
+            "data-nd-set must embed the template id placeholder: {content}"
+        );
+        assert!(
+            content.contains("/v1/projects/demo-project/tasks/${selectedTaskId}"),
+            "bind URL must resolve ident and leave store-var reference intact: {content}"
+        );
+        assert!(
+            content.contains(r#"data-nd-body='{"status":"{{target_status}}"}'"#),
+            "PATCH body must be literal JSON with target_status placeholder: {content}"
+        );
+        assert!(
+            !content.contains("nd-gap-md"),
+            "kanban row must not carry nd-gap-md (stacks on top of row gutter): {content}"
+        );
+    }
 }
