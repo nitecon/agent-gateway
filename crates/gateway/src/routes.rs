@@ -1656,23 +1656,27 @@ pub async fn tasks_board(
     let ident_attr = he(&project.ident);
     let page_title = format!("Tasks — {}", project.ident);
 
-    // NOTE: ndesign renders `data-nd-bind` results into the same element that
-    // declares `data-nd-sortable`. When a card is dragged from the TODO column
-    // into IN PROGRESS, only the destination column's reorder POST fires; the
-    // source column keeps the stale node in its DOM until the next manual
-    // refresh. Fixing this requires a follow-up in the ndesign runtime, not
-    // per-page JS.
+    // Layout: `.nd-row` gives each `.nd-col-*` 0.5rem of inner padding on
+    // both sides (Bootstrap-style gutter). For the cards to have visible
+    // space BETWEEN them, the card must live *inside* the col wrapper — if
+    // `.nd-card` and `.nd-col-*` are applied to the same element, the col
+    // padding lands inside the card's background and the three cards appear
+    // flush against each other.
     //
-    // Layout: `.nd-row` provides its own gutter via negative margin + child
-    // col padding (Bootstrap style). Adding `.nd-gap-md` on top stacks a flex
-    // `gap` that pushes 3 × 33.33% past 100% of the container, wrapping the
-    // last column. Keep the row gap-less.
+    // Cross-column drag: each column carries `data-nd-sortable-group="tasks"`
+    // so the ndesign sortable runtime allows drops between them. On a
+    // cross-column drop the runtime POSTs to the destination column's reorder
+    // URL, which mutates the task's status server-side (see
+    // `reorder_tasks_in_column`). A follow-up `nd:refresh` on every column
+    // keeps the board in sync without a reload.
     //
     // Modal pattern (ndesign SPEC §5.8, §20.12): the card button writes the
     // task id into the `selectedTaskId` store var, opens the dialog, and
-    // dispatches `nd:refresh` on every bound panel inside the dialog. The
-    // three panels share the same URL (`…/tasks/${selectedTaskId}`) so the
-    // runtime dedupes them into a single HTTP fetch.
+    // dispatches `nd:refresh` on every bound panel inside the dialog. All
+    // four panels share the same URL so the runtime dedupes them into a
+    // single HTTP fetch. `#task-modal-meta` MUST be in the refresh list —
+    // it is `data-nd-defer` and holds the description + details, so without
+    // the explicit refresh those fields stay blank on first open.
     let content = format!(
         r##"  <div class="nd-flex nd-gap-md nd-mb-md">
     <a class="nd-btn-ghost nd-btn-sm" href="/tasks">← All projects</a>
@@ -1686,7 +1690,7 @@ pub async fn tasks_board(
               class="nd-card-body nd-btn-ghost nd-text-left nd-w-full"
               data-nd-set="selectedTaskId='{{{{id}}}}'"
               data-nd-modal="#task-modal"
-              data-nd-success="refresh:#task-modal-header,refresh:#task-modal-actions,refresh:#task-modal-comments">
+              data-nd-success="refresh:#task-modal-header,refresh:#task-modal-meta,refresh:#task-modal-actions,refresh:#task-modal-comments">
         <div class="nd-font-semibold">{{{{title}}}}</div>
         <div class="nd-text-muted nd-text-sm">{{{{comment_count}}}} comments</div>
       </button>
@@ -1694,44 +1698,56 @@ pub async fn tasks_board(
   </template>
 
   <div class="nd-row">
-    <section class="nd-card nd-col-4">
-      <div class="nd-card-header"><strong>TODO</strong></div>
-      <ul class="nd-card-body"
-          id="col-todo"
-          data-nd-bind="/v1/projects/{ident}/tasks?status=todo"
-          data-nd-template="task-card"
-          data-nd-sortable="POST /v1/projects/{ident}/tasks/reorder?status=todo">
-        <template data-nd-empty>
-          <li class="nd-text-muted nd-text-sm">No tasks.</li>
-        </template>
-      </ul>
-    </section>
+    <div class="nd-col-4">
+      <section class="nd-card">
+        <div class="nd-card-header"><strong>TODO</strong></div>
+        <ul class="nd-card-body"
+            id="col-todo"
+            data-nd-bind="/v1/projects/{ident}/tasks?status=todo"
+            data-nd-template="task-card"
+            data-nd-sortable="POST /v1/projects/{ident}/tasks/reorder?status=todo"
+            data-nd-sortable-group="tasks"
+            data-nd-sortable-refresh="#col-todo,#col-in_progress,#col-done">
+          <template data-nd-empty>
+            <li class="nd-text-muted nd-text-sm">No tasks.</li>
+          </template>
+        </ul>
+      </section>
+    </div>
 
-    <section class="nd-card nd-col-4">
-      <div class="nd-card-header"><strong>IN PROGRESS</strong></div>
-      <ul class="nd-card-body"
-          id="col-in_progress"
-          data-nd-bind="/v1/projects/{ident}/tasks?status=in_progress"
-          data-nd-template="task-card"
-          data-nd-sortable="POST /v1/projects/{ident}/tasks/reorder?status=in_progress">
-        <template data-nd-empty>
-          <li class="nd-text-muted nd-text-sm">No tasks.</li>
-        </template>
-      </ul>
-    </section>
+    <div class="nd-col-4">
+      <section class="nd-card">
+        <div class="nd-card-header"><strong>IN PROGRESS</strong></div>
+        <ul class="nd-card-body"
+            id="col-in_progress"
+            data-nd-bind="/v1/projects/{ident}/tasks?status=in_progress"
+            data-nd-template="task-card"
+            data-nd-sortable="POST /v1/projects/{ident}/tasks/reorder?status=in_progress"
+            data-nd-sortable-group="tasks"
+            data-nd-sortable-refresh="#col-todo,#col-in_progress,#col-done">
+          <template data-nd-empty>
+            <li class="nd-text-muted nd-text-sm">No tasks.</li>
+          </template>
+        </ul>
+      </section>
+    </div>
 
-    <section class="nd-card nd-col-4">
-      <div class="nd-card-header"><strong>DONE</strong></div>
-      <ul class="nd-card-body"
-          id="col-done"
-          data-nd-bind="/v1/projects/{ident}/tasks?status=done"
-          data-nd-template="task-card"
-          data-nd-sortable="POST /v1/projects/{ident}/tasks/reorder?status=done">
-        <template data-nd-empty>
-          <li class="nd-text-muted nd-text-sm">No tasks.</li>
-        </template>
-      </ul>
-    </section>
+    <div class="nd-col-4">
+      <section class="nd-card">
+        <div class="nd-card-header"><strong>DONE</strong></div>
+        <ul class="nd-card-body"
+            id="col-done"
+            data-nd-bind="/v1/projects/{ident}/tasks?status=done"
+            data-nd-template="task-card"
+            data-nd-sortable="POST /v1/projects/{ident}/tasks/reorder?status=done"
+            data-nd-sortable-group="tasks"
+            data-nd-sortable-refresh="#col-todo,#col-in_progress,#col-done">
+          <template data-nd-empty>
+            <li class="nd-text-muted nd-text-sm">No tasks.</li>
+          </template>
+        </ul>
+      </section>
+    </div>
   </div>
 
   <!-- New-task modal — unchanged pattern, posts and refreshes the TODO column. -->
@@ -2337,27 +2353,40 @@ mod tests {
         assert!(actions_for_status("nonsense").is_empty());
     }
 
-    /// Render the exact format literal used by `tasks_board` with a known
-    /// ident and assert the emitted HTML carries the attributes the ndesign
-    /// runtime needs: the template-level `{{id}}` placeholders survive
-    /// `format!` escaping, the store-var reference renders as
-    /// `${selectedTaskId}`, the PATCH body template renders as valid JSON,
-    /// and the kanban row does NOT carry `nd-gap-md` (which triggers the
-    /// column-wrap bug discussed in the surrounding comment).
+    /// Render a literal that mirrors the shape of the string produced by
+    /// `tasks_board` and assert the attributes the ndesign runtime needs
+    /// survive `format!` escaping. Specifically:
+    ///   * template-level `{{id}}` placeholders are emitted verbatim,
+    ///   * store-var references render as `${selectedTaskId}`,
+    ///   * the PATCH body template is valid JSON with the target placeholder,
+    ///   * the card-click success refresh list includes `#task-modal-meta`
+    ///     (deferred panel — without this refresh description + details stay
+    ///     blank on first open),
+    ///   * the kanban row does NOT carry `nd-gap-md` (stacks on the Bootstrap-
+    ///     style gutter and wraps the third column),
+    ///   * each column is a `<div class="nd-col-4">` wrapper with the card
+    ///     inside (so col padding creates gutter BETWEEN cards, not inside),
+    ///   * each sortable list carries `data-nd-sortable-group="tasks"` so the
+    ///     ndesign runtime allows drops between columns.
     #[test]
     fn tasks_board_html_shape() {
-        // The format expression in `tasks_board` pulls `ident_attr` in as the
-        // only named arg and otherwise uses `{{…}}` / `${{…}}` / `{{"…"}}`
-        // escape sequences. We reproduce the same template literally so the
-        // test fails loudly if the real string diverges.
         let ident_attr = "demo-project";
         let content = format!(
             r##"<li data-id="{{{{id}}}}">
 <button data-nd-set="selectedTaskId='{{{{id}}}}'"
         data-nd-modal="#task-modal"
+        data-nd-success="refresh:#task-modal-header,refresh:#task-modal-meta,refresh:#task-modal-actions,refresh:#task-modal-comments"
         data-nd-bind="/v1/projects/{ident}/tasks/${{selectedTaskId}}"
         data-nd-body='{{"status":"{{{{target_status}}}}"}}'></button>
-<div class="nd-row">"##,
+<div class="nd-row">
+  <div class="nd-col-4">
+    <section class="nd-card">
+      <ul id="col-todo"
+          data-nd-sortable="POST /v1/projects/{ident}/tasks/reorder?status=todo"
+          data-nd-sortable-group="tasks"></ul>
+    </section>
+  </div>
+</div>"##,
             ident = ident_attr,
         );
 
@@ -2378,8 +2407,20 @@ mod tests {
             "PATCH body must be literal JSON with target_status placeholder: {content}"
         );
         assert!(
+            content.contains("refresh:#task-modal-meta"),
+            "card click must refresh #task-modal-meta (deferred description+details panel): {content}"
+        );
+        assert!(
             !content.contains("nd-gap-md"),
             "kanban row must not carry nd-gap-md (stacks on top of row gutter): {content}"
+        );
+        assert!(
+            content.contains(r#"<div class="nd-col-4">"#),
+            "column must be a separate nd-col-4 wrapper, not merged into nd-card: {content}"
+        );
+        assert!(
+            content.contains(r#"data-nd-sortable-group="tasks""#),
+            "sortable columns must declare group=\"tasks\" for cross-column drag: {content}"
         );
     }
 }
