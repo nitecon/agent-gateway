@@ -217,6 +217,9 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             summary     TEXT,
             body        TEXT NOT NULL,
             labels      TEXT,
+            version     TEXT NOT NULL DEFAULT 'draft'
+                        CHECK(version IN ('draft','latest','superseded')),
+            state       TEXT NOT NULL DEFAULT 'active',
             author      TEXT NOT NULL,
             created_at  INTEGER NOT NULL,
             updated_at  INTEGER NOT NULL
@@ -235,6 +238,15 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_pattern_comments_pattern
             ON pattern_comments(pattern_id, created_at);",
     )?;
+
+    let _ = conn.execute(
+        "ALTER TABLE patterns ADD COLUMN version TEXT NOT NULL DEFAULT 'draft'",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE patterns ADD COLUMN state TEXT NOT NULL DEFAULT 'active'",
+        [],
+    );
 
     Ok(())
 }
@@ -789,6 +801,8 @@ pub struct Pattern {
     pub summary: Option<String>,
     pub body: String,
     pub labels: Vec<String>,
+    pub version: String,
+    pub state: String,
     pub author: String,
     pub created_at: i64,
     pub updated_at: i64,
@@ -801,6 +815,8 @@ pub struct PatternSummary {
     pub slug: String,
     pub summary: Option<String>,
     pub labels: Vec<String>,
+    pub version: String,
+    pub state: String,
     pub author: String,
     pub comment_count: i64,
     pub created_at: i64,
@@ -826,6 +842,8 @@ pub struct PatternUpdate<'a> {
     pub summary: Option<Option<&'a str>>,
     pub body: Option<&'a str>,
     pub labels: Option<&'a [String]>,
+    pub version: Option<&'a str>,
+    pub state: Option<&'a str>,
 }
 
 fn row_to_pattern(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pattern> {
@@ -836,14 +854,24 @@ fn row_to_pattern(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pattern> {
         summary: row.get(3)?,
         body: row.get(4)?,
         labels: parse_labels(row.get::<_, Option<String>>(5)?),
-        author: row.get(6)?,
-        created_at: row.get(7)?,
-        updated_at: row.get(8)?,
+        version: row.get(6)?,
+        state: row.get(7)?,
+        author: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
     })
 }
 
 const PATTERN_SELECT_COLS: &str =
-    "id, title, slug, summary, body, labels, author, created_at, updated_at";
+    "id, title, slug, summary, body, labels, version, state, author, created_at, updated_at";
+
+pub fn validate_pattern_version(version: &str) -> Result<()> {
+    if version == "draft" || version == "latest" || version == "superseded" {
+        Ok(())
+    } else {
+        anyhow::bail!("invalid pattern version '{version}': must be draft|latest|superseded");
+    }
+}
 
 pub fn slugify_pattern_title(title: &str) -> String {
     let mut out = String::new();
@@ -867,6 +895,7 @@ pub fn slugify_pattern_title(title: &str) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn insert_pattern(
     conn: &Connection,
     title: &str,
@@ -874,8 +903,15 @@ pub fn insert_pattern(
     summary: Option<&str>,
     body: &str,
     labels: &[String],
+    version: &str,
+    state: &str,
     author: &str,
 ) -> Result<Pattern> {
+    validate_pattern_version(version)?;
+    if state.trim().is_empty() {
+        anyhow::bail!("pattern state is required");
+    }
+
     let id = new_uuid();
     let now = now_ms();
     let slug = slug
@@ -887,9 +923,20 @@ pub fn insert_pattern(
 
     conn.execute(
         "INSERT INTO patterns (
-             id, title, slug, summary, body, labels, author, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
-        params![id, title, slug, summary, body, labels_json, author, now],
+             id, title, slug, summary, body, labels, version, state, author, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+        params![
+            id,
+            title,
+            slug,
+            summary,
+            body,
+            labels_json,
+            version,
+            state.trim(),
+            author,
+            now,
+        ],
     )?;
 
     Ok(Pattern {
@@ -899,6 +946,8 @@ pub fn insert_pattern(
         summary: summary.map(str::to_string),
         body: body.to_string(),
         labels: labels.to_vec(),
+        version: version.to_string(),
+        state: state.trim().to_string(),
         author: author.to_string(),
         created_at: now,
         updated_at: now,
@@ -909,7 +958,7 @@ pub fn list_patterns(conn: &Connection, query: Option<&str>) -> Result<Vec<Patte
     let trimmed = query.map(str::trim).filter(|q| !q.is_empty());
     let (sql, pattern) = if let Some(q) = trimmed {
         (
-            "SELECT p.id, p.title, p.slug, p.summary, p.labels, p.author,
+            "SELECT p.id, p.title, p.slug, p.summary, p.labels, p.version, p.state, p.author,
                     (SELECT COUNT(*) FROM pattern_comments pc WHERE pc.pattern_id = p.id),
                     p.created_at, p.updated_at
              FROM patterns p
@@ -918,12 +967,14 @@ pub fn list_patterns(conn: &Connection, query: Option<&str>) -> Result<Vec<Patte
                 OR COALESCE(p.summary, '') LIKE ?1
                 OR p.body LIKE ?1
                 OR COALESCE(p.labels, '') LIKE ?1
+                OR p.version LIKE ?1
+                OR p.state LIKE ?1
              ORDER BY p.updated_at DESC, p.title ASC",
             Some(format!("%{q}%")),
         )
     } else {
         (
-            "SELECT p.id, p.title, p.slug, p.summary, p.labels, p.author,
+            "SELECT p.id, p.title, p.slug, p.summary, p.labels, p.version, p.state, p.author,
                     (SELECT COUNT(*) FROM pattern_comments pc WHERE pc.pattern_id = p.id),
                     p.created_at, p.updated_at
              FROM patterns p
@@ -940,10 +991,12 @@ pub fn list_patterns(conn: &Connection, query: Option<&str>) -> Result<Vec<Patte
             slug: r.get(2)?,
             summary: r.get(3)?,
             labels: parse_labels(r.get::<_, Option<String>>(4)?),
-            author: r.get(5)?,
-            comment_count: r.get(6)?,
-            created_at: r.get(7)?,
-            updated_at: r.get(8)?,
+            version: r.get(5)?,
+            state: r.get(6)?,
+            author: r.get(7)?,
+            comment_count: r.get(8)?,
+            created_at: r.get(9)?,
+            updated_at: r.get(10)?,
         })
     };
 
@@ -1006,6 +1059,26 @@ pub fn update_pattern(
         push(
             "labels",
             Box::new(serialize_labels(labels)),
+            &mut sets,
+            &mut binds,
+        );
+    }
+    if let Some(version) = upd.version {
+        validate_pattern_version(version)?;
+        push(
+            "version",
+            Box::new(version.to_string()),
+            &mut sets,
+            &mut binds,
+        );
+    }
+    if let Some(state) = upd.state {
+        if state.trim().is_empty() {
+            anyhow::bail!("pattern state is required");
+        }
+        push(
+            "state",
+            Box::new(state.trim().to_string()),
             &mut sets,
             &mut binds,
         );
@@ -1751,6 +1824,8 @@ mod tests {
             Some("Main deploys dev and tags deploy prod."),
             "# Deploying Eventic Applications\n\nUse main and tags.",
             &["eventic".into(), "deploy".into()],
+            "draft",
+            "active",
             "tester",
         )
         .unwrap();
@@ -1782,6 +1857,8 @@ mod tests {
             Some("Encrypt stored settings."),
             "Use envelope encryption for sensitive values.",
             &["security".into()],
+            "latest",
+            "active",
             "tester",
         )
         .unwrap();
@@ -1798,6 +1875,50 @@ mod tests {
         let results = list_patterns(&conn, Some("envelope")).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].slug, "settings-encryption");
+        assert_eq!(results[0].version, "latest");
+        assert_eq!(results[0].state, "active");
         assert_eq!(results[0].comment_count, 1);
+    }
+
+    #[test]
+    fn pattern_lifecycle_metadata_is_required_and_searchable() {
+        let conn = test_conn();
+        let old = insert_pattern(
+            &conn,
+            "Old Systemd Build Units",
+            Some("old-systemd-build-units"),
+            Some("Compile in the service unit."),
+            "Do not use for new deployments.",
+            &["linux".into(), "systemd".into(), "services".into()],
+            "superseded",
+            "superseded-by:eventic-build-units",
+            "tester",
+        )
+        .unwrap();
+
+        assert!(insert_pattern(
+            &conn,
+            "Bad Version",
+            Some("bad-version"),
+            None,
+            "Invalid lifecycle.",
+            &[],
+            "v1",
+            "active",
+            "tester",
+        )
+        .is_err());
+
+        let fetched = get_pattern(&conn, &old.slug).unwrap().unwrap();
+        assert_eq!(fetched.version, "superseded");
+        assert_eq!(fetched.state, "superseded-by:eventic-build-units");
+
+        let results = list_patterns(&conn, Some("systemd")).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].slug, "old-systemd-build-units");
+
+        let results = list_patterns(&conn, Some("superseded-by:eventic")).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].version, "superseded");
     }
 }

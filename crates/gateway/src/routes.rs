@@ -1079,6 +1079,8 @@ pub struct CreatePatternRequest {
     pub summary: Option<String>,
     pub body: String,
     pub labels: Option<serde_json::Value>,
+    pub version: String,
+    pub state: String,
     /// Defaults to X-Agent-Id header, or "user" when the header is absent.
     pub author: Option<String>,
 }
@@ -1091,6 +1093,19 @@ pub struct UpdatePatternRequest {
     pub summary: Option<serde_json::Value>,
     pub body: Option<String>,
     pub labels: Option<serde_json::Value>,
+    pub version: Option<String>,
+    pub state: Option<String>,
+}
+
+fn validate_pattern_version_field(version: &str) -> Result<()> {
+    if version == "draft" || version == "latest" || version == "superseded" {
+        Ok(())
+    } else {
+        Err(AppError(
+            StatusCode::BAD_REQUEST,
+            format!("invalid version '{version}': must be draft|latest|superseded"),
+        ))
+    }
 }
 
 fn decode_labels_field(field: &str, value: Option<serde_json::Value>) -> Result<Vec<String>> {
@@ -1161,6 +1176,13 @@ pub async fn create_pattern_handler(
     if req.body.trim().is_empty() {
         return Err(AppError(StatusCode::BAD_REQUEST, "body is required".into()));
     }
+    validate_pattern_version_field(req.version.trim())?;
+    if req.state.trim().is_empty() {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "state is required".into(),
+        ));
+    }
 
     let labels = decode_labels_field("labels", req.labels)?;
     let author = resolve_identity(req.author, &headers);
@@ -1169,6 +1191,8 @@ pub async fn create_pattern_handler(
     let slug = req.slug;
     let summary = req.summary;
     let body = req.body;
+    let version = req.version;
+    let state_value = req.state;
 
     let pattern = spawn_blocking(move || {
         let conn = db.lock().unwrap();
@@ -1179,6 +1203,8 @@ pub async fn create_pattern_handler(
             summary.as_deref().map(str::trim).filter(|s| !s.is_empty()),
             &body,
             &labels,
+            version.trim(),
+            state_value.trim(),
             &author,
         )
     })
@@ -1214,11 +1240,24 @@ pub async fn update_pattern_handler(
 ) -> Result<Json<db::Pattern>> {
     let summary = decode_nullable_string("summary", req.summary)?;
     let labels = decode_optional_labels_field("labels", req.labels)?;
+    if let Some(version) = req.version.as_deref() {
+        validate_pattern_version_field(version.trim())?;
+    }
+    if let Some(state) = req.state.as_deref() {
+        if state.trim().is_empty() {
+            return Err(AppError(
+                StatusCode::BAD_REQUEST,
+                "state cannot be empty".into(),
+            ));
+        }
+    }
     let db = state.db.clone();
     let id_for_update = id.clone();
     let title = req.title;
     let slug = req.slug;
     let body = req.body;
+    let version = req.version;
+    let state_value = req.state;
 
     let pattern = spawn_blocking(move || {
         let conn = db.lock().unwrap();
@@ -1228,6 +1267,8 @@ pub async fn update_pattern_handler(
             summary: summary.as_ref().map(|inner| inner.as_deref()),
             body: body.as_deref(),
             labels: labels.as_deref(),
+            version: version.as_deref().map(str::trim),
+            state: state_value.as_deref().map(str::trim),
         };
         db::update_pattern(&conn, &id_for_update, &upd)
     })
@@ -1859,6 +1900,8 @@ pub async fn patterns_page(State(state): State<AppState>) -> Result<Html<String>
         <div class="nd-text-muted nd-text-sm">{{summary}}</div>
       </td>
       <td class="nd-text-muted">{{slug}}</td>
+      <td>{{version}}</td>
+      <td class="nd-text-muted">{{state}}</td>
       <td>{{comment_count}}</td>
     </tr>
   </template>
@@ -1868,13 +1911,13 @@ pub async fn patterns_page(State(state): State<AppState>) -> Result<Html<String>
     <div class="nd-card-body nd-p-0">
       <table class="nd-table nd-table-hover">
         <thead>
-          <tr><th>Pattern</th><th>Slug</th><th>Comments</th></tr>
+          <tr><th>Pattern</th><th>Slug</th><th>Version</th><th>State</th><th>Comments</th></tr>
         </thead>
         <tbody id="patterns-list"
                data-nd-bind="/v1/patterns"
                data-nd-template="pattern-row">
           <template data-nd-empty>
-            <tr><td colspan="3" class="nd-text-muted">No patterns yet.</td></tr>
+            <tr><td colspan="5" class="nd-text-muted">No patterns yet.</td></tr>
           </template>
         </tbody>
       </table>
@@ -1903,6 +1946,18 @@ pub async fn patterns_page(State(state): State<AppState>) -> Result<Html<String>
           <input id="pattern-labels" name="labels">
         </div>
         <div class="nd-form-group">
+          <label for="pattern-version">Version</label>
+          <select id="pattern-version" name="version" required>
+            <option value="draft" selected>draft</option>
+            <option value="latest">latest</option>
+            <option value="superseded">superseded</option>
+          </select>
+        </div>
+        <div class="nd-form-group">
+          <label for="pattern-state">State</label>
+          <input id="pattern-state" name="state" value="active" required>
+        </div>
+        <div class="nd-form-group">
           <label for="pattern-body">Markdown</label>
           <textarea id="pattern-body" name="body" rows="16" required></textarea>
         </div>
@@ -1929,7 +1984,7 @@ pub async fn patterns_page(State(state): State<AppState>) -> Result<Html<String>
            data-nd-defer>
         <template id="pattern-modal-meta-tmpl">
           <div class="nd-text-muted nd-text-sm nd-mb-md">
-            slug: {{slug}} · author {{author}}
+            slug: {{slug}} · version {{version}} · state {{state}} · author {{author}}
           </div>
           <p>{{summary}}</p>
         </template>
