@@ -12,7 +12,7 @@ All endpoints require the same bearer token used by the existing gateway API.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/v1/patterns?q=<query>` | List or search pattern summaries. Search covers title, slug, summary, body, labels, version, and state. |
+| `GET` | `/v1/patterns?q=<query>&label=<label>&version=<version>&state=<state>&superseded_by=<id-or-slug>` | List or search pattern summaries. Search covers title, slug, summary, body, labels, version, and state. Filters are exact-match and can be combined with `q`. |
 | `POST` | `/v1/patterns` | Create a pattern. |
 | `GET` | `/v1/patterns/:id` | Fetch one pattern by id or slug, without comments. |
 | `PATCH` | `/v1/patterns/:id` | Update pattern metadata or markdown body. |
@@ -69,6 +69,16 @@ short state such as `active`. For superseded patterns, use
 `labels` are topical tags used for search and filtering, such as `linux`,
 `systemd`, `services`, `eventic`, `deploy`, or `encryption`.
 
+Structured list filters:
+
+- `q`: broad text search across title, slug, summary, body, labels, version,
+  and state.
+- `label`: exact topical tag match, for example `label=systemd`.
+- `version`: exact lifecycle match; must be `draft`, `latest`, or
+  `superseded`.
+- `state`: exact state match, for example `state=active`.
+- `superseded_by`: convenience filter for `state=superseded-by:<id-or-slug>`.
+
 Comments are intentionally not included in `GET /v1/patterns/:id`. Agents should
 only fetch comments when the user explicitly asks to address or review comments.
 
@@ -78,7 +88,7 @@ Recommended commands:
 
 ```bash
 agent-tools patterns list
-agent-tools patterns search "<query>"
+agent-tools patterns search "<query>" [--label x] [--version latest] [--state active] [--superseded-by slug]
 agent-tools patterns get <id-or-slug>
 agent-tools patterns create --title "..." --version draft --state active [--slug "..."] [--label x] [--summary "..."] --body-file path.md
 agent-tools patterns update <id-or-slug> [--title "..."] [--version latest] [--state "superseded-by:..."] [--slug "..."] [--label x] [--summary "..."] [--body-file path.md]
@@ -89,6 +99,15 @@ agent-tools patterns comment <id-or-slug> "<markdown comment>"
 
 `get` must print only the pattern document and metadata. It must not fetch or
 display comments.
+
+This separation is important because comments are collaboration state, not
+approved guidance. A pattern can have unresolved review notes, proposed edits,
+or user discussion that should not be mixed into the normal context an agent
+uses to perform work. Pulling comments by default would make agents more likely
+to treat pending debate as current practice, increase token usage on every
+lookup, and make old comment threads unexpectedly affect unrelated tasks.
+Comments are opt-in so an agent only loads them when the user is explicitly
+asking to review or resolve that discussion.
 
 `comments` should call `GET /v1/patterns/:id/comments` and print the thread.
 

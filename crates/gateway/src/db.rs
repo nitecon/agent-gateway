@@ -954,36 +954,74 @@ pub fn insert_pattern(
     })
 }
 
-pub fn list_patterns(conn: &Connection, query: Option<&str>) -> Result<Vec<PatternSummary>> {
-    let trimmed = query.map(str::trim).filter(|q| !q.is_empty());
-    let (sql, pattern) = if let Some(q) = trimmed {
-        (
-            "SELECT p.id, p.title, p.slug, p.summary, p.labels, p.version, p.state, p.author,
-                    (SELECT COUNT(*) FROM pattern_comments pc WHERE pc.pattern_id = p.id),
-                    p.created_at, p.updated_at
-             FROM patterns p
-             WHERE p.title LIKE ?1
-                OR p.slug LIKE ?1
-                OR COALESCE(p.summary, '') LIKE ?1
-                OR p.body LIKE ?1
-                OR COALESCE(p.labels, '') LIKE ?1
-                OR p.version LIKE ?1
-                OR p.state LIKE ?1
-             ORDER BY p.updated_at DESC, p.title ASC",
-            Some(format!("%{q}%")),
-        )
-    } else {
-        (
-            "SELECT p.id, p.title, p.slug, p.summary, p.labels, p.version, p.state, p.author,
-                    (SELECT COUNT(*) FROM pattern_comments pc WHERE pc.pattern_id = p.id),
-                    p.created_at, p.updated_at
-             FROM patterns p
-             ORDER BY p.updated_at DESC, p.title ASC",
-            None,
-        )
-    };
+#[derive(Debug, Default)]
+pub struct PatternFilters<'a> {
+    pub query: Option<&'a str>,
+    pub label: Option<&'a str>,
+    pub version: Option<&'a str>,
+    pub state: Option<&'a str>,
+    pub superseded_by: Option<&'a str>,
+}
 
-    let mut stmt = conn.prepare(sql)?;
+pub fn list_patterns(
+    conn: &Connection,
+    filters: &PatternFilters<'_>,
+) -> Result<Vec<PatternSummary>> {
+    let mut sql = String::from(
+        "SELECT p.id, p.title, p.slug, p.summary, p.labels, p.version, p.state, p.author,
+                (SELECT COUNT(*) FROM pattern_comments pc WHERE pc.pattern_id = p.id),
+                p.created_at, p.updated_at
+         FROM patterns p",
+    );
+    let mut clauses: Vec<String> = Vec::new();
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+    if let Some(q) = filters.query.map(str::trim).filter(|q| !q.is_empty()) {
+        binds.push(Box::new(format!("%{q}%")));
+        let ph = binds.len();
+        clauses.push(format!(
+            "(p.title LIKE ?{ph}
+              OR p.slug LIKE ?{ph}
+              OR COALESCE(p.summary, '') LIKE ?{ph}
+              OR p.body LIKE ?{ph}
+              OR COALESCE(p.labels, '') LIKE ?{ph}
+              OR p.version LIKE ?{ph}
+              OR p.state LIKE ?{ph})"
+        ));
+    }
+
+    if let Some(label) = filters.label.map(str::trim).filter(|v| !v.is_empty()) {
+        binds.push(Box::new(format!("%\"{label}\"%")));
+        clauses.push(format!("COALESCE(p.labels, '') LIKE ?{}", binds.len()));
+    }
+
+    if let Some(version) = filters.version.map(str::trim).filter(|v| !v.is_empty()) {
+        validate_pattern_version(version)?;
+        binds.push(Box::new(version.to_string()));
+        clauses.push(format!("p.version = ?{}", binds.len()));
+    }
+
+    if let Some(state) = filters.state.map(str::trim).filter(|v| !v.is_empty()) {
+        binds.push(Box::new(state.to_string()));
+        clauses.push(format!("p.state = ?{}", binds.len()));
+    }
+
+    if let Some(target) = filters
+        .superseded_by
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        binds.push(Box::new(format!("superseded-by:{target}")));
+        clauses.push(format!("p.state = ?{}", binds.len()));
+    }
+
+    if !clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&clauses.join(" AND "));
+    }
+    sql.push_str(" ORDER BY p.updated_at DESC, p.title ASC");
+
+    let mut stmt = conn.prepare(&sql)?;
     let map_row = |r: &rusqlite::Row<'_>| {
         Ok(PatternSummary {
             id: r.get(0)?,
@@ -1000,13 +1038,10 @@ pub fn list_patterns(conn: &Connection, query: Option<&str>) -> Result<Vec<Patte
         })
     };
 
-    let rows = if let Some(pattern) = pattern {
-        stmt.query_map(params![pattern], map_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    } else {
-        stmt.query_map([], map_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
+    let params_vec: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt
+        .query_map(params_vec.as_slice(), map_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
 
@@ -1872,7 +1907,14 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        let results = list_patterns(&conn, Some("envelope")).unwrap();
+        let results = list_patterns(
+            &conn,
+            &PatternFilters {
+                query: Some("envelope"),
+                ..PatternFilters::default()
+            },
+        )
+        .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].slug, "settings-encryption");
         assert_eq!(results[0].version, "latest");
@@ -1913,11 +1955,26 @@ mod tests {
         assert_eq!(fetched.version, "superseded");
         assert_eq!(fetched.state, "superseded-by:eventic-build-units");
 
-        let results = list_patterns(&conn, Some("systemd")).unwrap();
+        let results = list_patterns(
+            &conn,
+            &PatternFilters {
+                label: Some("systemd"),
+                version: Some("superseded"),
+                ..PatternFilters::default()
+            },
+        )
+        .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].slug, "old-systemd-build-units");
 
-        let results = list_patterns(&conn, Some("superseded-by:eventic")).unwrap();
+        let results = list_patterns(
+            &conn,
+            &PatternFilters {
+                superseded_by: Some("eventic-build-units"),
+                ..PatternFilters::default()
+            },
+        )
+        .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].version, "superseded");
     }

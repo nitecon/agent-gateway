@@ -1070,6 +1070,10 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
 #[derive(Deserialize)]
 pub struct ListPatternsQuery {
     pub q: Option<String>,
+    pub label: Option<String>,
+    pub version: Option<String>,
+    pub state: Option<String>,
+    pub superseded_by: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1152,11 +1156,25 @@ pub async fn list_patterns_handler(
     State(state): State<AppState>,
     Query(q): Query<ListPatternsQuery>,
 ) -> Result<Json<Vec<db::PatternSummary>>> {
+    if let Some(version) = q.version.as_deref() {
+        validate_pattern_version_field(version.trim())?;
+    }
     let db = state.db.clone();
     let query = q.q;
+    let label = q.label;
+    let version = q.version;
+    let state_value = q.state;
+    let superseded_by = q.superseded_by;
     let patterns = spawn_blocking(move || {
         let conn = db.lock().unwrap();
-        db::list_patterns(&conn, query.as_deref())
+        let filters = db::PatternFilters {
+            query: query.as_deref(),
+            label: label.as_deref(),
+            version: version.as_deref(),
+            state: state_value.as_deref(),
+            superseded_by: superseded_by.as_deref(),
+        };
+        db::list_patterns(&conn, &filters)
     })
     .await??;
     Ok(Json(patterns))
