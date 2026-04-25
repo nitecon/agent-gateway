@@ -3015,7 +3015,7 @@ pub async fn get_unread_messages(
     let status = if messages.is_empty() {
         "no messages".to_string()
     } else {
-        format!("{} unconfirmed message(s)", messages.len())
+        format!("{} unread user message(s)", messages.len())
     };
 
     Ok(Json(GetUnreadResponse { messages, status }))
