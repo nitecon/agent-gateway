@@ -1672,8 +1672,8 @@ pub async fn tasks_board(
     //
     // Modal pattern (ndesign SPEC §5.8, §20.12): the card button writes the
     // task id into the `selectedTaskId` store var, opens the dialog, and
-    // dispatches `nd:refresh` on every bound panel inside the dialog. All
-    // four panels share the same URL so the runtime dedupes them into a
+    // dispatches `nd:refresh` on every bound panel inside the dialog. The
+    // bound panels share the same URL so the runtime dedupes them into a
     // single HTTP fetch. `#task-modal-meta` MUST be in the refresh list —
     // it is `data-nd-defer` and holds the description + details, so without
     // the explicit refresh those fields stay blank on first open.
@@ -1690,7 +1690,7 @@ pub async fn tasks_board(
               class="nd-card-body nd-btn-ghost nd-text-left nd-w-full"
               data-nd-set="selectedTaskId='{{{{id}}}}'"
               data-nd-modal="#task-modal"
-              data-nd-success="refresh:#task-modal-header,refresh:#task-modal-meta,refresh:#task-modal-actions,refresh:#task-modal-comments">
+              data-nd-success="refresh:#task-modal-header,refresh:#task-modal-meta,refresh:#task-modal-comments">
         <div class="nd-font-semibold">{{{{title}}}}</div>
         <div class="nd-text-muted nd-text-sm">{{{{comment_count}}}} comments</div>
       </button>
@@ -1777,10 +1777,12 @@ pub async fn tasks_board(
   </dialog>
 
   <!--
-    Task detail modal. Three bound panels share the same URL so ndesign's
-    in-flight dedup issues exactly one GET per open/switch. Every write (PATCH,
-    POST comment) refreshes the three panels AND every column, so the board
-    and the modal stay in lockstep without a page reload.
+    Task detail modal. The bound panels share the same URL so ndesign's
+    in-flight dedup issues exactly one GET per open/switch. The action buttons
+    are static DOM nodes rather than template-rendered nodes because ndesign's
+    click action binding is installed during page init. Every write (PATCH,
+    POST comment) refreshes the panels and every column, so the board and the
+    modal stay in lockstep without a page reload.
   -->
   <dialog id="task-modal" class="nd-modal nd-modal-lg">
     <header>
@@ -1806,21 +1808,35 @@ pub async fn tasks_board(
         </template>
       </div>
 
-      <div id="task-modal-actions"
-           class="nd-flex nd-gap-sm nd-mt-md nd-mb-lg"
-           data-nd-bind="/v1/projects/{ident}/tasks/${{selectedTaskId}}"
-           data-nd-select="actions"
-           data-nd-template="task-modal-action-tmpl"
-           data-nd-defer>
-        <template id="task-modal-action-tmpl">
-          <button type="button"
-                  class="nd-btn-{{{{style}}}} nd-btn-sm"
-                  data-nd-action="PATCH /v1/projects/{ident}/tasks/${{selectedTaskId}}"
-                  data-nd-body='{{"status":"{{{{target_status}}}}"}}'
-                  data-nd-success="refresh:#col-todo,refresh:#col-in_progress,refresh:#col-done,refresh:#task-modal-header,refresh:#task-modal-meta,refresh:#task-modal-actions">
-            {{{{verb}}}}
-          </button>
-        </template>
+      <div id="task-modal-actions" class="nd-flex nd-gap-sm nd-mt-md nd-mb-lg">
+        <button type="button"
+                class="nd-btn-primary nd-btn-sm"
+                data-nd-action="PATCH /v1/projects/{ident}/tasks/${{selectedTaskId}}"
+                data-nd-body='{{"status":"in_progress"}}'
+                data-nd-success="refresh:#col-todo,refresh:#col-in_progress,refresh:#col-done,refresh:#task-modal-header,refresh:#task-modal-meta">
+          Claim
+        </button>
+        <button type="button"
+                class="nd-btn-secondary nd-btn-sm"
+                data-nd-action="PATCH /v1/projects/{ident}/tasks/${{selectedTaskId}}"
+                data-nd-body='{{"status":"todo"}}'
+                data-nd-success="refresh:#col-todo,refresh:#col-in_progress,refresh:#col-done,refresh:#task-modal-header,refresh:#task-modal-meta">
+          Release
+        </button>
+        <button type="button"
+                class="nd-btn-primary nd-btn-sm"
+                data-nd-action="PATCH /v1/projects/{ident}/tasks/${{selectedTaskId}}"
+                data-nd-body='{{"status":"done"}}'
+                data-nd-success="refresh:#col-todo,refresh:#col-in_progress,refresh:#col-done,refresh:#task-modal-header,refresh:#task-modal-meta">
+          Done
+        </button>
+        <button type="button"
+                class="nd-btn-secondary nd-btn-sm"
+                data-nd-action="PATCH /v1/projects/{ident}/tasks/${{selectedTaskId}}"
+                data-nd-body='{{"status":"todo"}}'
+                data-nd-success="refresh:#col-todo,refresh:#col-in_progress,refresh:#col-done,refresh:#task-modal-header,refresh:#task-modal-meta">
+          Reopen
+        </button>
       </div>
 
       <section class="nd-card">
@@ -2358,7 +2374,7 @@ mod tests {
     /// survive `format!` escaping. Specifically:
     ///   * template-level `{{id}}` placeholders are emitted verbatim,
     ///   * store-var references render as `${selectedTaskId}`,
-    ///   * the PATCH body template is valid JSON with the target placeholder,
+    ///   * the static PATCH action body is valid JSON,
     ///   * the card-click success refresh list includes `#task-modal-meta`
     ///     (deferred panel — without this refresh description + details stay
     ///     blank on first open),
@@ -2375,9 +2391,9 @@ mod tests {
             r##"<li data-id="{{{{id}}}}">
 <button data-nd-set="selectedTaskId='{{{{id}}}}'"
         data-nd-modal="#task-modal"
-        data-nd-success="refresh:#task-modal-header,refresh:#task-modal-meta,refresh:#task-modal-actions,refresh:#task-modal-comments"
+        data-nd-success="refresh:#task-modal-header,refresh:#task-modal-meta,refresh:#task-modal-comments"
         data-nd-bind="/v1/projects/{ident}/tasks/${{selectedTaskId}}"
-        data-nd-body='{{"status":"{{{{target_status}}}}"}}'></button>
+        data-nd-body='{{"status":"in_progress"}}'></button>
 <div class="nd-row">
   <div class="nd-col-4">
     <section class="nd-card">
@@ -2403,8 +2419,8 @@ mod tests {
             "bind URL must resolve ident and leave store-var reference intact: {content}"
         );
         assert!(
-            content.contains(r#"data-nd-body='{"status":"{{target_status}}"}'"#),
-            "PATCH body must be literal JSON with target_status placeholder: {content}"
+            content.contains(r#"data-nd-body='{"status":"in_progress"}'"#),
+            "PATCH body must be literal JSON with a concrete status: {content}"
         );
         assert!(
             content.contains("refresh:#task-modal-meta"),
