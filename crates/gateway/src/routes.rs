@@ -1065,6 +1065,271 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
     Ok(Html(html))
 }
 
+// ── Patterns API ─────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct ListPatternsQuery {
+    pub q: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct CreatePatternRequest {
+    pub title: String,
+    pub slug: Option<String>,
+    pub summary: Option<String>,
+    pub body: String,
+    pub labels: Option<serde_json::Value>,
+    /// Defaults to X-Agent-Id header, or "user" when the header is absent.
+    pub author: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdatePatternRequest {
+    pub title: Option<String>,
+    pub slug: Option<String>,
+    /// `Some(null)` clears the summary; absent leaves it untouched.
+    pub summary: Option<serde_json::Value>,
+    pub body: Option<String>,
+    pub labels: Option<serde_json::Value>,
+}
+
+fn decode_labels_field(field: &str, value: Option<serde_json::Value>) -> Result<Vec<String>> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(items)) => items
+            .into_iter()
+            .map(|v| match v {
+                serde_json::Value::String(s) => Ok(s.trim().to_string()),
+                _ => Err(AppError(
+                    StatusCode::BAD_REQUEST,
+                    format!("'{field}' must be an array of strings or a comma-separated string"),
+                )),
+            })
+            .filter_map(|r| match r {
+                Ok(s) if s.is_empty() => None,
+                other => Some(other),
+            })
+            .collect(),
+        Some(serde_json::Value::String(s)) => Ok(s
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()),
+        Some(_) => Err(AppError(
+            StatusCode::BAD_REQUEST,
+            format!("'{field}' must be an array of strings or a comma-separated string"),
+        )),
+    }
+}
+
+fn decode_optional_labels_field(
+    field: &str,
+    value: Option<serde_json::Value>,
+) -> Result<Option<Vec<String>>> {
+    match value {
+        None => Ok(None),
+        Some(v) => decode_labels_field(field, Some(v)).map(Some),
+    }
+}
+
+pub async fn list_patterns_handler(
+    State(state): State<AppState>,
+    Query(q): Query<ListPatternsQuery>,
+) -> Result<Json<Vec<db::PatternSummary>>> {
+    let db = state.db.clone();
+    let query = q.q;
+    let patterns = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::list_patterns(&conn, query.as_deref())
+    })
+    .await??;
+    Ok(Json(patterns))
+}
+
+pub async fn create_pattern_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CreatePatternRequest>,
+) -> Result<Json<db::Pattern>> {
+    if req.title.trim().is_empty() {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "title is required".into(),
+        ));
+    }
+    if req.body.trim().is_empty() {
+        return Err(AppError(StatusCode::BAD_REQUEST, "body is required".into()));
+    }
+
+    let labels = decode_labels_field("labels", req.labels)?;
+    let author = resolve_identity(req.author, &headers);
+    let db = state.db.clone();
+    let title = req.title;
+    let slug = req.slug;
+    let summary = req.summary;
+    let body = req.body;
+
+    let pattern = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::insert_pattern(
+            &conn,
+            title.trim(),
+            slug.as_deref().map(str::trim),
+            summary.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+            &body,
+            &labels,
+            &author,
+        )
+    })
+    .await??;
+    Ok(Json(pattern))
+}
+
+pub async fn get_pattern_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<db::Pattern>> {
+    let db = state.db.clone();
+    let id_for_lookup = id.clone();
+    let pattern = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::get_pattern(&conn, &id_for_lookup)
+    })
+    .await??;
+
+    match pattern {
+        Some(pattern) => Ok(Json(pattern)),
+        None => Err(AppError(
+            StatusCode::NOT_FOUND,
+            format!("pattern '{}' not found", id),
+        )),
+    }
+}
+
+pub async fn update_pattern_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdatePatternRequest>,
+) -> Result<Json<db::Pattern>> {
+    let summary = decode_nullable_string("summary", req.summary)?;
+    let labels = decode_optional_labels_field("labels", req.labels)?;
+    let db = state.db.clone();
+    let id_for_update = id.clone();
+    let title = req.title;
+    let slug = req.slug;
+    let body = req.body;
+
+    let pattern = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        let upd = db::PatternUpdate {
+            title: title.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+            slug: slug.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+            summary: summary.as_ref().map(|inner| inner.as_deref()),
+            body: body.as_deref(),
+            labels: labels.as_deref(),
+        };
+        db::update_pattern(&conn, &id_for_update, &upd)
+    })
+    .await??;
+
+    match pattern {
+        Some(pattern) => Ok(Json(pattern)),
+        None => Err(AppError(
+            StatusCode::NOT_FOUND,
+            format!("pattern '{}' not found", id),
+        )),
+    }
+}
+
+pub async fn delete_pattern_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<DeleteResponse>> {
+    let db = state.db.clone();
+    let id_for_delete = id.clone();
+    let deleted = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::delete_pattern(&conn, &id_for_delete)
+    })
+    .await??;
+
+    if deleted {
+        Ok(Json(DeleteResponse { deleted }))
+    } else {
+        Err(AppError(
+            StatusCode::NOT_FOUND,
+            format!("pattern '{}' not found", id),
+        ))
+    }
+}
+
+pub async fn list_pattern_comments_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<db::PatternComment>>> {
+    let db = state.db.clone();
+    let id_for_lookup = id.clone();
+    let comments = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::list_pattern_comments(&conn, &id_for_lookup)
+    })
+    .await??;
+
+    match comments {
+        Some(comments) => Ok(Json(comments)),
+        None => Err(AppError(
+            StatusCode::NOT_FOUND,
+            format!("pattern '{}' not found", id),
+        )),
+    }
+}
+
+pub async fn add_pattern_comment_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<AddCommentRequest>,
+) -> Result<Json<db::PatternComment>> {
+    if req.content.trim().is_empty() {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "content is required".into(),
+        ));
+    }
+    let author = resolve_identity(req.author, &headers);
+    let author_type = req.author_type.unwrap_or_else(|| {
+        if actor_agent_id(&headers).is_some() {
+            "agent".to_string()
+        } else {
+            "user".to_string()
+        }
+    });
+    if author_type != "agent" && author_type != "user" && author_type != "system" {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            format!("invalid author_type '{author_type}': must be agent|user|system"),
+        ));
+    }
+
+    let db = state.db.clone();
+    let id_for_insert = id.clone();
+    let content = req.content;
+    let comment = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::insert_pattern_comment(&conn, &id_for_insert, &author, &author_type, &content)
+    })
+    .await??;
+
+    match comment {
+        Some(comment) => Ok(Json(comment)),
+        None => Err(AppError(
+            StatusCode::NOT_FOUND,
+            format!("pattern '{}' not found", id),
+        )),
+    }
+}
+
 // ── Tasks API ────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -1567,6 +1832,161 @@ pub async fn list_projects_handler(
     Ok(Json(projects))
 }
 
+// ── GET /patterns (global pattern library) ───────────────────────────────────
+
+pub async fn patterns_page(State(state): State<AppState>) -> Result<Html<String>> {
+    let db = state.db.clone();
+    let theme = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::get_theme(&conn)
+    })
+    .await??;
+
+    let content = r##"  <div class="nd-flex nd-gap-md nd-mb-md">
+    <button class="nd-btn-primary nd-btn-sm" data-nd-modal="#new-pattern-modal">+ New pattern</button>
+  </div>
+
+  <template id="pattern-row">
+    <tr>
+      <td>
+        <button type="button"
+                class="nd-btn-ghost nd-text-left"
+                data-nd-set="selectedPatternId='{{id}}'"
+                data-nd-modal="#pattern-modal"
+                data-nd-success="refresh:#pattern-modal-title,refresh:#pattern-modal-meta,refresh:#pattern-modal-body,refresh:#pattern-modal-comments">
+          <strong>{{title}}</strong>
+        </button>
+        <div class="nd-text-muted nd-text-sm">{{summary}}</div>
+      </td>
+      <td class="nd-text-muted">{{slug}}</td>
+      <td>{{comment_count}}</td>
+    </tr>
+  </template>
+
+  <section class="nd-card">
+    <div class="nd-card-header"><strong>Patterns</strong></div>
+    <div class="nd-card-body nd-p-0">
+      <table class="nd-table nd-table-hover">
+        <thead>
+          <tr><th>Pattern</th><th>Slug</th><th>Comments</th></tr>
+        </thead>
+        <tbody id="patterns-list"
+               data-nd-bind="/v1/patterns"
+               data-nd-template="pattern-row">
+          <template data-nd-empty>
+            <tr><td colspan="3" class="nd-text-muted">No patterns yet.</td></tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <dialog id="new-pattern-modal" class="nd-modal nd-modal-lg">
+    <form data-nd-action="POST /v1/patterns"
+          data-nd-success="close-modal,refresh:#patterns-list,reset">
+      <header><h3>New pattern</h3></header>
+      <div>
+        <div class="nd-form-group">
+          <label for="pattern-title">Title</label>
+          <input id="pattern-title" name="title" required>
+        </div>
+        <div class="nd-form-group">
+          <label for="pattern-slug">Slug</label>
+          <input id="pattern-slug" name="slug">
+        </div>
+        <div class="nd-form-group">
+          <label for="pattern-summary">Summary</label>
+          <textarea id="pattern-summary" name="summary" rows="2"></textarea>
+        </div>
+        <div class="nd-form-group">
+          <label for="pattern-labels">Labels</label>
+          <input id="pattern-labels" name="labels">
+        </div>
+        <div class="nd-form-group">
+          <label for="pattern-body">Markdown</label>
+          <textarea id="pattern-body" name="body" rows="16" required></textarea>
+        </div>
+      </div>
+      <footer>
+        <button type="button" data-nd-dismiss class="nd-btn-ghost">Cancel</button>
+        <button type="submit" class="nd-btn-primary">Create</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="pattern-modal" class="nd-modal nd-modal-lg">
+    <header>
+      <h3 id="pattern-modal-title"
+          data-nd-bind="/v1/patterns/${selectedPatternId}"
+          data-nd-field="title"
+          data-nd-defer></h3>
+      <button type="button" class="nd-modal-close" data-nd-dismiss aria-label="Close">&times;</button>
+    </header>
+    <div>
+      <div id="pattern-modal-meta"
+           data-nd-bind="/v1/patterns/${selectedPatternId}"
+           data-nd-template="pattern-modal-meta-tmpl"
+           data-nd-defer>
+        <template id="pattern-modal-meta-tmpl">
+          <div class="nd-text-muted nd-text-sm nd-mb-md">
+            slug: {{slug}} · author {{author}}
+          </div>
+          <p>{{summary}}</p>
+        </template>
+      </div>
+
+      <pre id="pattern-modal-body"
+           class="nd-text-sm"
+           data-nd-bind="/v1/patterns/${selectedPatternId}"
+           data-nd-field="body"
+           data-nd-defer></pre>
+
+      <section class="nd-card nd-mt-lg">
+        <div class="nd-card-header"><strong>Comments</strong></div>
+        <div class="nd-card-body">
+          <div id="pattern-modal-comments"
+               data-nd-bind="/v1/patterns/${selectedPatternId}/comments"
+               data-nd-template="pattern-comment-tmpl"
+               data-nd-defer>
+            <template id="pattern-comment-tmpl">
+              <div class="nd-mb-md">
+                <div class="nd-text-muted nd-text-sm">{{author}} ({{author_type}})</div>
+                <div>{{content}}</div>
+              </div>
+            </template>
+            <template data-nd-empty>
+              <p class="nd-text-muted nd-text-sm">No comments yet.</p>
+            </template>
+          </div>
+
+          <form class="nd-mt-lg"
+                data-nd-action="POST /v1/patterns/${selectedPatternId}/comments"
+                data-nd-success="refresh:#pattern-modal-comments,refresh:#patterns-list,reset">
+            <div class="nd-form-group">
+              <label for="pattern-comment">Add a comment</label>
+              <textarea id="pattern-comment" name="content" rows="3" required></textarea>
+            </div>
+            <button type="submit" class="nd-btn-primary nd-btn-sm">Comment</button>
+          </form>
+        </div>
+      </section>
+    </div>
+  </dialog>"##;
+
+    let html = format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
+        head = control_panel_head(
+            "agent-gateway — Patterns",
+            &theme,
+            r#"<meta name="var:selectedPatternId" content="">"#,
+        ),
+        open = control_panel_open("Patterns", "patterns"),
+        content = content,
+        close = control_panel_close(&state.api_key),
+    );
+    Ok(Html(html))
+}
+
 // ── GET /tasks (project picker) ──────────────────────────────────────────────
 
 /// Render the project picker — a small table that the ndesign runtime
@@ -1935,13 +2355,13 @@ fn control_panel_head(title: &str, theme: &str, extra: &str) -> String {
 /// Open the control-panel body up to the start of `<main class="app-content">`.
 ///
 /// Emits `<body class="app-page">`, the app layout wrapper, the sidebar (brand
-/// plus the Main section with Dashboard, Tasks, Skills, Commands, Agents
-/// links), and the header (hamburger toggle, page title, theme toggle).
+/// plus the Main section with Dashboard, Tasks, Patterns, Skills, Commands,
+/// Agents links), and the header (hamburger toggle, page title, theme toggle).
 ///
 /// * `page_title` — rendered inside the header's `<h1>`.
 /// * `active` — which sidebar link receives `class="nd-active"`. Accepts
-///   `"dashboard"`, `"tasks"`, `"skills"`, `"commands"`, or `"agents"`. Any
-///   other value leaves all links inactive.
+///   `"dashboard"`, `"tasks"`, `"patterns"`, `"skills"`, `"commands"`, or
+///   `"agents"`. Any other value leaves all links inactive.
 fn control_panel_open(page_title: &str, active: &str) -> String {
     let cls = |key: &str| -> &'static str {
         if key == active {
@@ -1959,6 +2379,7 @@ fn control_panel_open(page_title: &str, active: &str) -> String {
     <ul class="nd-nav-menu">
       <li><a href="/"{dashboard}>Dashboard</a></li>
       <li><a href="/tasks"{tasks}>Tasks</a></li>
+      <li><a href="/patterns"{patterns}>Patterns</a></li>
       <li><a href="/skills"{skills}>Skills</a></li>
       <li><a href="/commands"{commands}>Commands</a></li>
       <li><a href="/agents"{agents}>Agents</a></li>
@@ -1977,6 +2398,7 @@ fn control_panel_open(page_title: &str, active: &str) -> String {
     <main class="app-content">"#,
         dashboard = cls("dashboard"),
         tasks = cls("tasks"),
+        patterns = cls("patterns"),
         skills = cls("skills"),
         commands = cls("commands"),
         agents = cls("agents"),
