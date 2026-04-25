@@ -382,6 +382,20 @@ async fn main() -> Result<()> {
             "/v1/projects/{ident}/tasks/{id}/comments",
             post(routes::add_comment_handler),
         )
+        .route(
+            "/v1/patterns",
+            get(routes::list_patterns_handler).post(routes::create_pattern_handler),
+        )
+        .route(
+            "/v1/patterns/{id}",
+            get(routes::get_pattern_handler)
+                .patch(routes::update_pattern_handler)
+                .delete(routes::delete_pattern_handler),
+        )
+        .route(
+            "/v1/patterns/{id}/comments",
+            get(routes::list_pattern_comments_handler).post(routes::add_pattern_comment_handler),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), bearer_auth));
 
     // Dashboard and admin list pages are public (local admin pages, no auth
@@ -391,6 +405,7 @@ async fn main() -> Result<()> {
         .route("/", get(routes::dashboard))
         .route("/tasks", get(routes::tasks_picker))
         .route("/projects/{ident}/tasks", get(routes::tasks_board))
+        .route("/patterns", get(routes::patterns_page))
         .route("/skills", get(routes::skills_page))
         .route("/commands", get(routes::commands_page))
         .route("/agents", get(routes::agents_page))

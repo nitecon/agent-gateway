@@ -208,6 +208,34 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             ON task_comments(task_id, created_at);",
     )?;
 
+    // ── Patterns: global markdown pattern library ────────────────────────────
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS patterns (
+            id          TEXT PRIMARY KEY,
+            title       TEXT NOT NULL,
+            slug        TEXT NOT NULL UNIQUE,
+            summary     TEXT,
+            body        TEXT NOT NULL,
+            labels      TEXT,
+            author      TEXT NOT NULL,
+            created_at  INTEGER NOT NULL,
+            updated_at  INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_patterns_updated
+            ON patterns(updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS pattern_comments (
+            id           TEXT PRIMARY KEY,
+            pattern_id   TEXT NOT NULL REFERENCES patterns(id) ON DELETE CASCADE,
+            author       TEXT NOT NULL,
+            author_type  TEXT NOT NULL CHECK(author_type IN ('agent','user','system')),
+            content      TEXT NOT NULL,
+            created_at   INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_pattern_comments_pattern
+            ON pattern_comments(pattern_id, created_at);",
+    )?;
+
     Ok(())
 }
 
@@ -749,6 +777,326 @@ fn parse_labels(raw: Option<String>) -> Vec<String> {
         Some(s) => serde_json::from_str::<Vec<String>>(&s).unwrap_or_default(),
         None => Vec::new(),
     }
+}
+
+// ── Patterns ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Pattern {
+    pub id: String,
+    pub title: String,
+    pub slug: String,
+    pub summary: Option<String>,
+    pub body: String,
+    pub labels: Vec<String>,
+    pub author: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PatternSummary {
+    pub id: String,
+    pub title: String,
+    pub slug: String,
+    pub summary: Option<String>,
+    pub labels: Vec<String>,
+    pub author: String,
+    pub comment_count: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PatternComment {
+    pub id: String,
+    pub pattern_id: String,
+    pub author: String,
+    /// One of `"agent"`, `"user"`, `"system"`.
+    pub author_type: String,
+    pub content: String,
+    pub created_at: i64,
+}
+
+/// Dynamic update payload for `update_pattern`. `None` on any field means
+/// "do not touch"; for `summary`, `Some(None)` clears the column.
+pub struct PatternUpdate<'a> {
+    pub title: Option<&'a str>,
+    pub slug: Option<&'a str>,
+    pub summary: Option<Option<&'a str>>,
+    pub body: Option<&'a str>,
+    pub labels: Option<&'a [String]>,
+}
+
+fn row_to_pattern(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pattern> {
+    Ok(Pattern {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        slug: row.get(2)?,
+        summary: row.get(3)?,
+        body: row.get(4)?,
+        labels: parse_labels(row.get::<_, Option<String>>(5)?),
+        author: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+const PATTERN_SELECT_COLS: &str =
+    "id, title, slug, summary, body, labels, author, created_at, updated_at";
+
+pub fn slugify_pattern_title(title: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for ch in title.chars().flat_map(|c| c.to_lowercase()) {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            prev_dash = false;
+        } else if !prev_dash && !out.is_empty() {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "pattern".to_string()
+    } else {
+        out
+    }
+}
+
+pub fn insert_pattern(
+    conn: &Connection,
+    title: &str,
+    slug: Option<&str>,
+    summary: Option<&str>,
+    body: &str,
+    labels: &[String],
+    author: &str,
+) -> Result<Pattern> {
+    let id = new_uuid();
+    let now = now_ms();
+    let slug = slug
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| slugify_pattern_title(title));
+    let labels_json = serialize_labels(labels);
+
+    conn.execute(
+        "INSERT INTO patterns (
+             id, title, slug, summary, body, labels, author, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+        params![id, title, slug, summary, body, labels_json, author, now],
+    )?;
+
+    Ok(Pattern {
+        id,
+        title: title.to_string(),
+        slug,
+        summary: summary.map(str::to_string),
+        body: body.to_string(),
+        labels: labels.to_vec(),
+        author: author.to_string(),
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+pub fn list_patterns(conn: &Connection, query: Option<&str>) -> Result<Vec<PatternSummary>> {
+    let trimmed = query.map(str::trim).filter(|q| !q.is_empty());
+    let (sql, pattern) = if let Some(q) = trimmed {
+        (
+            "SELECT p.id, p.title, p.slug, p.summary, p.labels, p.author,
+                    (SELECT COUNT(*) FROM pattern_comments pc WHERE pc.pattern_id = p.id),
+                    p.created_at, p.updated_at
+             FROM patterns p
+             WHERE p.title LIKE ?1
+                OR p.slug LIKE ?1
+                OR COALESCE(p.summary, '') LIKE ?1
+                OR p.body LIKE ?1
+                OR COALESCE(p.labels, '') LIKE ?1
+             ORDER BY p.updated_at DESC, p.title ASC",
+            Some(format!("%{q}%")),
+        )
+    } else {
+        (
+            "SELECT p.id, p.title, p.slug, p.summary, p.labels, p.author,
+                    (SELECT COUNT(*) FROM pattern_comments pc WHERE pc.pattern_id = p.id),
+                    p.created_at, p.updated_at
+             FROM patterns p
+             ORDER BY p.updated_at DESC, p.title ASC",
+            None,
+        )
+    };
+
+    let mut stmt = conn.prepare(sql)?;
+    let map_row = |r: &rusqlite::Row<'_>| {
+        Ok(PatternSummary {
+            id: r.get(0)?,
+            title: r.get(1)?,
+            slug: r.get(2)?,
+            summary: r.get(3)?,
+            labels: parse_labels(r.get::<_, Option<String>>(4)?),
+            author: r.get(5)?,
+            comment_count: r.get(6)?,
+            created_at: r.get(7)?,
+            updated_at: r.get(8)?,
+        })
+    };
+
+    let rows = if let Some(pattern) = pattern {
+        stmt.query_map(params![pattern], map_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        stmt.query_map([], map_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    Ok(rows)
+}
+
+pub fn get_pattern(conn: &Connection, id_or_slug: &str) -> Result<Option<Pattern>> {
+    let sql = format!("SELECT {PATTERN_SELECT_COLS} FROM patterns WHERE id = ?1 OR slug = ?1");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query_map(params![id_or_slug], row_to_pattern)?;
+    Ok(rows.next().transpose()?)
+}
+
+pub fn update_pattern(
+    conn: &Connection,
+    id_or_slug: &str,
+    upd: &PatternUpdate<'_>,
+) -> Result<Option<Pattern>> {
+    let current = match get_pattern(conn, id_or_slug)? {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+
+    let now = now_ms();
+    let mut sets: Vec<String> = Vec::new();
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    let push = |col: &str,
+                val: Box<dyn rusqlite::ToSql>,
+                sets: &mut Vec<String>,
+                binds: &mut Vec<Box<dyn rusqlite::ToSql>>| {
+        binds.push(val);
+        sets.push(format!("{col} = ?{}", binds.len()));
+    };
+
+    if let Some(title) = upd.title {
+        push("title", Box::new(title.to_string()), &mut sets, &mut binds);
+    }
+    if let Some(slug) = upd.slug {
+        push("slug", Box::new(slug.to_string()), &mut sets, &mut binds);
+    }
+    if let Some(summary) = upd.summary {
+        push(
+            "summary",
+            Box::new(summary.map(str::to_string)),
+            &mut sets,
+            &mut binds,
+        );
+    }
+    if let Some(body) = upd.body {
+        push("body", Box::new(body.to_string()), &mut sets, &mut binds);
+    }
+    if let Some(labels) = upd.labels {
+        push(
+            "labels",
+            Box::new(serialize_labels(labels)),
+            &mut sets,
+            &mut binds,
+        );
+    }
+    push("updated_at", Box::new(now), &mut sets, &mut binds);
+
+    binds.push(Box::new(current.id.clone()));
+    let id_ph = binds.len();
+    let sql = format!(
+        "UPDATE patterns SET {} WHERE id = ?{id_ph}",
+        sets.join(", ")
+    );
+    let params_vec: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+    conn.execute(&sql, params_vec.as_slice())?;
+    get_pattern(conn, &current.id)
+}
+
+pub fn delete_pattern(conn: &Connection, id_or_slug: &str) -> Result<bool> {
+    let n = conn.execute(
+        "DELETE FROM patterns WHERE id = ?1 OR slug = ?1",
+        params![id_or_slug],
+    )?;
+    Ok(n > 0)
+}
+
+pub fn list_pattern_comments(
+    conn: &Connection,
+    pattern_id_or_slug: &str,
+) -> Result<Option<Vec<PatternComment>>> {
+    let pattern = match get_pattern(conn, pattern_id_or_slug)? {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, pattern_id, author, author_type, content, created_at
+         FROM pattern_comments
+         WHERE pattern_id = ?1
+         ORDER BY created_at ASC",
+    )?;
+    let comments = stmt
+        .query_map(params![pattern.id], |r| {
+            Ok(PatternComment {
+                id: r.get(0)?,
+                pattern_id: r.get(1)?,
+                author: r.get(2)?,
+                author_type: r.get(3)?,
+                content: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(Some(comments))
+}
+
+pub fn insert_pattern_comment(
+    conn: &Connection,
+    pattern_id_or_slug: &str,
+    author: &str,
+    author_type: &str,
+    content: &str,
+) -> Result<Option<PatternComment>> {
+    if author_type != "agent" && author_type != "user" && author_type != "system" {
+        anyhow::bail!("invalid author_type '{author_type}': must be agent|user|system");
+    }
+    let pattern = match get_pattern(conn, pattern_id_or_slug)? {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+
+    let id = new_uuid();
+    let now = now_ms();
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO pattern_comments (id, pattern_id, author, author_type, content, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![id, pattern.id, author, author_type, content, now],
+    )?;
+    tx.execute(
+        "UPDATE patterns SET updated_at = ?1 WHERE id = ?2",
+        params![now, pattern.id],
+    )?;
+    tx.commit()?;
+
+    Ok(Some(PatternComment {
+        id,
+        pattern_id: pattern.id,
+        author: author.to_string(),
+        author_type: author_type.to_string(),
+        content: content.to_string(),
+        created_at: now,
+    }))
 }
 
 fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
@@ -1380,4 +1728,76 @@ pub fn reorder_tasks_in_column(
 
     tx.commit()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        apply_schema(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn pattern_get_does_not_include_comments_and_comments_are_explicit() {
+        let conn = test_conn();
+        let pattern = insert_pattern(
+            &conn,
+            "Deploying Eventic Applications",
+            None,
+            Some("Main deploys dev and tags deploy prod."),
+            "# Deploying Eventic Applications\n\nUse main and tags.",
+            &["eventic".into(), "deploy".into()],
+            "tester",
+        )
+        .unwrap();
+
+        let comment =
+            insert_pattern_comment(&conn, &pattern.id, "reviewer", "user", "Clarify tag gates.")
+                .unwrap()
+                .unwrap();
+
+        let fetched = get_pattern(&conn, &pattern.slug).unwrap().unwrap();
+        assert_eq!(fetched.body, pattern.body);
+        assert_eq!(fetched.labels, vec!["eventic", "deploy"]);
+
+        let comments = list_pattern_comments(&conn, &pattern.slug)
+            .unwrap()
+            .unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].id, comment.id);
+        assert_eq!(comments[0].content, "Clarify tag gates.");
+    }
+
+    #[test]
+    fn pattern_search_checks_markdown_body_and_summary_counts_comments() {
+        let conn = test_conn();
+        let pattern = insert_pattern(
+            &conn,
+            "Settings Encryption",
+            Some("settings-encryption"),
+            Some("Encrypt stored settings."),
+            "Use envelope encryption for sensitive values.",
+            &["security".into()],
+            "tester",
+        )
+        .unwrap();
+        insert_pattern_comment(
+            &conn,
+            &pattern.id,
+            "reviewer",
+            "user",
+            "Add key rotation notes.",
+        )
+        .unwrap()
+        .unwrap();
+
+        let results = list_patterns(&conn, Some("envelope")).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].slug, "settings-encryption");
+        assert_eq!(results[0].comment_count, 1);
+    }
 }
