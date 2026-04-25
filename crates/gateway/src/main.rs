@@ -24,7 +24,11 @@ use db::Db;
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "gateway", about = "agent-gateway server")]
+#[command(
+    name = "gateway",
+    about = "agent-gateway server",
+    version = env!("AGENT_GATEWAY_VERSION")
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
