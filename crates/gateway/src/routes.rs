@@ -2072,15 +2072,17 @@ pub async fn delegate_task_handler(
         let source_title = format!("{title} (DELEGATED)");
         let source_task = db::insert_delegated_task(
             &conn,
-            &source_ident,
-            &source_title,
-            description.as_deref(),
-            specification.as_deref(),
-            &labels,
-            hostname.as_deref(),
-            &reporter,
-            &target_ident,
-            &target_task.id,
+            &db::DelegatedTaskInsert {
+                project_ident: &source_ident,
+                title: &source_title,
+                description: description.as_deref(),
+                details: specification.as_deref(),
+                labels: &labels,
+                hostname: hostname.as_deref(),
+                reporter: &reporter,
+                target_project_ident: &target_ident,
+                target_task_id: &target_task.id,
+            },
         )?;
         let delegation = db::insert_task_delegation(
             &conn,

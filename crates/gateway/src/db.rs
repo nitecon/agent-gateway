@@ -951,6 +951,18 @@ pub struct TaskUpdate<'a> {
     pub hostname: Option<Option<&'a str>>,
 }
 
+pub struct DelegatedTaskInsert<'a> {
+    pub project_ident: &'a str,
+    pub title: &'a str,
+    pub description: Option<&'a str>,
+    pub details: Option<&'a str>,
+    pub labels: &'a [String],
+    pub hostname: Option<&'a str>,
+    pub reporter: &'a str,
+    pub target_project_ident: &'a str,
+    pub target_task_id: &'a str,
+}
+
 fn new_uuid() -> String {
     uuid::Uuid::now_v7().to_string()
 }
@@ -1593,27 +1605,16 @@ pub fn insert_task(
     })
 }
 
-pub fn insert_delegated_task(
-    conn: &Connection,
-    project_ident: &str,
-    title: &str,
-    description: Option<&str>,
-    details: Option<&str>,
-    labels: &[String],
-    hostname: Option<&str>,
-    reporter: &str,
-    target_project_ident: &str,
-    target_task_id: &str,
-) -> Result<Task> {
-    let mut task = insert_task(
+pub fn insert_delegated_task(conn: &Connection, task: &DelegatedTaskInsert<'_>) -> Result<Task> {
+    let mut inserted = insert_task(
         conn,
-        project_ident,
-        title,
-        description,
-        details,
-        labels,
-        hostname,
-        reporter,
+        task.project_ident,
+        task.title,
+        task.description,
+        task.details,
+        task.labels,
+        task.hostname,
+        task.reporter,
     )?;
     conn.execute(
         "UPDATE tasks
@@ -1621,12 +1622,17 @@ pub fn insert_delegated_task(
              delegated_to_project_ident = ?1,
              delegated_to_task_id = ?2
          WHERE id = ?3 AND project_ident = ?4",
-        params![target_project_ident, target_task_id, task.id, project_ident],
+        params![
+            task.target_project_ident,
+            task.target_task_id,
+            inserted.id,
+            task.project_ident
+        ],
     )?;
-    task.kind = "delegated".to_string();
-    task.delegated_to_project_ident = Some(target_project_ident.to_string());
-    task.delegated_to_task_id = Some(target_task_id.to_string());
-    Ok(task)
+    inserted.kind = "delegated".to_string();
+    inserted.delegated_to_project_ident = Some(task.target_project_ident.to_string());
+    inserted.delegated_to_task_id = Some(task.target_task_id.to_string());
+    Ok(inserted)
 }
 
 /// List task summaries for a project filtered by status. When `statuses`
@@ -2419,15 +2425,17 @@ mod tests {
         .unwrap();
         let source = insert_delegated_task(
             &conn,
-            "source",
-            "Build dependency (DELEGATED)",
-            Some("Context"),
-            Some("Specification"),
-            &[],
-            None,
-            "tester",
-            "target",
-            &target.id,
+            &DelegatedTaskInsert {
+                project_ident: "source",
+                title: "Build dependency (DELEGATED)",
+                description: Some("Context"),
+                details: Some("Specification"),
+                labels: &[],
+                hostname: None,
+                reporter: "tester",
+                target_project_ident: "target",
+                target_task_id: &target.id,
+            },
         )
         .unwrap();
         let delegation = insert_task_delegation(
