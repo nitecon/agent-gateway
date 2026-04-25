@@ -192,6 +192,27 @@ All messaging endpoints accept an optional `X-Agent-Id` header. When provided, e
 | `GET` | `/v1/skills/:name` | Download a skill as a zip file. |
 | `DELETE` | `/v1/skills/:name` | Delete a skill. |
 
+### Patterns
+
+Global markdown pattern library for organization-wide practices. Patterns are
+not project-scoped. They carry topical `labels` for search plus lifecycle
+metadata: `version` (`draft`, `latest`, or `superseded`) and required `state`
+(`active` or conventions such as `superseded-by:<id-or-slug>`).
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/v1/patterns` | List pattern summaries. Supports `q`, `label`, `version`, `state`, and `superseded_by` query filters. |
+| `POST` | `/v1/patterns` | Create a pattern. Body includes `title`, `body`, `labels`, `version`, `state`, optional `slug`/`summary`/`author`. |
+| `GET` | `/v1/patterns/:id` | Fetch one pattern by id or slug. Returns markdown and metadata, intentionally without comments. |
+| `PATCH` | `/v1/patterns/:id` | Update pattern metadata or markdown body. |
+| `DELETE` | `/v1/patterns/:id` | Delete a pattern and its comments. |
+| `GET` | `/v1/patterns/:id/comments` | Fetch the comment thread for one pattern. |
+| `POST` | `/v1/patterns/:id/comments` | Add a comment. Body: `{"content":"...","author":"...","author_type":"agent|user|system"}`. |
+
+Pattern comments are intentionally opt-in. Normal pattern pulls should use
+`GET /v1/patterns/:id`; comments are collaboration/review state and should only
+be fetched when a user asks an agent to address comments on that pattern.
+
 ### Dashboard
 
 `GET /` -- no auth required. HTML page showing project counts, message stats, and skill inventory.
