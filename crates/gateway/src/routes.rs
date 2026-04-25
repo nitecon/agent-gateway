@@ -2582,12 +2582,14 @@ pub async fn tasks_board(
   <template id="task-card">
     <li class="nd-card nd-mb-sm" data-id="{{{{id}}}}">
       <button type="button"
-              class="nd-card-body nd-btn-ghost nd-text-left nd-w-full"
+              class="nd-card-body nd-btn-ghost nd-text-left nd-w-full task-card-button"
               data-nd-set="selectedTaskId='{{{{id}}}}'"
               data-nd-modal="#task-modal"
               data-nd-success="refresh:#task-modal-header,refresh:#task-modal-meta,refresh:#task-modal-comments">
-        <div class="nd-font-semibold">{{{{title}}}}</div>
-        <div class="nd-text-muted nd-text-sm">{{{{comment_count}}}} comments</div>
+        <div class="nd-font-semibold task-card-title">{{{{title}}}}</div>
+        <ul class="task-card-meta nd-text-muted nd-text-sm">
+          <li>{{{{comment_count}}}} comments</li>
+        </ul>
       </button>
     </li>
   </template>
@@ -2774,7 +2776,24 @@ pub async fn tasks_board(
         head = control_panel_head(
             &page_title,
             &theme,
-            r#"<meta name="var:selectedTaskId" content="">"#,
+            r#"<meta name="var:selectedTaskId" content="">
+<style>
+.task-card-button {
+  display: block;
+  max-width: 100%;
+  min-width: 0;
+  white-space: normal;
+}
+.task-card-title {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.task-card-meta {
+  margin: 0.375rem 0 0 1.25rem;
+  padding: 0;
+  white-space: normal;
+}
+</style>"#,
         ),
         open = control_panel_open(&page_title, "tasks"),
         content = content,
@@ -3286,11 +3305,15 @@ mod tests {
         let ident_attr = "demo-project";
         let content = format!(
             r##"<li data-id="{{{{id}}}}">
-<button data-nd-set="selectedTaskId='{{{{id}}}}'"
+<button class="task-card-button"
+        data-nd-set="selectedTaskId='{{{{id}}}}'"
         data-nd-modal="#task-modal"
         data-nd-success="refresh:#task-modal-header,refresh:#task-modal-meta,refresh:#task-modal-comments"
         data-nd-bind="/v1/projects/{ident}/tasks/${{selectedTaskId}}"
-        data-nd-body='{{"status":"in_progress"}}'></button>
+        data-nd-body='{{"status":"in_progress"}}'>
+  <div class="task-card-title">{{{{title}}}}</div>
+  <ul class="task-card-meta"><li>{{{{comment_count}}}} comments</li></ul>
+</button>
 <div class="nd-row">
   <div class="nd-col-4">
     <section class="nd-card">
@@ -3334,6 +3357,16 @@ mod tests {
         assert!(
             content.contains(r#"data-nd-sortable-group="tasks""#),
             "sortable columns must declare group=\"tasks\" for cross-column drag: {content}"
+        );
+        assert!(
+            content.contains(r#"class="task-card-button""#)
+                && content.contains(r#"class="task-card-title""#),
+            "task cards must carry wrapping-specific classes: {content}"
+        );
+        assert!(
+            content
+                .contains(r#"<ul class="task-card-meta"><li>{{comment_count}} comments</li></ul>"#),
+            "task comment count must render as a bullet below the title: {content}"
         );
     }
 }
