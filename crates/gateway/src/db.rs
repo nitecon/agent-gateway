@@ -417,7 +417,7 @@ pub fn upsert_agent(conn: &Connection, project_ident: &str, agent_id: &str) -> R
     Ok(())
 }
 
-/// Get all messages not yet confirmed by a specific agent.
+/// Get all user-authored messages not yet confirmed by a specific agent.
 pub fn get_unconfirmed_for_agent(
     conn: &Connection,
     ident: &str,
@@ -430,6 +430,7 @@ pub fn get_unconfirmed_for_agent(
                 m.subject, m.hostname, m.event_at
          FROM messages m
          WHERE m.project_ident = ?1
+           AND m.source = 'user'
            AND NOT EXISTS (
                SELECT 1 FROM agent_confirmations ac
                WHERE ac.agent_id = ?2
@@ -1948,6 +1949,62 @@ mod tests {
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         apply_schema(&conn).unwrap();
         conn
+    }
+
+    fn test_project(ident: &str) -> Project {
+        Project {
+            ident: ident.into(),
+            channel_name: "test".into(),
+            room_id: format!("room-{ident}"),
+            last_msg_id: None,
+            created_at: now_ms(),
+        }
+    }
+
+    fn test_message(ident: &str, source: &str, content: &str, agent_id: Option<&str>) -> Message {
+        Message {
+            id: 0,
+            project_ident: ident.into(),
+            source: source.into(),
+            external_message_id: None,
+            content: content.into(),
+            sent_at: now_ms(),
+            confirmed_at: None,
+            parent_message_id: None,
+            agent_id: agent_id.map(str::to_string),
+            message_type: "message".into(),
+            subject: None,
+            hostname: None,
+            event_at: None,
+        }
+    }
+
+    #[test]
+    fn unconfirmed_for_agent_only_returns_unread_user_messages() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("proj")).unwrap();
+        upsert_agent(&conn, "proj", "agent-a").unwrap();
+
+        let first_user = insert_message(
+            &conn,
+            &test_message("proj", "user", "please handle this", None),
+        )
+        .unwrap();
+        let agent_message = insert_message(
+            &conn,
+            &test_message("proj", "agent", "system/agent status", Some("agent-b")),
+        )
+        .unwrap();
+        let second_user =
+            insert_message(&conn, &test_message("proj", "user", "also this", None)).unwrap();
+
+        assert!(confirm_message_for_agent(&conn, "proj", "agent-a", first_user).unwrap());
+
+        let unread = get_unconfirmed_for_agent(&conn, "proj", "agent-a").unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].id, second_user);
+        assert_eq!(unread[0].source, "user");
+        assert_ne!(unread[0].id, agent_message);
     }
 
     #[test]
