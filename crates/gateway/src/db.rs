@@ -309,6 +309,30 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // ── Agent API docs: project-scoped, agent-native API context ─────────────
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS api_docs (
+            id             TEXT PRIMARY KEY,
+            project_ident  TEXT NOT NULL REFERENCES projects(ident) ON DELETE CASCADE,
+            app            TEXT NOT NULL,
+            title          TEXT NOT NULL,
+            summary        TEXT,
+            kind           TEXT NOT NULL DEFAULT 'agent_context',
+            source_format  TEXT NOT NULL DEFAULT 'agent_context',
+            source_ref     TEXT,
+            version        TEXT,
+            labels         TEXT,
+            content_json   TEXT NOT NULL,
+            author         TEXT NOT NULL,
+            created_at     INTEGER NOT NULL,
+            updated_at     INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_api_docs_project_app
+            ON api_docs(project_ident, app, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_api_docs_project_updated
+            ON api_docs(project_ident, updated_at DESC);",
+    )?;
+
     Ok(())
 }
 
@@ -710,6 +734,7 @@ pub struct ProjectStats {
     pub room_id: String,
     pub total_messages: i64,
     pub unread_count: i64,
+    pub api_doc_count: i64,
     pub repo_provider: Option<String>,
     pub repo_namespace: Option<String>,
     pub repo_name: Option<String>,
@@ -731,6 +756,7 @@ pub struct DashboardData {
     pub agent_messages: i64,
     pub user_messages: i64,
     pub skill_count: i64,
+    pub api_doc_count: i64,
     pub projects: Vec<ProjectStats>,
 }
 
@@ -748,6 +774,8 @@ pub fn list_project_stats(conn: &Connection) -> Result<Vec<ProjectStats>> {
                  WHERE m2.project_ident = p.ident
                    AND m2.confirmed_at IS NULL
                    AND m2.source = 'user'),
+                (SELECT COUNT(*) FROM api_docs d
+                 WHERE d.project_ident = p.ident),
                 p.repo_provider, p.repo_namespace, p.repo_name, p.repo_full_name
          FROM projects p
          LEFT JOIN messages m ON m.project_ident = p.ident
@@ -762,10 +790,11 @@ pub fn list_project_stats(conn: &Connection) -> Result<Vec<ProjectStats>> {
                 room_id: r.get(2)?,
                 total_messages: r.get(3)?,
                 unread_count: r.get(4)?,
-                repo_provider: r.get(5)?,
-                repo_namespace: r.get(6)?,
-                repo_name: r.get(7)?,
-                repo_full_name: r.get(8)?,
+                api_doc_count: r.get(5)?,
+                repo_provider: r.get(6)?,
+                repo_namespace: r.get(7)?,
+                repo_name: r.get(8)?,
+                repo_full_name: r.get(9)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -814,6 +843,7 @@ pub fn get_dashboard_data(conn: &Connection) -> Result<DashboardData> {
         |r| r.get(0),
     )?;
     let skill_count: i64 = conn.query_row("SELECT COUNT(*) FROM skills", [], |r| r.get(0))?;
+    let api_doc_count: i64 = conn.query_row("SELECT COUNT(*) FROM api_docs", [], |r| r.get(0))?;
 
     let projects = list_project_stats(conn)?;
 
@@ -823,6 +853,7 @@ pub fn get_dashboard_data(conn: &Connection) -> Result<DashboardData> {
         agent_messages,
         user_messages,
         skill_count,
+        api_doc_count,
         projects,
     })
 }
@@ -1468,6 +1499,315 @@ pub fn delete_pattern(conn: &Connection, id_or_slug: &str) -> Result<bool> {
     let n = conn.execute(
         "DELETE FROM patterns WHERE id = ?1 OR slug = ?1",
         params![id_or_slug],
+    )?;
+    Ok(n > 0)
+}
+
+// ── Agent API docs ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ApiDoc {
+    pub id: String,
+    pub project_ident: String,
+    pub app: String,
+    pub title: String,
+    pub summary: Option<String>,
+    pub kind: String,
+    pub source_format: String,
+    pub source_ref: Option<String>,
+    pub version: Option<String>,
+    pub labels: Vec<String>,
+    pub content: serde_json::Value,
+    pub author: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ApiDocSummary {
+    pub id: String,
+    pub project_ident: String,
+    pub app: String,
+    pub title: String,
+    pub summary: Option<String>,
+    pub kind: String,
+    pub source_format: String,
+    pub source_ref: Option<String>,
+    pub version: Option<String>,
+    pub labels: Vec<String>,
+    pub author: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Default)]
+pub struct ApiDocFilters<'a> {
+    pub query: Option<&'a str>,
+    pub app: Option<&'a str>,
+    pub label: Option<&'a str>,
+    pub kind: Option<&'a str>,
+}
+
+pub struct ApiDocInsert<'a> {
+    pub app: &'a str,
+    pub title: &'a str,
+    pub summary: Option<&'a str>,
+    pub kind: &'a str,
+    pub source_format: &'a str,
+    pub source_ref: Option<&'a str>,
+    pub version: Option<&'a str>,
+    pub labels: &'a [String],
+    pub content: &'a serde_json::Value,
+    pub author: &'a str,
+}
+
+#[derive(Default)]
+pub struct ApiDocUpdate<'a> {
+    pub app: Option<&'a str>,
+    pub title: Option<&'a str>,
+    pub summary: Option<Option<&'a str>>,
+    pub kind: Option<&'a str>,
+    pub source_format: Option<&'a str>,
+    pub source_ref: Option<Option<&'a str>>,
+    pub version: Option<Option<&'a str>>,
+    pub labels: Option<&'a [String]>,
+    pub content: Option<&'a serde_json::Value>,
+}
+
+fn parse_content_json(raw: String) -> serde_json::Value {
+    serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({ "raw": raw }))
+}
+
+fn row_to_api_doc(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiDoc> {
+    let content_json: String = row.get(10)?;
+    Ok(ApiDoc {
+        id: row.get(0)?,
+        project_ident: row.get(1)?,
+        app: row.get(2)?,
+        title: row.get(3)?,
+        summary: row.get(4)?,
+        kind: row.get(5)?,
+        source_format: row.get(6)?,
+        source_ref: row.get(7)?,
+        version: row.get(8)?,
+        labels: parse_labels(row.get::<_, Option<String>>(9)?),
+        content: parse_content_json(content_json),
+        author: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+    })
+}
+
+fn row_to_api_doc_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiDocSummary> {
+    Ok(ApiDocSummary {
+        id: row.get(0)?,
+        project_ident: row.get(1)?,
+        app: row.get(2)?,
+        title: row.get(3)?,
+        summary: row.get(4)?,
+        kind: row.get(5)?,
+        source_format: row.get(6)?,
+        source_ref: row.get(7)?,
+        version: row.get(8)?,
+        labels: parse_labels(row.get::<_, Option<String>>(9)?),
+        author: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+    })
+}
+
+const API_DOC_SELECT_COLS: &str = "id, project_ident, app, title, summary, kind, source_format, source_ref, version, labels, content_json, author, created_at, updated_at";
+const API_DOC_SUMMARY_SELECT_COLS: &str = "id, project_ident, app, title, summary, kind, source_format, source_ref, version, labels, author, created_at, updated_at";
+
+pub fn insert_api_doc(
+    conn: &Connection,
+    project_ident: &str,
+    doc: &ApiDocInsert<'_>,
+) -> Result<ApiDoc> {
+    let id = new_uuid();
+    let now = now_ms();
+    let labels_json = serialize_labels(doc.labels);
+    let content_json = serde_json::to_string(doc.content)?;
+    conn.execute(
+        "INSERT INTO api_docs (
+             id, project_ident, app, title, summary, kind, source_format, source_ref,
+             version, labels, content_json, author, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
+        params![
+            id,
+            project_ident,
+            doc.app,
+            doc.title,
+            doc.summary,
+            doc.kind,
+            doc.source_format,
+            doc.source_ref,
+            doc.version,
+            labels_json,
+            content_json,
+            doc.author,
+            now,
+        ],
+    )?;
+    get_api_doc(conn, project_ident, &id)?
+        .ok_or_else(|| anyhow::anyhow!("inserted api doc not found"))
+}
+
+pub fn list_api_docs(
+    conn: &Connection,
+    project_ident: &str,
+    filters: &ApiDocFilters<'_>,
+) -> Result<Vec<ApiDocSummary>> {
+    let mut sql =
+        format!("SELECT {API_DOC_SUMMARY_SELECT_COLS} FROM api_docs WHERE project_ident = ?1");
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(project_ident.to_string())];
+
+    if let Some(app) = filters.app.map(str::trim).filter(|v| !v.is_empty()) {
+        binds.push(Box::new(app.to_string()));
+        sql.push_str(&format!(" AND app = ?{}", binds.len()));
+    }
+    if let Some(kind) = filters.kind.map(str::trim).filter(|v| !v.is_empty()) {
+        binds.push(Box::new(kind.to_string()));
+        sql.push_str(&format!(" AND kind = ?{}", binds.len()));
+    }
+    if let Some(label) = filters.label.map(str::trim).filter(|v| !v.is_empty()) {
+        binds.push(Box::new(format!("%\"{label}\"%")));
+        sql.push_str(&format!(" AND COALESCE(labels, '') LIKE ?{}", binds.len()));
+    }
+    if let Some(q) = filters.query.map(str::trim).filter(|v| !v.is_empty()) {
+        binds.push(Box::new(format!("%{q}%")));
+        let ph = binds.len();
+        sql.push_str(&format!(
+            " AND (app LIKE ?{ph}
+                   OR title LIKE ?{ph}
+                   OR COALESCE(summary, '') LIKE ?{ph}
+                   OR kind LIKE ?{ph}
+                   OR source_format LIKE ?{ph}
+                   OR COALESCE(source_ref, '') LIKE ?{ph}
+                   OR COALESCE(version, '') LIKE ?{ph}
+                   OR COALESCE(labels, '') LIKE ?{ph}
+                   OR content_json LIKE ?{ph})"
+        ));
+    }
+    sql.push_str(" ORDER BY updated_at DESC, app ASC, title ASC");
+
+    let params_vec: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params_vec.as_slice(), row_to_api_doc_summary)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn get_api_doc(conn: &Connection, project_ident: &str, id: &str) -> Result<Option<ApiDoc>> {
+    let sql =
+        format!("SELECT {API_DOC_SELECT_COLS} FROM api_docs WHERE project_ident = ?1 AND id = ?2");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query_map(params![project_ident, id], row_to_api_doc)?;
+    Ok(rows.next().transpose()?)
+}
+
+pub fn update_api_doc(
+    conn: &Connection,
+    project_ident: &str,
+    id: &str,
+    upd: &ApiDocUpdate<'_>,
+) -> Result<Option<ApiDoc>> {
+    if get_api_doc(conn, project_ident, id)?.is_none() {
+        return Ok(None);
+    }
+
+    let now = now_ms();
+    let mut sets: Vec<String> = Vec::new();
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    let push = |col: &str,
+                val: Box<dyn rusqlite::ToSql>,
+                sets: &mut Vec<String>,
+                binds: &mut Vec<Box<dyn rusqlite::ToSql>>| {
+        binds.push(val);
+        sets.push(format!("{col} = ?{}", binds.len()));
+    };
+
+    if let Some(app) = upd.app {
+        push("app", Box::new(app.to_string()), &mut sets, &mut binds);
+    }
+    if let Some(title) = upd.title {
+        push("title", Box::new(title.to_string()), &mut sets, &mut binds);
+    }
+    if let Some(summary) = upd.summary {
+        push(
+            "summary",
+            Box::new(summary.map(str::to_string)),
+            &mut sets,
+            &mut binds,
+        );
+    }
+    if let Some(kind) = upd.kind {
+        push("kind", Box::new(kind.to_string()), &mut sets, &mut binds);
+    }
+    if let Some(source_format) = upd.source_format {
+        push(
+            "source_format",
+            Box::new(source_format.to_string()),
+            &mut sets,
+            &mut binds,
+        );
+    }
+    if let Some(source_ref) = upd.source_ref {
+        push(
+            "source_ref",
+            Box::new(source_ref.map(str::to_string)),
+            &mut sets,
+            &mut binds,
+        );
+    }
+    if let Some(version) = upd.version {
+        push(
+            "version",
+            Box::new(version.map(str::to_string)),
+            &mut sets,
+            &mut binds,
+        );
+    }
+    if let Some(labels) = upd.labels {
+        push(
+            "labels",
+            Box::new(serialize_labels(labels)),
+            &mut sets,
+            &mut binds,
+        );
+    }
+    if let Some(content) = upd.content {
+        push(
+            "content_json",
+            Box::new(serde_json::to_string(content)?),
+            &mut sets,
+            &mut binds,
+        );
+    }
+
+    if sets.is_empty() {
+        return get_api_doc(conn, project_ident, id);
+    }
+    push("updated_at", Box::new(now), &mut sets, &mut binds);
+    binds.push(Box::new(project_ident.to_string()));
+    let project_ph = binds.len();
+    binds.push(Box::new(id.to_string()));
+    let id_ph = binds.len();
+
+    let sql = format!(
+        "UPDATE api_docs SET {} WHERE project_ident = ?{project_ph} AND id = ?{id_ph}",
+        sets.join(", ")
+    );
+    let params_vec: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+    conn.execute(&sql, params_vec.as_slice())?;
+    get_api_doc(conn, project_ident, id)
+}
+
+pub fn delete_api_doc(conn: &Connection, project_ident: &str, id: &str) -> Result<bool> {
+    let n = conn.execute(
+        "DELETE FROM api_docs WHERE project_ident = ?1 AND id = ?2",
+        params![project_ident, id],
     )?;
     Ok(n > 0)
 }
@@ -2743,5 +3083,78 @@ mod tests {
         .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].version, "superseded");
+    }
+
+    #[test]
+    fn api_docs_store_docs_first_context_and_search_content() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("billing")).unwrap();
+
+        let content = serde_json::json!({
+            "purpose": "Owns invoice state.",
+            "workflows": [{
+                "name": "Create invoice",
+                "steps": ["Create draft", "Finalize after confirmation"]
+            }],
+            "endpoints": [{
+                "method": "POST",
+                "path": "/v1/invoices",
+                "intent": "Create a draft invoice"
+            }]
+        });
+        let doc = insert_api_doc(
+            &conn,
+            "billing",
+            &ApiDocInsert {
+                app: "billing-api",
+                title: "Billing API agent context",
+                summary: Some("System of record for invoices."),
+                kind: "agent_context",
+                source_format: "agent_context",
+                source_ref: Some(".agent/api/billing.yaml"),
+                version: Some("2026-04-28"),
+                labels: &["billing".into(), "invoices".into()],
+                content: &content,
+                author: "tester",
+            },
+        )
+        .unwrap();
+
+        let fetched = get_api_doc(&conn, "billing", &doc.id).unwrap().unwrap();
+        assert_eq!(fetched.app, "billing-api");
+        assert_eq!(fetched.content["purpose"], "Owns invoice state.");
+
+        let results = list_api_docs(
+            &conn,
+            "billing",
+            &ApiDocFilters {
+                query: Some("draft invoice"),
+                label: Some("invoices"),
+                ..ApiDocFilters::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, doc.id);
+
+        let updated = update_api_doc(
+            &conn,
+            "billing",
+            &doc.id,
+            &ApiDocUpdate {
+                summary: Some(Some("Updated agent guidance.")),
+                version: Some(None),
+                ..ApiDocUpdate::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(updated.summary.as_deref(), Some("Updated agent guidance."));
+        assert_eq!(updated.version, None);
+
+        let project_stats = list_project_stats(&conn).unwrap();
+        assert_eq!(project_stats[0].api_doc_count, 1);
+        let dashboard = get_dashboard_data(&conn).unwrap();
+        assert_eq!(dashboard.api_doc_count, 1);
     }
 }
