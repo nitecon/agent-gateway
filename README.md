@@ -197,6 +197,76 @@ All messaging endpoints accept an optional `X-Agent-Id` header. When provided, e
 | `GET` | `/v1/skills/:name/content` | Fetch markdown content for a command/agent. |
 | `DELETE` | `/v1/skills/:name` | Delete a skill. |
 
+### Agent API docs
+
+Project-scoped registry for agent-native API context. This is designed for
+apps that often do not have OpenAPI/Swagger yet: publish docs-first structured
+context directly, or import generated specs later as one source format.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/v1/projects/:ident/api-docs` | List API context summaries. Supports `q`, `app`, `label`, and `kind` query filters. |
+| `POST` | `/v1/projects/:ident/api-docs` | Publish a new API context document. Body includes `app`, `title`, `content`, optional `summary`, `kind`, `source_format`, `source_ref`, `version`, `labels`, and `author`. |
+| `GET` | `/v1/projects/:ident/api-docs/chunks` | Return RAG-ready chunks generated from stored context. Supports the same filters as list. |
+| `GET` | `/v1/projects/:ident/api-docs/:id` | Fetch one API context document with full JSON content. |
+| `PATCH` | `/v1/projects/:ident/api-docs/:id` | Update API context metadata or content. Nullable fields such as `summary`, `source_ref`, and `version` can be set to `null`. |
+| `DELETE` | `/v1/projects/:ident/api-docs/:id` | Delete one API context document. |
+
+The canonical payload is agent context, not OpenAPI. OpenAPI/Swagger should be
+stored as `source_format: "openapi"` or `source_format: "swagger"` when it is
+available, but agents should prefer enriched fields that capture intent,
+workflows, auth expectations, safety constraints, cross-app relationships, and
+copyable examples.
+
+Example docs-first publish body:
+
+```json
+{
+  "app": "billing-api",
+  "title": "Billing API agent context",
+  "summary": "System of record for invoices and customer billing state.",
+  "kind": "agent_context",
+  "source_format": "agent_context",
+  "source_ref": ".agent/api/billing.yaml",
+  "version": "2026-04-28",
+  "labels": ["billing", "invoices"],
+  "content": {
+    "purpose": "Owns invoice state, invoice line items, and billing status.",
+    "workflows": [
+      {
+        "name": "Create invoice",
+        "steps": [
+          "Look up the customer by external_id",
+          "Create a draft invoice",
+          "Add line items",
+          "Finalize only after explicit user confirmation"
+        ]
+      }
+    ],
+    "auth": {
+      "type": "bearer",
+      "token_source": "project secret store"
+    },
+    "safety": {
+      "destructive_operations": ["void invoice", "finalize invoice"]
+    },
+    "relationships": [
+      {
+        "app": "crm",
+        "relationship": "CRM owns customer profile; billing owns invoice state."
+      }
+    ],
+    "endpoints": [
+      {
+        "method": "POST",
+        "path": "/v1/invoices",
+        "intent": "Create a draft invoice for an existing customer."
+      }
+    ]
+  }
+}
+```
+
 ### Patterns
 
 Global markdown pattern library for organization-wide practices. Patterns are

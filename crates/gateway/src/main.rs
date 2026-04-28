@@ -422,6 +422,20 @@ async fn main() -> Result<()> {
             get(routes::get_project_eventic_status),
         )
         .route(
+            "/v1/projects/{ident}/api-docs",
+            get(routes::list_api_docs_handler).post(routes::create_api_doc_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/api-docs/chunks",
+            get(routes::list_api_doc_chunks_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/api-docs/{id}",
+            get(routes::get_api_doc_handler)
+                .patch(routes::update_api_doc_handler)
+                .delete(routes::delete_api_doc_handler),
+        )
+        .route(
             "/v1/eventic/servers",
             get(routes::get_eventic_servers)
                 .post(routes::add_eventic_server)
@@ -453,7 +467,13 @@ async fn main() -> Result<()> {
     // old /manage tab hub.
     let app = Router::new()
         .route("/", get(routes::dashboard))
+        .route("/api-docs", get(routes::api_docs_index_page))
         .route("/projects/{ident}/build", get(routes::project_build_page))
+        .route("/projects/{ident}/api-docs", get(routes::api_docs_page))
+        .route(
+            "/projects/{ident}/api-docs/{id}",
+            get(routes::api_doc_detail_page),
+        )
         .route("/tasks", get(routes::tasks_picker))
         .route("/projects/{ident}/tasks", get(routes::tasks_board))
         .route("/projects/{ident}/tasks/new", get(routes::new_task_page))

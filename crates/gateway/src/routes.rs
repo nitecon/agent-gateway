@@ -496,6 +496,412 @@ pub async fn get_project_eventic_status(
     }))
 }
 
+// ── Agent API docs ───────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct ListApiDocsQuery {
+    pub q: Option<String>,
+    pub app: Option<String>,
+    pub label: Option<String>,
+    pub kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct CreateApiDocRequest {
+    pub app: String,
+    pub title: String,
+    pub summary: Option<String>,
+    #[serde(default = "default_api_doc_kind")]
+    pub kind: String,
+    #[serde(default = "default_api_doc_source_format")]
+    pub source_format: String,
+    pub source_ref: Option<String>,
+    pub version: Option<String>,
+    #[serde(default)]
+    pub labels: Value,
+    pub content: Value,
+    pub author: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateApiDocRequest {
+    pub app: Option<String>,
+    pub title: Option<String>,
+    pub summary: Option<Value>,
+    pub kind: Option<String>,
+    pub source_format: Option<String>,
+    pub source_ref: Option<Value>,
+    pub version: Option<Value>,
+    pub labels: Option<Value>,
+    pub content: Option<Value>,
+}
+
+#[derive(Serialize)]
+pub struct ApiDocChunk {
+    pub doc_id: String,
+    pub project_ident: String,
+    pub app: String,
+    pub title: String,
+    pub chunk_type: String,
+    pub labels: Vec<String>,
+    pub text: String,
+    pub updated_at: i64,
+}
+
+fn default_api_doc_kind() -> String {
+    "agent_context".to_string()
+}
+
+fn default_api_doc_source_format() -> String {
+    "agent_context".to_string()
+}
+
+fn optional_string_field(field: &str, value: Value) -> Result<Option<String>> {
+    match value {
+        Value::Null => Ok(None),
+        Value::String(s) => Ok(Some(s)),
+        _ => Err(AppError(
+            StatusCode::BAD_REQUEST,
+            format!("{field} must be a string or null"),
+        )),
+    }
+}
+
+fn validate_api_doc_input(
+    app: Option<&str>,
+    title: Option<&str>,
+    kind: Option<&str>,
+    source_format: Option<&str>,
+) -> Result<()> {
+    if app.is_some_and(|v| v.trim().is_empty()) {
+        return Err(AppError(StatusCode::BAD_REQUEST, "app is required".into()));
+    }
+    if title.is_some_and(|v| v.trim().is_empty()) {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "title is required".into(),
+        ));
+    }
+    if kind.is_some_and(|v| v.trim().is_empty()) {
+        return Err(AppError(StatusCode::BAD_REQUEST, "kind is required".into()));
+    }
+    if source_format.is_some_and(|v| v.trim().is_empty()) {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "source_format is required".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn api_doc_chunks(doc: &db::ApiDoc) -> Vec<ApiDocChunk> {
+    let mut chunks = Vec::new();
+    let mut overview = format!("{} ({})", doc.title, doc.app);
+    if let Some(summary) = doc.summary.as_deref().filter(|s| !s.trim().is_empty()) {
+        overview.push_str("\n\n");
+        overview.push_str(summary.trim());
+    }
+    overview.push_str("\n\nkind: ");
+    overview.push_str(&doc.kind);
+    overview.push_str("\nsource_format: ");
+    overview.push_str(&doc.source_format);
+    if let Some(version) = doc.version.as_deref().filter(|s| !s.trim().is_empty()) {
+        overview.push_str("\nversion: ");
+        overview.push_str(version.trim());
+    }
+    chunks.push(ApiDocChunk {
+        doc_id: doc.id.clone(),
+        project_ident: doc.project_ident.clone(),
+        app: doc.app.clone(),
+        title: doc.title.clone(),
+        chunk_type: "overview".to_string(),
+        labels: doc.labels.clone(),
+        text: overview,
+        updated_at: doc.updated_at,
+    });
+
+    if let Value::Object(map) = &doc.content {
+        for key in [
+            "purpose",
+            "workflows",
+            "endpoints",
+            "auth",
+            "safety",
+            "relationships",
+            "examples",
+            "operations",
+            "schemas",
+        ] {
+            if let Some(value) = map.get(key) {
+                let rendered = match value {
+                    Value::String(s) => s.clone(),
+                    _ => serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
+                };
+                if rendered.trim().is_empty() {
+                    continue;
+                }
+                chunks.push(ApiDocChunk {
+                    doc_id: doc.id.clone(),
+                    project_ident: doc.project_ident.clone(),
+                    app: doc.app.clone(),
+                    title: doc.title.clone(),
+                    chunk_type: key.to_string(),
+                    labels: doc.labels.clone(),
+                    text: rendered,
+                    updated_at: doc.updated_at,
+                });
+            }
+        }
+    } else {
+        chunks.push(ApiDocChunk {
+            doc_id: doc.id.clone(),
+            project_ident: doc.project_ident.clone(),
+            app: doc.app.clone(),
+            title: doc.title.clone(),
+            chunk_type: "content".to_string(),
+            labels: doc.labels.clone(),
+            text: doc.content.to_string(),
+            updated_at: doc.updated_at,
+        });
+    }
+
+    chunks
+}
+
+pub async fn list_api_docs_handler(
+    State(state): State<AppState>,
+    Path(ident): Path<String>,
+    Query(q): Query<ListApiDocsQuery>,
+) -> Result<Json<Vec<db::ApiDocSummary>>> {
+    let db = state.db.clone();
+    let (project_exists, docs) = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        if db::get_project(&conn, &ident)?.is_none() {
+            return Ok::<_, anyhow::Error>((false, Vec::new()));
+        }
+        let filters = db::ApiDocFilters {
+            query: q.q.as_deref(),
+            app: q.app.as_deref(),
+            label: q.label.as_deref(),
+            kind: q.kind.as_deref(),
+        };
+        let docs = db::list_api_docs(&conn, &ident, &filters)?;
+        Ok((true, docs))
+    })
+    .await??;
+    if !project_exists {
+        return Err(AppError(
+            StatusCode::NOT_FOUND,
+            "project not found".to_string(),
+        ));
+    }
+    Ok(Json(docs))
+}
+
+pub async fn create_api_doc_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(ident): Path<String>,
+    Json(req): Json<CreateApiDocRequest>,
+) -> Result<Json<db::ApiDoc>> {
+    validate_api_doc_input(
+        Some(req.app.as_str()),
+        Some(req.title.as_str()),
+        Some(req.kind.as_str()),
+        Some(req.source_format.as_str()),
+    )?;
+    if req.content.is_null() {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "content is required".into(),
+        ));
+    }
+    let labels = decode_labels_field("labels", Some(req.labels))?;
+    let author = resolve_identity(req.author, &headers);
+    let db = state.db.clone();
+    let doc = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        if db::get_project(&conn, &ident)?.is_none() {
+            return Ok::<_, anyhow::Error>(None);
+        }
+        let doc = db::insert_api_doc(
+            &conn,
+            &ident,
+            &db::ApiDocInsert {
+                app: req.app.trim(),
+                title: req.title.trim(),
+                summary: req
+                    .summary
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty()),
+                kind: req.kind.trim(),
+                source_format: req.source_format.trim(),
+                source_ref: req
+                    .source_ref
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty()),
+                version: req
+                    .version
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty()),
+                labels: &labels,
+                content: &req.content,
+                author: &author,
+            },
+        )?;
+        Ok(Some(doc))
+    })
+    .await??;
+    match doc {
+        Some(doc) => Ok(Json(doc)),
+        None => Err(AppError(
+            StatusCode::NOT_FOUND,
+            "project not found".to_string(),
+        )),
+    }
+}
+
+pub async fn get_api_doc_handler(
+    State(state): State<AppState>,
+    Path((ident, id)): Path<(String, String)>,
+) -> Result<Json<db::ApiDoc>> {
+    let db = state.db.clone();
+    let doc = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::get_api_doc(&conn, &ident, &id)
+    })
+    .await??;
+    match doc {
+        Some(doc) => Ok(Json(doc)),
+        None => Err(AppError(
+            StatusCode::NOT_FOUND,
+            "api doc not found".to_string(),
+        )),
+    }
+}
+
+pub async fn update_api_doc_handler(
+    State(state): State<AppState>,
+    Path((ident, id)): Path<(String, String)>,
+    Json(req): Json<UpdateApiDocRequest>,
+) -> Result<Json<db::ApiDoc>> {
+    validate_api_doc_input(
+        req.app.as_deref(),
+        req.title.as_deref(),
+        req.kind.as_deref(),
+        req.source_format.as_deref(),
+    )?;
+    let labels = match req.labels {
+        Some(labels) => Some(decode_labels_field("labels", Some(labels))?),
+        None => None,
+    };
+    let summary = match req.summary {
+        Some(value) => Some(optional_string_field("summary", value)?),
+        None => None,
+    };
+    let source_ref = match req.source_ref {
+        Some(value) => Some(optional_string_field("source_ref", value)?),
+        None => None,
+    };
+    let version = match req.version {
+        Some(value) => Some(optional_string_field("version", value)?),
+        None => None,
+    };
+    let db = state.db.clone();
+    let doc = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::update_api_doc(
+            &conn,
+            &ident,
+            &id,
+            &db::ApiDocUpdate {
+                app: req.app.as_deref().map(str::trim),
+                title: req.title.as_deref().map(str::trim),
+                summary: summary
+                    .as_ref()
+                    .map(|value| value.as_deref().map(str::trim).filter(|s| !s.is_empty())),
+                kind: req.kind.as_deref().map(str::trim),
+                source_format: req.source_format.as_deref().map(str::trim),
+                source_ref: source_ref
+                    .as_ref()
+                    .map(|value| value.as_deref().map(str::trim).filter(|s| !s.is_empty())),
+                version: version
+                    .as_ref()
+                    .map(|value| value.as_deref().map(str::trim).filter(|s| !s.is_empty())),
+                labels: labels.as_deref(),
+                content: req.content.as_ref(),
+            },
+        )
+    })
+    .await??;
+    match doc {
+        Some(doc) => Ok(Json(doc)),
+        None => Err(AppError(
+            StatusCode::NOT_FOUND,
+            "api doc not found".to_string(),
+        )),
+    }
+}
+
+pub async fn delete_api_doc_handler(
+    State(state): State<AppState>,
+    Path((ident, id)): Path<(String, String)>,
+) -> Result<Json<DeleteResponse>> {
+    let db = state.db.clone();
+    let deleted = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::delete_api_doc(&conn, &ident, &id)
+    })
+    .await??;
+    if deleted {
+        Ok(Json(DeleteResponse { deleted: true }))
+    } else {
+        Err(AppError(
+            StatusCode::NOT_FOUND,
+            "api doc not found".to_string(),
+        ))
+    }
+}
+
+pub async fn list_api_doc_chunks_handler(
+    State(state): State<AppState>,
+    Path(ident): Path<String>,
+    Query(q): Query<ListApiDocsQuery>,
+) -> Result<Json<Vec<ApiDocChunk>>> {
+    let db = state.db.clone();
+    let (project_exists, chunks) = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        if db::get_project(&conn, &ident)?.is_none() {
+            return Ok::<_, anyhow::Error>((false, Vec::new()));
+        }
+        let filters = db::ApiDocFilters {
+            query: q.q.as_deref(),
+            app: q.app.as_deref(),
+            label: q.label.as_deref(),
+            kind: q.kind.as_deref(),
+        };
+        let docs = db::list_api_docs(&conn, &ident, &filters)?;
+        let mut chunks = Vec::new();
+        for summary in docs {
+            if let Some(doc) = db::get_api_doc(&conn, &ident, &summary.id)? {
+                chunks.extend(api_doc_chunks(&doc));
+            }
+        }
+        Ok::<_, anyhow::Error>((true, chunks))
+    })
+    .await??;
+    if !project_exists {
+        return Err(AppError(
+            StatusCode::NOT_FOUND,
+            "project not found".to_string(),
+        ));
+    }
+    Ok(Json(chunks))
+}
+
 // ── POST /v1/projects ─────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -1514,7 +1920,7 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
     };
 
     let rows = if data.project_count == 0 {
-        r#"<tr><td colspan="6" class="nd-text-muted nd-text-center">No projects registered yet</td></tr>"#.to_string()
+        r#"<tr><td colspan="8" class="nd-text-muted nd-text-center">No projects registered yet</td></tr>"#.to_string()
     } else {
         data.projects
             .iter()
@@ -1535,14 +1941,32 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
                     ),
                     None => r#"<a class="nd-btn-ghost nd-btn-sm" href="/settings">Map repo</a>"#.into(),
                 };
+                let docs_cell = if p.api_doc_count > 0 {
+                    format!(
+                        r#"<a class="nd-btn-secondary nd-btn-sm" href="/projects/{}/api-docs">{} docs</a>"#,
+                        he(&p.ident),
+                        p.api_doc_count
+                    )
+                } else {
+                    format!(
+                        r#"<a class="nd-btn-ghost nd-btn-sm" href="/projects/{}/api-docs">No docs</a>"#,
+                        he(&p.ident)
+                    )
+                };
+                let tasks_cell = format!(
+                    r#"<a class="nd-btn-secondary nd-btn-sm" href="/projects/{}/tasks">Tasks</a>"#,
+                    he(&p.ident)
+                );
                 format!(
-                    "<tr><td>{}</td><td>{}</td><td class=\"nd-text-muted\">{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    "<tr><td>{}</td><td>{}</td><td class=\"nd-text-muted\">{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                     he(&p.ident),
                     he(&p.channel_name),
                     he(&p.room_id),
                     p.total_messages,
                     unread_cell,
                     build_cell,
+                    docs_cell,
+                    tasks_cell,
                 )
             })
             .collect::<Vec<_>>()
@@ -1559,13 +1983,14 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
     <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{agent}</div><div class="nd-text-xs nd-text-muted">Agent</div></div></div></div>
     <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{user}</div><div class="nd-text-xs nd-text-muted">User</div></div></div></div>
     <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{skills}</div><div class="nd-text-xs nd-text-muted">Skills</div></div></div></div>
+    <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{api_docs}</div><div class="nd-text-xs nd-text-muted">API docs</div></div></div></div>
   </section>
 
   <section class="nd-card">
     <div class="nd-card-header"><strong>Projects</strong></div>
     <div class="nd-card-body nd-p-0">
       <table class="nd-table nd-table-hover">
-        <thead><tr><th>Project</th><th>Channel</th><th>Room ID</th><th>Messages</th><th>Unread</th><th>Build</th></tr></thead>
+        <thead><tr><th>Project</th><th>Channel</th><th>Room ID</th><th>Messages</th><th>Unread</th><th>Build</th><th>Docs</th><th>Tasks</th></tr></thead>
         <tbody>{rows}</tbody>
       </table>
     </div>
@@ -1577,6 +2002,7 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
         agent = data.agent_messages,
         user = data.user_messages,
         skills = data.skill_count,
+        api_docs = data.api_doc_count,
         rows = rows,
     );
 
@@ -1588,6 +2014,287 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
         close = control_panel_close(&state.api_key),
     );
 
+    Ok(Html(html))
+}
+
+pub async fn api_docs_index_page(State(state): State<AppState>) -> Result<Html<String>> {
+    let db = state.db.clone();
+    let (projects, theme) = spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = db.lock().unwrap();
+        Ok((db::list_project_stats(&conn)?, db::get_theme(&conn)?))
+    })
+    .await??;
+
+    let rows = if projects.is_empty() {
+        r#"<tr><td colspan="5" class="nd-text-muted nd-text-center">No projects registered yet.</td></tr>"#.to_string()
+    } else {
+        projects
+            .iter()
+            .map(|project| {
+                let docs_cell = if project.api_doc_count > 0 {
+                    format!(
+                        r#"<a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/api-docs">{count} docs</a>"#,
+                        ident = he(&project.ident),
+                        count = project.api_doc_count,
+                    )
+                } else {
+                    format!(
+                        r#"<a class="nd-btn-ghost nd-btn-sm" href="/projects/{ident}/api-docs">Start docs</a>"#,
+                        ident = he(&project.ident),
+                    )
+                };
+                let repo = project.repo_full_name.as_deref().unwrap_or("");
+                format!(
+                    r#"<tr>
+  <td><strong>{ident}</strong><div class="nd-text-xs nd-text-muted">{repo}</div></td>
+  <td>{docs}</td>
+  <td>{messages}</td>
+  <td>{unread}</td>
+  <td><a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/tasks">Tasks</a></td>
+</tr>"#,
+                    ident = he(&project.ident),
+                    repo = he(repo),
+                    docs = docs_cell,
+                    messages = project.total_messages,
+                    unread = project.unread_count,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let content = format!(
+        r#"  <section class="nd-card">
+    <div class="nd-card-header"><strong>API Docs by Project</strong></div>
+    <div class="nd-card-body nd-p-0">
+      <table class="nd-table nd-table-hover">
+        <thead><tr><th>Project</th><th>Docs</th><th>Messages</th><th>Unread</th><th>Tasks</th></tr></thead>
+        <tbody>{rows}</tbody>
+      </table>
+    </div>
+  </section>"#,
+        rows = rows,
+    );
+
+    let html = format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
+        head = control_panel_head("agent-gateway - API docs", &theme, ""),
+        open = control_panel_open("API Docs", "api-docs"),
+        content = content,
+        close = control_panel_close(&state.api_key),
+    );
+    Ok(Html(html))
+}
+
+pub async fn api_docs_page(
+    State(state): State<AppState>,
+    Path(ident): Path<String>,
+) -> Result<Html<String>> {
+    let db = state.db.clone();
+    let ident_for_lookup = ident.clone();
+    let (project, docs, theme) = spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = db.lock().unwrap();
+        let project = db::get_project(&conn, &ident_for_lookup)?;
+        let docs = db::list_api_docs(&conn, &ident_for_lookup, &db::ApiDocFilters::default())?;
+        let theme = db::get_theme(&conn)?;
+        Ok((project, docs, theme))
+    })
+    .await??;
+
+    let project = project.ok_or_else(|| {
+        AppError(
+            StatusCode::NOT_FOUND,
+            format!("project '{}' not found", ident),
+        )
+    })?;
+
+    let rows = if docs.is_empty() {
+        r#"<tr><td colspan="6" class="nd-text-muted nd-text-center">No agent API context has been published for this project.</td></tr>"#.to_string()
+    } else {
+        docs.iter()
+            .map(|doc| {
+                let labels = if doc.labels.is_empty() {
+                    String::new()
+                } else {
+                    doc.labels
+                        .iter()
+                        .map(|label| {
+                            format!(r#"<span class="nd-badge nd-badge-sm">{}</span>"#, he(label))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                let summary = doc.summary.as_deref().unwrap_or("");
+                format!(
+                    r#"<tr>
+  <td><a class="nd-btn-ghost nd-text-left" href="/projects/{ident}/api-docs/{id}"><strong>{app}</strong><div class="nd-text-xs nd-text-muted">{title}</div></a></td>
+  <td>{kind}</td>
+  <td>{source}</td>
+  <td>{version}</td>
+  <td>{labels}</td>
+  <td class="nd-text-muted">{summary}</td>
+</tr>"#,
+                    ident = he(&project.ident),
+                    id = he(&doc.id),
+                    app = he(&doc.app),
+                    title = he(&doc.title),
+                    kind = he(&doc.kind),
+                    source = he(&doc.source_format),
+                    version = he(doc.version.as_deref().unwrap_or("")),
+                    labels = labels,
+                    summary = he(summary),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let ident_attr = he(&project.ident);
+    let content = format!(
+        r#"  <div class="nd-flex nd-gap-md nd-mb-md">
+    <a class="nd-btn-secondary nd-btn-sm" href="/api-docs">All API docs</a>
+    <a class="nd-btn-secondary nd-btn-sm" href="/">Dashboard</a>
+    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/tasks">Tasks</a>
+    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/build">Build</a>
+  </div>
+
+  <section class="nd-card">
+    <div class="nd-card-header"><strong>Agent API Context</strong></div>
+    <div class="nd-card-body nd-p-0">
+      <table class="nd-table nd-table-hover">
+        <thead><tr><th>App</th><th>Kind</th><th>Source</th><th>Version</th><th>Labels</th><th>Summary</th></tr></thead>
+        <tbody>{rows}</tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="nd-card nd-mt-lg">
+    <div class="nd-card-header"><strong>Agent endpoints</strong></div>
+    <div class="nd-card-body">
+      <p class="nd-text-muted nd-text-sm">Publish docs-first context with <code>POST /v1/projects/{ident}/api-docs</code>. Retrieve RAG-ready chunks with <code>GET /v1/projects/{ident}/api-docs/chunks</code>.</p>
+    </div>
+  </section>"#,
+        ident = ident_attr,
+        rows = rows,
+    );
+
+    let page_title = format!("API docs - {}", project.ident);
+    let html = format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
+        head = control_panel_head("agent-gateway - API docs", &theme, ""),
+        open = control_panel_open(&page_title, "dashboard"),
+        content = content,
+        close = control_panel_close(&state.api_key),
+    );
+    Ok(Html(html))
+}
+
+pub async fn api_doc_detail_page(
+    State(state): State<AppState>,
+    Path((ident, id)): Path<(String, String)>,
+) -> Result<Html<String>> {
+    let db = state.db.clone();
+    let ident_for_lookup = ident.clone();
+    let id_for_lookup = id.clone();
+    let (project, doc, theme) = spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = db.lock().unwrap();
+        let project = db::get_project(&conn, &ident_for_lookup)?;
+        let doc = db::get_api_doc(&conn, &ident_for_lookup, &id_for_lookup)?;
+        let theme = db::get_theme(&conn)?;
+        Ok((project, doc, theme))
+    })
+    .await??;
+
+    let project = project.ok_or_else(|| {
+        AppError(
+            StatusCode::NOT_FOUND,
+            format!("project '{}' not found", ident),
+        )
+    })?;
+    let doc =
+        doc.ok_or_else(|| AppError(StatusCode::NOT_FOUND, format!("api doc '{}' not found", id)))?;
+
+    let labels = if doc.labels.is_empty() {
+        String::new()
+    } else {
+        doc.labels
+            .iter()
+            .map(|label| format!(r#"<span class="nd-badge nd-badge-sm">{}</span>"#, he(label)))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let chunks = api_doc_chunks(&doc)
+        .into_iter()
+        .map(|chunk| {
+            format!(
+                r#"<section class="nd-card nd-mt-md">
+  <div class="nd-card-header"><strong>{chunk_type}</strong></div>
+  <div class="nd-card-body"><pre><code>{text}</code></pre></div>
+</section>"#,
+                chunk_type = he(&chunk.chunk_type),
+                text = he(&chunk.text),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content_json =
+        serde_json::to_string_pretty(&doc.content).unwrap_or_else(|_| doc.content.to_string());
+    let source_ref = doc.source_ref.as_deref().unwrap_or("");
+    let version = doc.version.as_deref().unwrap_or("");
+    let summary = doc.summary.as_deref().unwrap_or("");
+    let ident_attr = he(&project.ident);
+
+    let content = format!(
+        r#"  <div class="nd-flex nd-gap-md nd-mb-md">
+    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/api-docs">Back to project docs</a>
+    <a class="nd-btn-secondary nd-btn-sm" href="/api-docs">All API docs</a>
+  </div>
+
+  <section class="nd-card">
+    <div class="nd-card-header"><strong>{title}</strong></div>
+    <div class="nd-card-body">
+      <div class="nd-row nd-gap-md">
+        <div class="nd-col-3"><div class="nd-text-xs nd-text-muted">App</div><strong>{app}</strong></div>
+        <div class="nd-col-3"><div class="nd-text-xs nd-text-muted">Kind</div><strong>{kind}</strong></div>
+        <div class="nd-col-3"><div class="nd-text-xs nd-text-muted">Source</div><strong>{source}</strong></div>
+        <div class="nd-col-3"><div class="nd-text-xs nd-text-muted">Version</div><strong>{version}</strong></div>
+      </div>
+      <p class="nd-text-muted nd-mt-md">{summary}</p>
+      <div class="nd-mt-md">{labels}</div>
+      <div class="nd-text-xs nd-text-muted nd-mt-md">Source ref: {source_ref}</div>
+    </div>
+  </section>
+
+  <section class="nd-card nd-mt-lg">
+    <div class="nd-card-header"><strong>Stored agent context</strong></div>
+    <div class="nd-card-body"><pre><code>{content_json}</code></pre></div>
+  </section>
+
+  <section class="nd-mt-lg">
+    <h2 class="nd-text-lg nd-mb-sm">RAG chunks</h2>
+    {chunks}
+  </section>"#,
+        ident = ident_attr,
+        title = he(&doc.title),
+        app = he(&doc.app),
+        kind = he(&doc.kind),
+        source = he(&doc.source_format),
+        version = he(version),
+        summary = he(summary),
+        labels = labels,
+        source_ref = he(source_ref),
+        content_json = he(&content_json),
+        chunks = chunks,
+    );
+
+    let page_title = format!("{} - {}", doc.app, project.ident);
+    let html = format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
+        head = control_panel_head("agent-gateway - API doc", &theme, ""),
+        open = control_panel_open(&page_title, "api-docs"),
+        content = content,
+        close = control_panel_close(&state.api_key),
+    );
     Ok(Html(html))
 }
 
@@ -3983,6 +4690,7 @@ fn control_panel_open(page_title: &str, active: &str) -> String {
     <p class="nd-nav-section">Main</p>
     <ul class="nd-nav-menu">
       <li><a href="/"{dashboard}>Dashboard</a></li>
+      <li><a href="/api-docs"{api_docs}>API Docs</a></li>
       <li><a href="/tasks"{tasks}>Tasks</a></li>
       <li><a href="/patterns"{patterns}>Patterns</a></li>
       <li><a href="/skills"{skills}>Skills</a></li>
@@ -4003,6 +4711,7 @@ fn control_panel_open(page_title: &str, active: &str) -> String {
     </header>
     <main class="app-content">"#,
         dashboard = cls("dashboard"),
+        api_docs = cls("api-docs"),
         tasks = cls("tasks"),
         patterns = cls("patterns"),
         skills = cls("skills"),
@@ -4538,5 +5247,12 @@ mod tests {
         assert_eq!(value["details"], "Long handoff spec");
         assert_eq!(value["specification"], "Long handoff spec");
         assert!(value["actions"].is_array());
+    }
+
+    #[test]
+    fn control_panel_nav_exposes_api_docs() {
+        let html = control_panel_open("API Docs", "api-docs");
+
+        assert!(html.contains(r#"<li><a href="/api-docs" class="nd-active">API Docs</a></li>"#));
     }
 }
