@@ -48,6 +48,10 @@ pub struct AppState {
     pub plugins: Arc<HashMap<String, Arc<dyn ChannelPlugin>>>,
     pub default_channel: String,
     pub api_key: String,
+    pub artifact_operations: db::ArtifactOperationsEnvelope,
+    pub artifact_api_enabled: bool,
+    pub artifact_body_schema_enabled: bool,
+    pub artifact_auth_enforced: bool,
     /// Set by the background update checker when a newer release is available.
     pub update_available: Arc<std::sync::Mutex<Option<String>>>,
 }
@@ -226,6 +230,11 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "30".into())
         .parse()
         .context("MESSAGE_RETENTION_DAYS must be a u64")?;
+    let artifact_operations =
+        db::ArtifactOperationsEnvelope::from_env().context("load artifact operations envelope")?;
+    let artifact_api_enabled = env_flag("GATEWAY_ARTIFACT_API_ENABLED", false)?;
+    let artifact_body_schema_enabled = env_flag("GATEWAY_ARTIFACT_BODY_SCHEMA_ENABLED", true)?;
+    let artifact_auth_enforced = env_flag("GATEWAY_ARTIFACT_AUTH_ENFORCED", false)?;
 
     // ── Database ──────────────────────────────────────────────────────────────
     if let Some(parent) = std::path::Path::new(&db_path).parent() {
@@ -341,6 +350,10 @@ async fn main() -> Result<()> {
         plugins: Arc::new(plugins),
         default_channel,
         api_key,
+        artifact_operations,
+        artifact_api_enabled,
+        artifact_body_schema_enabled,
+        artifact_auth_enforced,
         update_available,
     };
 
@@ -436,6 +449,111 @@ async fn main() -> Result<()> {
                 .delete(routes::delete_api_doc_handler),
         )
         .route(
+            "/v1/projects/{ident}/artifacts",
+            get(routes::list_artifacts_handler).post(routes::create_artifact_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/artifacts/{artifact_id}",
+            get(routes::get_artifact_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/artifacts/{artifact_id}/versions",
+            get(routes::list_artifact_versions_handler)
+                .post(routes::create_artifact_version_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/artifacts/{artifact_id}/versions/{version_id}",
+            get(routes::get_artifact_version_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/artifacts/{artifact_id}/versions/{version_id}/diff",
+            get(routes::diff_artifact_version_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/artifacts/{artifact_id}/comments",
+            get(routes::list_artifact_comments_handler)
+                .post(routes::create_artifact_comment_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/artifacts/{artifact_id}/comments/{comment_id}/resolve",
+            post(routes::resolve_artifact_comment_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/artifacts/{artifact_id}/comments/{comment_id}/reopen",
+            post(routes::reopen_artifact_comment_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/artifacts/{artifact_id}/contributions",
+            get(routes::list_artifact_contributions_handler)
+                .post(routes::create_artifact_contribution_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/artifacts/links",
+            get(routes::list_artifact_links_handler).post(routes::create_artifact_link_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/artifacts/{artifact_id}/workflow-runs",
+            get(routes::list_artifact_workflow_runs_handler)
+                .post(routes::start_artifact_workflow_run_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/artifacts/{artifact_id}/workflow-runs/{workflow_run_id}",
+            get(routes::get_artifact_workflow_run_handler)
+                .patch(routes::complete_artifact_workflow_run_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/design-reviews",
+            post(routes::create_design_review_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/design-reviews/{artifact_id}/rounds",
+            post(routes::create_design_review_round_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/design-reviews/{artifact_id}/rounds/{workflow_run_id}/contributions",
+            post(routes::create_design_review_contribution_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/design-reviews/{artifact_id}/rounds/{workflow_run_id}/synthesis",
+            post(routes::create_design_review_synthesis_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/design-reviews/{artifact_id}/state",
+            post(routes::update_design_review_state_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/design-reviews/{artifact_id}/contributions",
+            get(routes::list_design_review_contributions_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/specs",
+            post(routes::create_spec_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/specs/{artifact_id}/versions",
+            post(routes::create_spec_version_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/specs/{artifact_id}/accept",
+            post(routes::accept_spec_version_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/specs/{artifact_id}/manifest",
+            get(routes::get_spec_manifest_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/specs/{artifact_id}/manifest/{manifest_item_id}",
+            get(routes::get_spec_manifest_item_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/specs/{artifact_id}/generate-tasks",
+            post(routes::generate_spec_tasks_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/specs/{artifact_id}/link-task",
+            post(routes::link_existing_spec_task_handler),
+        )
+        .route(
             "/v1/eventic/servers",
             get(routes::get_eventic_servers)
                 .post(routes::add_eventic_server)
@@ -468,7 +586,16 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/", get(routes::dashboard))
         .route("/api-docs", get(routes::api_docs_index_page))
+        .route("/artifacts", get(routes::artifacts_index_page))
         .route("/projects/{ident}/build", get(routes::project_build_page))
+        .route(
+            "/projects/{ident}/artifacts",
+            get(routes::artifact_workspace_page),
+        )
+        .route(
+            "/projects/{ident}/artifacts/{artifact_id}",
+            get(routes::artifact_detail_page),
+        )
         .route("/projects/{ident}/api-docs", get(routes::api_docs_page))
         .route(
             "/projects/{ident}/api-docs/{id}",
@@ -508,4 +635,16 @@ fn require_env(key: &str) -> String {
         eprintln!("Missing required environment variable: {key}");
         std::process::exit(1);
     })
+}
+
+fn env_flag(key: &str, default: bool) -> Result<bool> {
+    match std::env::var(key) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => anyhow::bail!("{key} must be a boolean flag"),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(err) => Err(err).with_context(|| format!("read {key}")),
+    }
 }

@@ -9,6 +9,7 @@ labels:
   - gateway
   - agents
   - api-docs
+  - artifacts
   - tasks
   - comms
   - patterns
@@ -17,7 +18,7 @@ content:
   purpose: |
     agent-gateway is the server-side coordination layer for AI agents. It stores project registration, messages, per-agent unread state, project task boards, global patterns, skills/commands/agents, Eventic build status configuration, and agent-native API docs.
 
-    Agents should use agent-gateway when they need durable cross-session coordination, cross-project delegated work, user-visible project communication, reusable organization guidance, or RAG-ready API context for owned apps.
+    Agents should use agent-gateway when they need durable cross-session coordination, cross-project delegated work, user-visible project communication, reusable organization guidance, RAG-ready API context for owned apps, or stable artifact IDs for design reviews, specs, documentation, comments, links, and implementation handoff.
   auth:
     type: bearer
     header: "Authorization: Bearer <GATEWAY_API_KEY>"
@@ -37,6 +38,10 @@ content:
       guidance: Pattern comments are review/collaboration state. Normal agents should fetch pattern bodies without comments unless explicitly asked to address comments.
     - name: API docs are agent-native
       guidance: OpenAPI or Swagger can feed the registry, but the canonical registry entry should include workflows, intent, auth, safety, relationships, and examples.
+    - name: Prefer stable artifact IDs before code search
+      guidance: For design-review, spec, and documentation workflows, retrieve the artifact/version/manifest-item context by stable gateway IDs before searching source files. Scratch files remain compatibility state during migration, not the canonical handoff surface.
+    - name: Migrate client and skill handoff to artifacts
+      guidance: "`/design-review`, `/spec`, and `/implement` should pass project_ident, artifact_id, artifact_version_id, workflow_run_id, contribution_id, manifest_item_id, and generated task_id values between agents. Source-adjacent scratch files and task Specification text remain dual-read fallbacks until `docs/artifact-client-skill-migration.md` release gates pass."
   relationships:
     - app: agent-tools
       relationship: Primary CLI client for agents. It wraps gateway comms, tasks, patterns, API docs, and setup flows.
@@ -69,6 +74,34 @@ content:
         - Validate locally with agent-tools docs validate --file PATH.
         - Publish with agent-tools docs publish --file PATH or POST /v1/projects/:ident/api-docs.
         - Retrieve RAG chunks with GET /v1/projects/:ident/api-docs/chunks.
+    - name: Work with artifact-backed specs
+      steps:
+        - Import or create a spec with POST /v1/projects/:ident/specs, preserving source_doc, manifest, per-task spec bodies, touch surfaces, acceptance criteria, validation plans, and stable manifest_item_id values.
+        - Create a new immutable spec version with POST /v1/projects/:ident/specs/:artifact_id/versions.
+        - Accept the version with POST /v1/projects/:ident/specs/:artifact_id/accept before generating tasks.
+        - Read GET /v1/projects/:ident/specs/:artifact_id/manifest or /manifest/:manifest_item_id to delegate without scraping scratch files.
+        - Generate tasks with POST /v1/projects/:ident/specs/:artifact_id/generate-tasks using confirmed=true; idempotent retries reuse task IDs and artifact links.
+        - Link pre-existing tasks with POST /v1/projects/:ident/specs/:artifact_id/link-task when migration discovers work already on the task board.
+    - name: Run artifact-backed design reviews
+      steps:
+        - Create the review artifact with POST /v1/projects/:ident/reviews.
+        - Start each review round with POST /v1/projects/:ident/reviews/:artifact_id/rounds; the workflow_run records round_id, phase, reviewed source version, participants, and read_set.
+        - Record pass 1 and pass 2 contributions with POST /v1/projects/:ident/reviews/:artifact_id/contributions. Pass 2 must preserve prior contribution IDs or an equivalent deterministic read_set.
+        - Add synthesis with POST /v1/projects/:ident/reviews/:artifact_id/synthesis; set create_version=true when the synthesis should produce a new artifact version.
+        - Query analyst context with GET /v1/projects/:ident/reviews/:artifact_id/contributions filtered by round_id, phase, role, reviewed_version_id, or read_set_contains.
+    - name: Publish and retrieve artifact-backed docs
+      steps:
+        - "Continue using docs-first commands for API context: agent-tools docs validate, publish, search, and chunks."
+        - Gateway stores docs as compatibility api_docs records plus documentation artifacts and immutable artifact_versions with retained API context bodies.
+        - Retrieve chunks with GET /v1/projects/:ident/api-docs/chunks. Use include_history=true when historical immutable chunks are needed; default retrieval is current-version oriented.
+        - "Use artifact routes when the broader graph is needed: links to specs, tasks, patterns, repository refs, comments, versions, and stale/partial chunk status."
+    - name: Export artifact-backed docs to source files
+      steps:
+        - Proposed CLI/API behavior is agent-tools docs export --app APP --accepted --manifest PATH.
+        - Export selects the accepted documentation artifact version by default; if no accepted version exists, the command must require --current or fail with an explicit message.
+        - The export manifest maps artifact_id, artifact_version_id, app, source_ref, source_path, content_hash, generated_at, and overwrite_policy for each materialized file.
+        - "Default conflict policy is propose, not overwrite: write proposed files beside the target or into a review directory when the target exists with a different hash."
+        - Overwriting repository files requires an explicit confirmation flag from the user or calling skill; agents must not silently replace source-adjacent docs.
     - name: Reuse global patterns
       steps:
         - Search active latest patterns before implementing established practice.
@@ -182,6 +215,93 @@ content:
       path: /v1/projects/:ident/api-docs/:id
       intent: Delete one API context document.
     - method: GET
+      path: /v1/projects/:ident/artifacts
+      intent: List durable artifacts by kind, lifecycle state, label, actor, or search query.
+      query:
+        kind: spec, design_review, or documentation.
+        lifecycle_state: draft, active, superseded, or archived.
+        label: Label filter.
+        actor_id: Actor provenance filter.
+        q: Search artifact metadata, version bodies, contributions, and linked IDs.
+    - method: POST
+      path: /v1/projects/:ident/artifacts
+      intent: Create a generic artifact container with actor provenance and an idempotency key.
+      headers:
+        X-Agent-Id: Stable agent identity.
+        Idempotency-Key: Required for mutating artifact routes.
+    - method: GET
+      path: /v1/projects/:ident/artifacts/:artifact_id
+      intent: Fetch artifact detail including current/accepted versions and chunking status.
+    - method: POST
+      path: /v1/projects/:ident/artifacts/:artifact_id/versions
+      intent: Create an immutable artifact version; replay returns the original version.
+    - method: GET
+      path: /v1/projects/:ident/artifacts/:artifact_id/versions
+      intent: List immutable versions for an artifact.
+    - method: GET
+      path: /v1/projects/:ident/artifacts/:artifact_id/versions/:version_id
+      intent: Fetch one immutable artifact version plus version-level chunk status.
+    - method: GET
+      path: /v1/projects/:ident/artifacts/:artifact_id/versions/:version_id/diff
+      intent: Diff a version against its parent or a supplied base_version_id.
+    - method: GET
+      path: /v1/projects/:ident/artifacts/:artifact_id/comments
+      intent: List artifact comments.
+    - method: POST
+      path: /v1/projects/:ident/artifacts/:artifact_id/comments
+      intent: Add a comment to an artifact, version, manifest item, chunk, or comment target.
+    - method: GET
+      path: /v1/projects/:ident/artifacts/:artifact_id/contributions
+      intent: List contribution timeline entries.
+    - method: POST
+      path: /v1/projects/:ident/artifacts/:artifact_id/contributions
+      intent: Add an immutable contribution with phase, role, read_set, body, and actor provenance.
+    - method: GET
+      path: /v1/projects/:ident/artifact-links
+      intent: List artifact graph links visible to the project.
+    - method: POST
+      path: /v1/projects/:ident/artifact-links
+      intent: Create a durable graph edge between artifacts, versions, tasks, docs, patterns, repo refs, or external refs where the current link registry allows it.
+    - method: POST
+      path: /v1/projects/:ident/specs
+      intent: Create or import a spec artifact with manifest, source_doc, file bodies, and stable manifest item IDs.
+    - method: POST
+      path: /v1/projects/:ident/specs/:artifact_id/versions
+      intent: Add an immutable spec iteration/version.
+    - method: POST
+      path: /v1/projects/:ident/specs/:artifact_id/accept
+      intent: Mark a spec version as accepted without collapsing current and accepted version pointers.
+    - method: GET
+      path: /v1/projects/:ident/specs/:artifact_id/manifest
+      intent: Retrieve the stored spec manifest and normalized manifest items.
+    - method: GET
+      path: /v1/projects/:ident/specs/:artifact_id/manifest/:manifest_item_id
+      intent: Retrieve one stable manifest item for agent delegation.
+    - method: POST
+      path: /v1/projects/:ident/specs/:artifact_id/generate-tasks
+      intent: Generate or resume gateway task creation from the accepted spec version. Requires confirmed=true and is idempotent by manifest item.
+    - method: POST
+      path: /v1/projects/:ident/specs/:artifact_id/link-task
+      intent: Link an existing gateway task to a spec manifest item and immutable source version.
+    - method: POST
+      path: /v1/projects/:ident/reviews
+      intent: Create a design review artifact.
+    - method: POST
+      path: /v1/projects/:ident/reviews/:artifact_id/rounds
+      intent: Start a design review round workflow run.
+    - method: POST
+      path: /v1/projects/:ident/reviews/:artifact_id/contributions
+      intent: Record pass 1 or pass 2 review contribution provenance.
+    - method: GET
+      path: /v1/projects/:ident/reviews/:artifact_id/contributions
+      intent: Fetch review contributions by round, phase, role, reviewed version, or read-set membership.
+    - method: POST
+      path: /v1/projects/:ident/reviews/:artifact_id/synthesis
+      intent: Record synthesis and optionally create a new artifact version.
+    - method: PATCH
+      path: /v1/projects/:ident/reviews/:artifact_id/state
+      intent: Update review lifecycle/review state without corrupting current or accepted version pointers.
+    - method: GET
       path: /v1/patterns
       intent: List global markdown patterns with filters q, label, version, state, and superseded_by.
     - method: POST
@@ -271,6 +391,25 @@ content:
       command: "agent-tools docs validate --file .agent/api/agent-gateway.yaml && agent-tools docs publish --file .agent/api/agent-gateway.yaml"
     - name: Search API context
       command: "agent-tools docs search \"delegate task\" --project agent-gateway"
+    - name: Generate implementation tasks from an accepted spec
+      request:
+        method: POST
+        path: /v1/projects/agent-gateway/specs/<artifact_id>/generate-tasks
+        headers:
+          Authorization: "Bearer <GATEWAY_API_KEY>"
+          X-Agent-Id: codex
+          Idempotency-Key: spec-generate-<artifact_version_id>
+        body:
+          confirmed: true
+          manifest_item_ids:
+            - phase-3:T009
+      response:
+        workflow_run_id: "stable resumable workflow id"
+        generated_task_ids:
+          - "gateway task id"
+        replayed: false
+    - name: Export accepted docs without overwriting source files
+      command: "agent-tools docs export --app agent-gateway --accepted --manifest .agent/api/export-manifest.json --policy propose"
   operations:
     - name: Startup without Discord
       guidance: Gateway starts and serves API/UI/Eventic routes when Discord credentials are absent. Channel send/receive is unavailable for projects using missing channel plugins.
@@ -278,6 +417,10 @@ content:
       guidance: Main source manifests use source-build versioning; release version is anchored by git tags such as v1.6.0.
     - name: Database
       guidance: SQLite schema is applied at startup through idempotent migrations in db::apply_schema.
+    - name: Artifact rollback flags
+      guidance: Operators can disable generic artifact endpoints or body-schema-dependent behavior while legacy tasks and API-doc routes continue serving migration-compatible reads.
+    - name: Artifact docs export
+      guidance: Treat docs export as a proposed source materialization until an explicit overwrite confirmation is present. Export manifests should identify artifact_id and immutable artifact_version_id so regenerated files are auditable.
   schemas:
     message_envelope:
       required:
@@ -297,6 +440,44 @@ content:
         title: Human readable title.
         content: Structured agent-native context JSON.
         labels: Array or comma-separated string.
+    artifact_mutation_envelope:
+      headers:
+        Authorization: Bearer token required for /v1 API routes.
+        X-Agent-Id: Stable actor identity for provenance.
+        X-Agent-System: Optional agent runtime label such as codex, claude, or gemini.
+        X-Agent-Project: Required in hardened artifact authorization mode; must match the route project ident.
+        X-Agent-Scopes: Required in hardened artifact authorization mode; comma or whitespace separated scopes, with exact scopes, prefix wildcards such as artifact.*, or *.
+        X-Artifact-Quota-Override: Optional true/false request for soft-warning override; requires project.administer in hardened mode and never bypasses hard limits.
+        Idempotency-Key: Required for mutating artifact workflow endpoints.
+        X-Workflow-Run-Id: Optional existing workflow_run for resumable fan-out work.
+      response:
+        data: Generated or replayed resource.
+        provenance: Actor, workflow_run_id, idempotency_key, request_id, authorization boundary, required scopes, generated resource ids, replay flag, and quota warnings.
+      authorization:
+        trusted_mode: Default migration mode; bearer auth is the enforcement boundary and responses report boundary trusted-single-tenant.
+        hardened_mode: Set GATEWAY_ARTIFACT_AUTH_ENFORCED=true; every artifact read/write checks X-Agent-Project plus X-Agent-Scopes and responses report boundary project-scoped.
+        forbidden_shape: HTTP 403 with error artifact_authorization_forbidden and missing project/scope detail.
+    spec_manifest_item:
+      key_fields:
+        - manifest_item_id
+        - phase
+        - task_code
+        - team
+        - title
+        - dependencies
+        - acceptance_criteria
+        - validation_plan
+        - gateway_task_id
+        - spec_file
+    docs_export_manifest:
+      fields:
+        artifact_id: Documentation artifact id.
+        artifact_version_id: Accepted immutable documentation version exported.
+        app: API-doc app key.
+        source_ref: Original docs source reference.
+        source_path: Repository path proposed for materialization.
+        content_hash: Hash of exported content.
+        overwrite_policy: propose by default; overwrite only with explicit confirmation.
     task:
       key_fields:
         - id

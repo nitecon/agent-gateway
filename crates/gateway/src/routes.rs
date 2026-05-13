@@ -7,6 +7,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::task::spawn_blocking;
 use tracing::error;
 
@@ -19,6 +20,7 @@ use crate::{
 
 // ── Error helper ─────────────────────────────────────────────────────────────
 
+#[derive(Debug)]
 pub(crate) struct AppError(pub StatusCode, pub String);
 
 impl IntoResponse for AppError {
@@ -38,6 +40,48 @@ impl<E: Into<anyhow::Error>> From<E> for AppError {
 type Result<T> = std::result::Result<T, AppError>;
 
 const EVENTIC_SERVERS_SETTING: &str = "eventic.servers";
+
+// ── Artifact operations envelope accessor (T016 plumbing) ───────────────────
+//
+// T016 owns the typed runtime surface for the T004 operations envelope. The
+// envelope is parsed from `std::env` exactly once per process via a
+// `OnceLock`; route handlers MUST call `operations_envelope()` instead of
+// reading env vars or hardcoding T004 constants. T007 will migrate this
+// accessor's caller-shape into `AppState` once the envelope acquires
+// per-project overrides; until then, a process-wide cache is the right
+// scope (the env values are immutable across a single binary lifetime).
+//
+// Failures during load short-circuit to production defaults AND log a
+// warning. We deliberately do NOT panic on misconfigured env values at
+// load time here — that decision belongs to a future startup gate in
+// `main.rs` (out of touch surface for T016). T007 SHOULD wire
+// `ArtifactOperationsEnvelope::from_env()?` into the explicit startup
+// path so SRE catches misconfiguration before traffic lands.
+
+static ARTIFACT_OPERATIONS_ENVELOPE: std::sync::OnceLock<db::ArtifactOperationsEnvelope> =
+    std::sync::OnceLock::new();
+
+/// Returns the process-wide artifact operations envelope. First call loads
+/// from environment variables; subsequent calls return the cached value.
+/// On parse failure the call logs a warning and returns
+/// `ArtifactOperationsEnvelope::production_defaults()` so the gateway
+/// continues to serve with documented T004 defaults. Startup code (future
+/// T007 work) SHOULD call `db::ArtifactOperationsEnvelope::from_env()`
+/// directly to surface configuration errors explicitly.
+#[allow(dead_code)]
+pub(crate) fn operations_envelope() -> &'static db::ArtifactOperationsEnvelope {
+    ARTIFACT_OPERATIONS_ENVELOPE.get_or_init(|| {
+        match db::ArtifactOperationsEnvelope::from_env() {
+            Ok(envelope) => envelope,
+            Err(err) => {
+                tracing::warn!(
+                    "artifact operations envelope failed to load from env, falling back to T004 defaults: {err}"
+                );
+                db::ArtifactOperationsEnvelope::production_defaults()
+            }
+        }
+    })
+}
 
 /// Extract agent identity from X-Agent-Id header, defaulting to "_default".
 fn extract_agent_id(headers: &HeaderMap) -> String {
@@ -98,6 +142,3666 @@ fn build_outbound(
         body,
         event_at,
     }
+}
+
+// -- Generic artifacts (/v1/projects/:ident/artifacts) -----------------------
+
+#[derive(Debug, Clone)]
+struct ArtifactActorHeaders {
+    actor_type: String,
+    agent_system: Option<String>,
+    agent_id: String,
+    host: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ArtifactMutationContext {
+    actor: ArtifactActorHeaders,
+    idempotency_key: String,
+    workflow_run_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ArtifactActorResponse {
+    actor_id: String,
+    actor_type: String,
+    agent_system: Option<String>,
+    agent_id: Option<String>,
+    host: Option<String>,
+    display_name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ArtifactAuthorization {
+    boundary: &'static str,
+    required_scopes: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone)]
+struct ArtifactAuthorizationDecision {
+    boundary: &'static str,
+    required_scopes: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct ArtifactProvenance {
+    actor: ArtifactActorResponse,
+    workflow_run_id: Option<String>,
+    idempotency_key: String,
+    request_id: String,
+    created_at: i64,
+    authorization: ArtifactAuthorization,
+    generated_resources: Value,
+    replay: bool,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ArtifactMutationResponse<T: Serialize> {
+    data: T,
+    provenance: ArtifactProvenance,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ArtifactReadResponse<T: Serialize> {
+    data: T,
+    chunking_status: ChunkingStatus,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ArtifactDetailResponse {
+    artifact: db::ArtifactSummary,
+    current_version: Option<VersionReadModel>,
+    accepted_version: Option<VersionReadModel>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VersionReadModel {
+    #[serde(flatten)]
+    version: db::ArtifactVersion,
+    chunking_status: ChunkingStatus,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct ChunkingStatus {
+    status: &'static str,
+    current_chunk_count: usize,
+    stale_chunk_count: usize,
+    superseded_chunk_count: usize,
+    failed_addresses: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ArtifactDiffResponse {
+    from_version_id: Option<String>,
+    to_version_id: String,
+    format: &'static str,
+    byte_delta: isize,
+    diff: String,
+    chunking_status: ChunkingStatus,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListArtifactsQuery {
+    kind: Option<String>,
+    subkind: Option<String>,
+    lifecycle_state: Option<String>,
+    label: Option<String>,
+    actor_id: Option<String>,
+    q: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateArtifactRequest {
+    kind: String,
+    subkind: Option<String>,
+    title: String,
+    labels: Option<Vec<String>>,
+    actor_display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateArtifactVersionRequest {
+    version_label: Option<String>,
+    parent_version_id: Option<String>,
+    body_format: Option<String>,
+    body: Option<String>,
+    structured_payload: Option<Value>,
+    source_format: Option<String>,
+    version_state: Option<String>,
+    actor_display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DiffQuery {
+    base_version_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateContributionRequest {
+    target_kind: String,
+    target_id: String,
+    contribution_kind: String,
+    phase: Option<String>,
+    role: String,
+    read_set: Option<Value>,
+    body_format: Option<String>,
+    body: String,
+    actor_display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateCommentRequest {
+    target_kind: String,
+    target_id: String,
+    child_address: Option<String>,
+    parent_comment_id: Option<String>,
+    body: String,
+    actor_display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResolveCommentRequest {
+    resolution_note: Option<String>,
+    actor_display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReopenCommentRequest {
+    note_body: Option<String>,
+    actor_display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListLinksQuery {
+    link_type: Option<String>,
+    source_kind: Option<String>,
+    source_id: Option<String>,
+    target_kind: Option<String>,
+    target_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateLinkRequest {
+    link_type: String,
+    source_kind: String,
+    source_id: String,
+    source_version_id: Option<String>,
+    source_child_address: Option<String>,
+    target_kind: String,
+    target_id: String,
+    target_version_id: Option<String>,
+    target_child_address: Option<String>,
+    supersedes_link_id: Option<String>,
+    actor_display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StartWorkflowRunRequest {
+    workflow_kind: String,
+    phase: Option<String>,
+    round_id: Option<String>,
+    participant_actor_ids: Option<Vec<String>>,
+    source_artifact_version_id: Option<String>,
+    read_set: Option<Value>,
+    is_resumable: Option<bool>,
+    actor_display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CompleteWorkflowRunRequest {
+    state: String,
+    failure_reason: Option<String>,
+    generated_contribution_ids: Option<Vec<String>>,
+    generated_version_ids: Option<Vec<String>>,
+    generated_task_ids: Option<Vec<String>>,
+    generated_link_ids: Option<Vec<String>>,
+    generated_chunk_ids: Option<Vec<String>>,
+    actor_display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SpecImportRequest {
+    title: String,
+    labels: Option<Vec<String>>,
+    body: Option<String>,
+    manifest: Value,
+    file_bodies: Option<std::collections::HashMap<String, String>>,
+    source_doc: Option<String>,
+    source_artifact_id: Option<String>,
+    source_artifact_version_id: Option<String>,
+    actor_display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SpecVersionRequest {
+    version_label: Option<String>,
+    parent_version_id: Option<String>,
+    body: Option<String>,
+    manifest: Value,
+    file_bodies: Option<std::collections::HashMap<String, String>>,
+    source_doc: Option<String>,
+    actor_display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SpecAcceptRequest {
+    version_id: String,
+    actor_display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SpecManifestQuery {
+    version_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GenerateSpecTasksRequest {
+    confirmed: bool,
+    manifest_item_ids: Option<Vec<String>>,
+    reporter: Option<String>,
+    hostname: Option<String>,
+    actor_display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LinkSpecTaskRequest {
+    version_id: Option<String>,
+    manifest_item_id: String,
+    task_id: String,
+    actor_display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DesignReviewCreateRequest {
+    title: String,
+    labels: Option<Vec<String>>,
+    body: Option<String>,
+    body_format: Option<String>,
+    source_artifact_id: Option<String>,
+    source_artifact_version_id: Option<String>,
+    actor_display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DesignReviewRoundRequest {
+    round_id: Option<String>,
+    participant_actor_ids: Option<Vec<String>>,
+    source_artifact_version_id: String,
+    read_set: Option<Value>,
+    actor_display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DesignReviewContributionRequest {
+    phase: String,
+    role: Option<String>,
+    reviewed_version_id: Option<String>,
+    read_set: Option<Value>,
+    body_format: Option<String>,
+    body: String,
+    actor_display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DesignReviewSynthesisRequest {
+    reviewed_version_id: Option<String>,
+    read_set: Value,
+    body_format: Option<String>,
+    body: String,
+    create_version: Option<bool>,
+    version_label: Option<String>,
+    actor_display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DesignReviewStateRequest {
+    lifecycle_state: Option<String>,
+    review_state: Option<String>,
+    note: Option<String>,
+    actor_display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListDesignReviewContributionsQuery {
+    round_id: Option<String>,
+    phase: Option<String>,
+    role: Option<String>,
+    reviewed_version_id: Option<String>,
+    read_set_contains: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ArtifactWorkspaceQuery {
+    kind: Option<String>,
+    status: Option<String>,
+    label: Option<String>,
+    actor: Option<String>,
+    q: Option<String>,
+    chunk_q: Option<String>,
+    include_history: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SpecManifestItem {
+    manifest_item_id: String,
+    phase: Option<String>,
+    task_code: Option<String>,
+    team: Option<String>,
+    title: String,
+    status: Option<String>,
+    dependencies: Vec<String>,
+    labels: Vec<String>,
+    touch_surface: Vec<String>,
+    acceptance_criteria: Vec<String>,
+    validation_plan: Vec<String>,
+    gateway_task_id: Option<String>,
+    spec_file: Option<String>,
+    spec_body: Option<String>,
+    metadata: Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SpecManifestResponse {
+    artifact_id: String,
+    artifact_version_id: String,
+    manifest: Value,
+    items: Vec<SpecManifestItem>,
+    stability_policy: Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GenerateSpecTasksResponse {
+    artifact_id: String,
+    artifact_version_id: String,
+    workflow_run_id: String,
+    generated_task_ids: Vec<String>,
+    generated_link_ids: Vec<String>,
+    items: Vec<Value>,
+    replayed: bool,
+}
+
+fn require_artifact_api_enabled(state: &AppState) -> Result<()> {
+    if state.artifact_api_enabled {
+        Ok(())
+    } else {
+        Err(AppError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "artifact_api_disabled".to_string(),
+        ))
+    }
+}
+
+fn parse_scope_header(headers: &HeaderMap) -> std::collections::BTreeSet<String> {
+    headers
+        .get("x-agent-scopes")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn scope_grants(held: &std::collections::BTreeSet<String>, required: &str) -> bool {
+    held.contains("*")
+        || held.contains(required)
+        || required
+            .split_once('.')
+            .is_some_and(|(prefix, _)| held.contains(&format!("{prefix}.*")))
+}
+
+fn require_artifact_authorization(
+    state: &AppState,
+    headers: &HeaderMap,
+    project_ident: &str,
+    required_scopes: Vec<&'static str>,
+) -> Result<ArtifactAuthorizationDecision> {
+    if !state.artifact_auth_enforced {
+        return Ok(ArtifactAuthorizationDecision {
+            boundary: "trusted-single-tenant",
+            required_scopes,
+        });
+    }
+
+    let authorized_project = headers
+        .get("x-agent-project")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    if authorized_project != Some(project_ident) {
+        return Err(AppError(
+            StatusCode::FORBIDDEN,
+            "artifact_authorization_forbidden: missing or mismatched x-agent-project".to_string(),
+        ));
+    }
+
+    let held_scopes = parse_scope_header(headers);
+    let missing_scopes: Vec<&'static str> = required_scopes
+        .iter()
+        .copied()
+        .filter(|scope| !scope_grants(&held_scopes, scope))
+        .collect();
+    if !missing_scopes.is_empty() {
+        return Err(AppError(
+            StatusCode::FORBIDDEN,
+            format!(
+                "artifact_authorization_forbidden: missing scopes {}",
+                missing_scopes.join(",")
+            ),
+        ));
+    }
+
+    Ok(ArtifactAuthorizationDecision {
+        boundary: "project-scoped",
+        required_scopes,
+    })
+}
+
+fn require_artifact_read(
+    state: &AppState,
+    headers: &HeaderMap,
+    project_ident: &str,
+) -> Result<ArtifactAuthorizationDecision> {
+    require_artifact_api_enabled(state)?;
+    require_artifact_authorization(state, headers, project_ident, vec!["artifact.read"])
+}
+
+fn require_quota_override_authorization(
+    state: &AppState,
+    headers: &HeaderMap,
+    project_ident: &str,
+) -> Result<()> {
+    let requested = headers
+        .get("x-artifact-quota-override")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+    if requested {
+        require_artifact_authorization(state, headers, project_ident, vec!["project.administer"])?;
+    }
+    Ok(())
+}
+
+fn artifact_body_schema_allowed(
+    state: &AppState,
+    body_format: &str,
+    payload: Option<&Value>,
+) -> Result<()> {
+    if state.artifact_body_schema_enabled || (body_format == "markdown" && payload.is_none()) {
+        Ok(())
+    } else {
+        Err(AppError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "artifact_body_schema_disabled".to_string(),
+        ))
+    }
+}
+
+fn parse_artifact_actor_headers(
+    headers: &HeaderMap,
+    mutation: bool,
+) -> Result<ArtifactActorHeaders> {
+    let agent_id = headers
+        .get("x-agent-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    if mutation && agent_id.as_deref().unwrap_or("_default") == "_default" {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "x_agent_id_required".to_string(),
+        ));
+    }
+
+    let actor_type = headers
+        .get("x-actor-type")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("agent")
+        .to_ascii_lowercase();
+    if !matches!(actor_type.as_str(), "user" | "agent" | "system") {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "invalid_x_actor_type".to_string(),
+        ));
+    }
+
+    let agent_system = headers
+        .get("x-agent-system")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_ascii_lowercase());
+    if actor_type == "agent" {
+        match agent_system.as_deref() {
+            Some("claude" | "codex" | "gemini" | "other") => {}
+            Some(_) => {
+                return Err(AppError(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_x_agent_system".to_string(),
+                ));
+            }
+            None if mutation => {
+                return Err(AppError(
+                    StatusCode::BAD_REQUEST,
+                    "x_agent_system_required".to_string(),
+                ));
+            }
+            None => {}
+        }
+    }
+
+    Ok(ArtifactActorHeaders {
+        actor_type,
+        agent_system,
+        agent_id: agent_id.unwrap_or_else(|| "_default".to_string()),
+        host: headers
+            .get("x-host")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string),
+    })
+}
+
+fn parse_mutation_context(headers: &HeaderMap) -> Result<ArtifactMutationContext> {
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            AppError(
+                StatusCode::BAD_REQUEST,
+                "idempotency_key_required".to_string(),
+            )
+        })?
+        .to_string();
+    if key.len() > 255 {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "idempotency_key_too_long".to_string(),
+        ));
+    }
+
+    Ok(ArtifactMutationContext {
+        actor: parse_artifact_actor_headers(headers, true)?,
+        idempotency_key: key,
+        workflow_run_id: headers
+            .get("x-workflow-run-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string),
+    })
+}
+
+fn trim_required(value: &str, field: &'static str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(AppError(
+            StatusCode::BAD_REQUEST,
+            format!("{field}_required"),
+        ))
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn validate_artifact_kind(kind: &str) -> Result<()> {
+    if matches!(kind, "design_review" | "spec" | "documentation") {
+        Ok(())
+    } else {
+        Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "invalid_artifact_kind".to_string(),
+        ))
+    }
+}
+
+fn validate_body_format(format: &str) -> Result<()> {
+    if matches!(
+        format,
+        "markdown" | "application/agent-context+json" | "openapi" | "swagger"
+    ) {
+        Ok(())
+    } else {
+        Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "invalid_body_format".to_string(),
+        ))
+    }
+}
+
+fn validate_read_set_required(
+    phase: Option<&str>,
+    kind: &str,
+    read_set: Option<&Value>,
+) -> Result<()> {
+    if read_set.is_none() && (matches!(phase, Some("pass_2" | "synthesis")) || kind == "synthesis")
+    {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "read_set_required".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_artifact_actor(
+    conn: &rusqlite::Connection,
+    headers: &ArtifactActorHeaders,
+    display_name: Option<&str>,
+) -> anyhow::Result<db::ArtifactActor> {
+    let display = display_name
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or(&headers.agent_id);
+    db::resolve_artifact_actor(
+        conn,
+        &db::ArtifactActorIdentity {
+            actor_type: &headers.actor_type,
+            agent_system: headers.agent_system.as_deref(),
+            agent_system_label: None,
+            agent_id: Some(&headers.agent_id),
+            host: headers.host.as_deref(),
+            display_name: display,
+            runtime_metadata: None,
+        },
+    )
+}
+
+fn map_db_error(err: anyhow::Error) -> AppError {
+    if let Some(ops) = err.downcast_ref::<db::OperationsError>() {
+        return match ops {
+            db::OperationsError::SizeLimit { kind, .. } => {
+                let token = kind.token();
+                let code = match *kind {
+                    db::SizeLimitKind::ArtifactLabelsCount
+                    | db::SizeLimitKind::ArtifactLabelBytes
+                    | db::SizeLimitKind::ReadSetRefs => token.to_string(),
+                    _ => format!("{token}_too_large"),
+                };
+                let status = match *kind {
+                    db::SizeLimitKind::ArtifactLabelsCount
+                    | db::SizeLimitKind::ArtifactLabelBytes
+                    | db::SizeLimitKind::ReadSetRefs => StatusCode::BAD_REQUEST,
+                    _ => StatusCode::PAYLOAD_TOO_LARGE,
+                };
+                AppError(status, code)
+            }
+            db::OperationsError::QuotaHardReject { counter, .. } => AppError(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("quota_{}_exceeded", counter.token()),
+            ),
+            db::OperationsError::InvalidEnvValue { .. }
+            | db::OperationsError::InvalidQuotaThresholds { .. } => {
+                AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}"))
+            }
+        };
+    }
+
+    let text = format!("{err:#}");
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("not found") {
+        AppError(StatusCode::NOT_FOUND, text)
+    } else if lower.contains("required")
+        || lower.contains("invalid")
+        || lower.contains("missing")
+        || lower.contains("does not belong")
+        || lower.contains("cannot")
+        || lower.contains("unsupported")
+        || lower.contains("not retryable")
+        || lower.contains("check constraint failed")
+    {
+        AppError(StatusCode::BAD_REQUEST, text)
+    } else {
+        AppError(StatusCode::INTERNAL_SERVER_ERROR, text)
+    }
+}
+
+fn generated_resource(key: &str, value: impl Into<Value>) -> Value {
+    serde_json::json!({ key: value.into() })
+}
+
+fn generated_workflow_resources(run: &db::WorkflowRun) -> Value {
+    serde_json::json!({
+        "workflow_run_id": run.workflow_run_id,
+        "state": run.state,
+        "generated_contribution_ids": run.generated_contribution_ids,
+        "generated_version_ids": run.generated_version_ids,
+        "generated_task_ids": run.generated_task_ids,
+        "generated_link_ids": run.generated_link_ids,
+        "generated_chunk_ids": run.generated_chunk_ids,
+    })
+}
+
+fn build_artifact_provenance(
+    actor: db::ArtifactActor,
+    context: &ArtifactMutationContext,
+    authorization: ArtifactAuthorizationDecision,
+    generated_resources: Value,
+    warnings: Vec<db::QuotaWarning>,
+    replay: bool,
+) -> ArtifactProvenance {
+    ArtifactProvenance {
+        actor: ArtifactActorResponse {
+            actor_id: actor.actor_id,
+            actor_type: actor.actor_type,
+            agent_system: actor.agent_system,
+            agent_id: actor.agent_id,
+            host: actor.host,
+            display_name: actor.display_name,
+        },
+        workflow_run_id: context.workflow_run_id.clone(),
+        idempotency_key: context.idempotency_key.clone(),
+        request_id: uuid::Uuid::now_v7().to_string(),
+        created_at: db::now_ms(),
+        authorization: ArtifactAuthorization {
+            boundary: authorization.boundary,
+            required_scopes: authorization.required_scopes,
+        },
+        generated_resources,
+        replay,
+        warnings: warnings.into_iter().map(|w| w.token()).collect(),
+    }
+}
+
+fn mutation_response<T: Serialize>(
+    status: StatusCode,
+    data: T,
+    provenance: ArtifactProvenance,
+) -> Response {
+    (status, Json(ArtifactMutationResponse { data, provenance })).into_response()
+}
+
+fn status_for_replay(replayed: bool) -> StatusCode {
+    if replayed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    }
+}
+
+/// Canonical metric `result` label for create-style artifact mutations.
+/// Replayed inserts (idempotency-key hits) report `"replayed"`; first-time
+/// inserts report `"created"`. Centralized so every handler reports the same
+/// label values to the operations pipeline.
+fn result_label(replayed: bool) -> &'static str {
+    if replayed {
+        "replayed"
+    } else {
+        "created"
+    }
+}
+
+fn emit_artifact_metric(name: &str, labels: &[(&str, &str)]) {
+    tracing::info!(target: "gateway_metrics", metric = name, labels = ?labels, "artifact metric");
+}
+
+/// Common entry validation for every artifact mutation route handler:
+/// feature-gate the artifact API and parse the mandatory mutation envelope
+/// (actor headers + idempotency-key, plus optional workflow-run id).
+/// Returns the parsed [`ArtifactMutationContext`] on success.
+///
+/// Endpoint-specific request validation (`trim_required`, body-format checks,
+/// read-set requirements, etc.) intentionally stays in the handler so this
+/// helper remains a stable mutation envelope rather than a generic abstraction.
+fn begin_artifact_mutation(
+    state: &AppState,
+    headers: &HeaderMap,
+    project_ident: &str,
+    scopes: Vec<&'static str>,
+) -> Result<(ArtifactMutationContext, ArtifactAuthorizationDecision)> {
+    require_artifact_api_enabled(state)?;
+    let authorization = require_artifact_authorization(state, headers, project_ident, scopes)?;
+    require_quota_override_authorization(state, headers, project_ident)?;
+    Ok((parse_mutation_context(headers)?, authorization))
+}
+
+/// Build the standard mutation response envelope: status (replay-aware),
+/// provenance (actor + idempotency-key + generated_resources + warnings +
+/// authorization scopes), and JSON payload. Every artifact mutation handler
+/// funnels its happy-path response through this helper so provenance fields,
+/// replay status semantics, and the response shape stay consistent.
+fn finalize_mutation<T: Serialize>(
+    actor: db::ArtifactActor,
+    context: &ArtifactMutationContext,
+    authorization: ArtifactAuthorizationDecision,
+    generated_resources: Value,
+    warnings: Vec<db::QuotaWarning>,
+    replayed: bool,
+    data: T,
+) -> Response {
+    let provenance = build_artifact_provenance(
+        actor,
+        context,
+        authorization,
+        generated_resources,
+        warnings,
+        replayed,
+    );
+    mutation_response(status_for_replay(replayed), data, provenance)
+}
+
+/// Build the response envelope for mutations whose status is always `200 OK`
+/// and which do not surface idempotent replay (e.g. comment resolve/reopen,
+/// workflow-run complete). Keeps the provenance construction signature uniform
+/// with [`finalize_mutation`] for handlers that branch on replay state.
+fn finalize_ok_mutation<T: Serialize>(
+    actor: db::ArtifactActor,
+    context: &ArtifactMutationContext,
+    authorization: ArtifactAuthorizationDecision,
+    generated_resources: Value,
+    warnings: Vec<db::QuotaWarning>,
+    data: T,
+) -> Response {
+    let provenance = build_artifact_provenance(
+        actor,
+        context,
+        authorization,
+        generated_resources,
+        warnings,
+        false,
+    );
+    mutation_response(StatusCode::OK, data, provenance)
+}
+
+fn chunking_status_for(
+    artifact: &db::ArtifactSummary,
+    chunks: &[db::ArtifactChunk],
+) -> ChunkingStatus {
+    let freshness_version = artifact
+        .accepted_version_id
+        .as_deref()
+        .or(artifact.current_version_id.as_deref());
+    let mut current = 0usize;
+    let mut stale = 0usize;
+    let mut superseded = 0usize;
+    let mut failed_addresses = Vec::new();
+    for chunk in chunks {
+        if chunk.superseded_by_chunk_id.is_some() {
+            superseded += 1;
+        } else if Some(chunk.artifact_version_id.as_str()) == freshness_version {
+            current += 1;
+        } else {
+            stale += 1;
+        }
+        if let Some(Value::Object(metadata)) = &chunk.metadata {
+            let failed = metadata
+                .get("status")
+                .or_else(|| metadata.get("chunking_status"))
+                .and_then(Value::as_str)
+                == Some("failed");
+            if failed {
+                failed_addresses.push(chunk.child_address.clone());
+            }
+        }
+    }
+    let status = if !failed_addresses.is_empty() {
+        "partial"
+    } else if stale > 0 {
+        "stale"
+    } else if current > 0 {
+        "current"
+    } else {
+        "none"
+    };
+    ChunkingStatus {
+        status,
+        current_chunk_count: current,
+        stale_chunk_count: stale,
+        superseded_chunk_count: superseded,
+        failed_addresses,
+    }
+}
+
+fn version_status(
+    artifact: &db::ArtifactSummary,
+    version: db::ArtifactVersion,
+    chunks: &[db::ArtifactChunk],
+) -> VersionReadModel {
+    let selected: Vec<_> = chunks
+        .iter()
+        .filter(|chunk| chunk.artifact_version_id == version.artifact_version_id)
+        .cloned()
+        .collect();
+    VersionReadModel {
+        version,
+        chunking_status: chunking_status_for(artifact, &selected),
+    }
+}
+
+/// Shared retryability gate for any artifact mutation that references an existing
+/// `workflow_run`. Cancelled runs and non-resumable failed runs cannot be reused;
+/// every other state (running, succeeded, resumable-failed) is allowed to proceed
+/// — replay/idempotency-key handling at the DB layer still owns terminal-state
+/// dedup semantics. Centralizing this here keeps artifact-scoped and project-
+/// scoped (link) handlers from drifting on these error messages, which
+/// `map_db_error` matches against to produce `BAD_REQUEST`.
+fn ensure_workflow_run_retryable(run: &db::WorkflowRun) -> anyhow::Result<()> {
+    match run.state.as_str() {
+        "cancelled" => anyhow::bail!("cancelled workflow_run is not retryable"),
+        "failed" if !run.is_resumable => {
+            anyhow::bail!("non-resumable failed workflow_run is not retryable")
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Load and validate a workflow run that must belong to a specific artifact.
+/// Returns `Ok(None)` when no run id is supplied, `Ok(Some(run))` for a
+/// retryable run, and `Err` for not-found, cross-artifact, or non-retryable
+/// state.
+fn validate_workflow_run_for_mutation(
+    conn: &rusqlite::Connection,
+    artifact_id: &str,
+    workflow_run_id: Option<&str>,
+) -> anyhow::Result<Option<db::WorkflowRun>> {
+    let Some(run_id) = workflow_run_id else {
+        return Ok(None);
+    };
+    let run = db::get_workflow_run(conn, run_id)?
+        .ok_or_else(|| anyhow::anyhow!("workflow_run not found"))?;
+    if run.artifact_id != artifact_id {
+        anyhow::bail!("workflow_run does not belong to artifact");
+    }
+    ensure_workflow_run_retryable(&run)?;
+    Ok(Some(run))
+}
+
+/// Project-scoped workflow run lookup for link creation. Unlike
+/// [`validate_workflow_run_for_mutation`], this does not bind the run to a
+/// specific artifact — links are project-scoped and may reference resources
+/// across artifacts — but it still applies the canonical retryability gate so
+/// link creation cannot resurrect cancelled or non-resumable-failed runs.
+fn load_workflow_run_for_link(
+    conn: &rusqlite::Connection,
+    workflow_run_id: Option<&str>,
+) -> anyhow::Result<Option<db::WorkflowRun>> {
+    let Some(run_id) = workflow_run_id else {
+        return Ok(None);
+    };
+    let run = db::get_workflow_run(conn, run_id)?
+        .ok_or_else(|| anyhow::anyhow!("workflow_run not found"))?;
+    ensure_workflow_run_retryable(&run)?;
+    Ok(Some(run))
+}
+
+fn complete_resumed_run(
+    conn: &rusqlite::Connection,
+    run: Option<&db::WorkflowRun>,
+    contribution_id: Option<String>,
+    version_id: Option<String>,
+    link_id: Option<String>,
+) -> anyhow::Result<()> {
+    let Some(run) = run else {
+        return Ok(());
+    };
+    if !(run.state == "failed" && run.is_resumable) {
+        return Ok(());
+    }
+
+    let mut contribution_ids = run.generated_contribution_ids.clone();
+    let mut version_ids = run.generated_version_ids.clone();
+    let mut link_ids = run.generated_link_ids.clone();
+    if let Some(id) = contribution_id {
+        if !contribution_ids.contains(&id) {
+            contribution_ids.push(id);
+        }
+    }
+    if let Some(id) = version_id {
+        if !version_ids.contains(&id) {
+            version_ids.push(id);
+        }
+    }
+    if let Some(id) = link_id {
+        if !link_ids.contains(&id) {
+            link_ids.push(id);
+        }
+    }
+    db::update_workflow_run(
+        conn,
+        &run.workflow_run_id,
+        &db::WorkflowRunUpdate {
+            state: Some("succeeded"),
+            failure_reason: Some(None),
+            generated_contribution_ids: Some(&contribution_ids),
+            generated_version_ids: Some(&version_ids),
+            generated_task_ids: Some(&run.generated_task_ids),
+            generated_link_ids: Some(&link_ids),
+            generated_chunk_ids: Some(&run.generated_chunk_ids),
+            ended_at: None,
+        },
+    )?;
+    Ok(())
+}
+
+fn spec_item_stability_policy() -> Value {
+    serde_json::json!({
+        "stable_id_field": "manifest_item_id",
+        "fallback_heuristic": "phase_id plus task id/code from source-adjacent manifests",
+        "unchanged": "preserve manifest_item_id",
+        "renamed": "preserve manifest_item_id when the task id/code is unchanged",
+        "split": "keep the original manifest_item_id for the continuing item and issue new ids for split-out work",
+        "merged": "issue a new manifest_item_id unless the manifest explicitly declares the surviving id",
+        "deleted": "do not delete existing gateway task or artifact links; future generations simply omit the item",
+        "collision": "explicit duplicate manifest_item_id values are rejected"
+    })
+}
+
+fn string_array_field(value: &Value, keys: &[&str]) -> Vec<String> {
+    for key in keys {
+        if let Some(values) = value.get(*key).and_then(Value::as_array) {
+            return values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+        if let Some(value) = value.get(*key).and_then(Value::as_str) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return vec![trimmed.to_string()];
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn optional_string_field_value(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn manifest_item_id(phase_id: Option<&str>, item: &Value) -> Option<String> {
+    optional_string_field_value(item, &["manifest_item_id", "stable_id"]).or_else(|| {
+        optional_string_field_value(item, &["id", "task_code", "code"])
+            .map(|id| phase_id.map(|phase| format!("{phase}:{id}")).unwrap_or(id))
+    })
+}
+
+fn normalize_spec_manifest(
+    manifest: &Value,
+    file_bodies: Option<&std::collections::HashMap<String, String>>,
+) -> Result<Vec<SpecManifestItem>> {
+    let mut items = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+
+    if let Some(raw_items) = manifest.get("items").and_then(Value::as_array) {
+        for item in raw_items {
+            let manifest_item_id = manifest_item_id(None, item).ok_or_else(|| {
+                AppError(
+                    StatusCode::BAD_REQUEST,
+                    "manifest_item_id_required".to_string(),
+                )
+            })?;
+            if !seen.insert(manifest_item_id.clone()) {
+                return Err(AppError(
+                    StatusCode::BAD_REQUEST,
+                    "duplicate_manifest_item_id".to_string(),
+                ));
+            }
+            let title = optional_string_field_value(item, &["title"])
+                .ok_or_else(|| AppError(StatusCode::BAD_REQUEST, "task_title_required".into()))?;
+            let spec_file = optional_string_field_value(item, &["spec_file", "file_path"]);
+            let spec_body =
+                optional_string_field_value(item, &["spec_body", "body"]).or_else(|| {
+                    spec_file
+                        .as_deref()
+                        .and_then(|path| file_bodies.and_then(|bodies| bodies.get(path)).cloned())
+                });
+            items.push(SpecManifestItem {
+                manifest_item_id,
+                phase: optional_string_field_value(item, &["phase", "phase_id"]),
+                task_code: optional_string_field_value(item, &["task_code", "id", "code"]),
+                team: optional_string_field_value(item, &["team"]),
+                title,
+                status: optional_string_field_value(item, &["status"]),
+                dependencies: string_array_field(item, &["dependencies", "depends_on"]),
+                labels: string_array_field(item, &["labels"]),
+                touch_surface: string_array_field(item, &["touch_surface"]),
+                acceptance_criteria: string_array_field(item, &["acceptance_criteria"]),
+                validation_plan: string_array_field(item, &["validation_plan"]),
+                gateway_task_id: optional_string_field_value(item, &["gateway_task_id"]),
+                spec_file,
+                spec_body,
+                metadata: item.clone(),
+            });
+        }
+    } else if let Some(phases) = manifest.get("phases").and_then(Value::as_array) {
+        for phase in phases {
+            let phase_id = optional_string_field_value(phase, &["id"]);
+            let phase_name = optional_string_field_value(phase, &["name"]).or(phase_id.clone());
+            let Some(tasks) = phase.get("tasks").and_then(Value::as_array) else {
+                continue;
+            };
+            for task in tasks {
+                let manifest_item_id =
+                    manifest_item_id(phase_id.as_deref(), task).ok_or_else(|| {
+                        AppError(
+                            StatusCode::BAD_REQUEST,
+                            "manifest_item_id_required".to_string(),
+                        )
+                    })?;
+                if !seen.insert(manifest_item_id.clone()) {
+                    return Err(AppError(
+                        StatusCode::BAD_REQUEST,
+                        "duplicate_manifest_item_id".to_string(),
+                    ));
+                }
+                let title = optional_string_field_value(task, &["title"]).ok_or_else(|| {
+                    AppError(StatusCode::BAD_REQUEST, "task_title_required".into())
+                })?;
+                let spec_file = optional_string_field_value(task, &["spec_file", "file_path"]);
+                let spec_body =
+                    optional_string_field_value(task, &["spec_body", "body"]).or_else(|| {
+                        spec_file.as_deref().and_then(|path| {
+                            file_bodies.and_then(|bodies| bodies.get(path)).cloned()
+                        })
+                    });
+                items.push(SpecManifestItem {
+                    manifest_item_id,
+                    phase: phase_name.clone(),
+                    task_code: optional_string_field_value(task, &["task_code", "id", "code"]),
+                    team: optional_string_field_value(task, &["team"]),
+                    title,
+                    status: optional_string_field_value(task, &["status"]),
+                    dependencies: string_array_field(task, &["dependencies", "depends_on"]),
+                    labels: string_array_field(task, &["labels"]),
+                    touch_surface: string_array_field(task, &["touch_surface"]),
+                    acceptance_criteria: string_array_field(task, &["acceptance_criteria"]),
+                    validation_plan: string_array_field(task, &["validation_plan"]),
+                    gateway_task_id: optional_string_field_value(task, &["gateway_task_id"]),
+                    spec_file,
+                    spec_body,
+                    metadata: task.clone(),
+                });
+            }
+        }
+    }
+
+    if items.is_empty() {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "manifest_items_required".to_string(),
+        ));
+    }
+    Ok(items)
+}
+
+fn spec_structured_payload(
+    manifest: Value,
+    file_bodies: Option<std::collections::HashMap<String, String>>,
+    source_doc: Option<String>,
+    source_artifact_id: Option<String>,
+    source_artifact_version_id: Option<String>,
+) -> Result<Value> {
+    let items = normalize_spec_manifest(&manifest, file_bodies.as_ref())?;
+    Ok(serde_json::json!({
+        "schema": "gateway.spec_manifest.v1",
+        "source_doc": source_doc,
+        "source_artifact_id": source_artifact_id,
+        "source_artifact_version_id": source_artifact_version_id,
+        "manifest": manifest,
+        "items": items,
+        "stability_policy": spec_item_stability_policy()
+    }))
+}
+
+fn spec_manifest_from_version(
+    artifact_id: &str,
+    version: &db::ArtifactVersion,
+) -> Result<SpecManifestResponse> {
+    let payload = version
+        .structured_payload
+        .as_ref()
+        .ok_or_else(|| AppError(StatusCode::BAD_REQUEST, "spec_manifest_missing".to_string()))?;
+    let manifest = payload
+        .get("manifest")
+        .cloned()
+        .unwrap_or_else(|| payload.clone());
+    let items_value = payload.get("items").cloned().unwrap_or(Value::Null);
+    let items: Vec<SpecManifestItem> = serde_json::from_value(items_value).map_err(|err| {
+        AppError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("invalid stored spec manifest items: {err}"),
+        )
+    })?;
+    Ok(SpecManifestResponse {
+        artifact_id: artifact_id.to_string(),
+        artifact_version_id: version.artifact_version_id.clone(),
+        manifest,
+        items,
+        stability_policy: payload
+            .get("stability_policy")
+            .cloned()
+            .unwrap_or_else(spec_item_stability_policy),
+    })
+}
+
+fn spec_task_source_block(artifact_id: &str, version_id: &str, item: &SpecManifestItem) -> String {
+    format!(
+        "Source:\nsource_spec_artifact_id: {artifact_id}\nsource_spec_version_id: {version_id}\nmanifest_item_id: {}\nspec_file: {}\n",
+        item.manifest_item_id,
+        item.spec_file.as_deref().unwrap_or("")
+    )
+}
+
+fn generated_task_specification(
+    artifact_id: &str,
+    version_id: &str,
+    item: &SpecManifestItem,
+) -> String {
+    let mut out = spec_task_source_block(artifact_id, version_id, item);
+    out.push('\n');
+    if let Some(team) = &item.team {
+        out.push_str(&format!("Team: {team}\n"));
+    }
+    if !item.dependencies.is_empty() {
+        out.push_str(&format!("Depends on: {}\n", item.dependencies.join(", ")));
+    }
+    if !item.touch_surface.is_empty() {
+        out.push_str("\nTouch surface:\n");
+        for path in &item.touch_surface {
+            out.push_str(&format!("- {path}\n"));
+        }
+    }
+    if !item.acceptance_criteria.is_empty() {
+        out.push_str("\nAcceptance criteria:\n");
+        for criterion in &item.acceptance_criteria {
+            out.push_str(&format!("- {criterion}\n"));
+        }
+    }
+    if !item.validation_plan.is_empty() {
+        out.push_str("\nValidation plan:\n");
+        for step in &item.validation_plan {
+            out.push_str(&format!("- {step}\n"));
+        }
+    }
+    if let Some(body) = &item.spec_body {
+        out.push_str("\nFocused spec:\n");
+        out.push_str(body);
+        if !body.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn generated_spec_task_title(item: &SpecManifestItem) -> String {
+    item.task_code
+        .as_deref()
+        .map(|code| format!("{code} {}", item.title))
+        .unwrap_or_else(|| item.title.clone())
+}
+
+fn design_review_payload(
+    source_artifact_id: Option<String>,
+    source_artifact_version_id: Option<String>,
+) -> Value {
+    serde_json::json!({
+        "workflow": "design_review",
+        "source": {
+            "artifact_id": source_artifact_id,
+            "artifact_version_id": source_artifact_version_id,
+        }
+    })
+}
+
+fn read_set_has_ids(read_set: &Value, keys: &[&str]) -> bool {
+    let Value::Object(map) = read_set else {
+        return false;
+    };
+    keys.iter().any(|key| {
+        map.get(*key)
+            .and_then(Value::as_array)
+            .is_some_and(|values| values.iter().any(|value| value.as_str().is_some()))
+    })
+}
+
+fn validate_design_review_phase(phase: &str, read_set: Option<&Value>) -> Result<()> {
+    if !matches!(phase, "pass_1" | "pass_2") {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "invalid_review_phase".to_string(),
+        ));
+    }
+    validate_read_set_required(Some(phase), "review", read_set)?;
+    if phase == "pass_2"
+        && !read_set
+            .is_some_and(|value| read_set_has_ids(value, &["contribution", "contributions"]))
+    {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "pass_2_read_set_contributions_required".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_synthesis_read_set(read_set: &Value) -> Result<()> {
+    if !read_set_has_ids(read_set, &["contribution", "contributions"]) {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "synthesis_read_set_contributions_required".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_set_for_reviewed_version(reviewed_version_id: &str) -> Value {
+    serde_json::json!({ "versions": [reviewed_version_id] })
+}
+
+fn item_generation_key(version_id: &str, manifest_item_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(version_id.as_bytes());
+    hasher.update(b":");
+    hasher.update(manifest_item_id.as_bytes());
+    format!("spec-task-{}", hex::encode(hasher.finalize()))
+}
+
+fn body_text(version: &db::ArtifactVersion) -> String {
+    if let Some(body) = &version.body {
+        body.clone()
+    } else if let Some(payload) = &version.structured_payload {
+        serde_json::to_string_pretty(payload).unwrap_or_else(|_| payload.to_string())
+    } else {
+        String::new()
+    }
+}
+
+fn simple_diff(from: &str, to: &str) -> String {
+    let from_lines: Vec<_> = from.lines().collect();
+    let to_lines: Vec<_> = to.lines().collect();
+    let mut out = String::new();
+    out.push_str("--- base\n+++ target\n");
+    for line in &from_lines {
+        if !to_lines.contains(line) {
+            out.push('-');
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    for line in &to_lines {
+        if !from_lines.contains(line) {
+            out.push('+');
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+pub async fn list_artifacts_handler(
+    State(state): State<AppState>,
+    Path(ident): Path<String>,
+    Query(query): Query<ListArtifactsQuery>,
+    headers: HeaderMap,
+) -> Result<Json<ArtifactReadResponse<Vec<db::ArtifactSummary>>>> {
+    require_artifact_read(&state, &headers, &ident)?;
+    emit_artifact_metric(
+        "gateway_artifact_search_requests_total",
+        &[
+            ("project", ident.as_str()),
+            ("by", if query.q.is_some() { "query" } else { "id" }),
+        ],
+    );
+    let db = state.db.clone();
+    let artifacts = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::list_artifacts(
+            &conn,
+            &ident,
+            &db::ArtifactFilters {
+                kind: query.kind.as_deref(),
+                subkind: query.subkind.as_deref(),
+                lifecycle_state: query.lifecycle_state.as_deref(),
+                label: query.label.as_deref(),
+                actor_id: query.actor_id.as_deref(),
+                query: query.q.as_deref(),
+            },
+        )
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    Ok(Json(ArtifactReadResponse {
+        data: artifacts,
+        chunking_status: ChunkingStatus {
+            status: "none",
+            current_chunk_count: 0,
+            stale_chunk_count: 0,
+            superseded_chunk_count: 0,
+            failed_addresses: Vec::new(),
+        },
+    }))
+}
+
+pub async fn create_artifact_handler(
+    State(state): State<AppState>,
+    Path(ident): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<CreateArtifactRequest>,
+) -> Result<Response> {
+    let (context, authorization) =
+        begin_artifact_mutation(&state, &headers, &ident, vec!["artifact.write"])?;
+    let kind = trim_required(&body.kind, "kind")?;
+    validate_artifact_kind(&kind)?;
+    let title = trim_required(&body.title, "title")?;
+    let labels = body.labels.unwrap_or_default();
+    let envelope = state.artifact_operations;
+    let db = state.db.clone();
+    let context_for_db = context.clone();
+    let (actor, write) = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::get_project(&conn, &ident)?.ok_or_else(|| anyhow::anyhow!("project not found"))?;
+        let actor = resolve_artifact_actor(
+            &conn,
+            &context_for_db.actor,
+            body.actor_display_name.as_deref(),
+        )?;
+        let result = db::create_artifact(
+            &conn,
+            &envelope,
+            &db::ArtifactInsert {
+                project_ident: &ident,
+                kind: &kind,
+                subkind: body.subkind.as_deref(),
+                title: &title,
+                labels: &labels,
+                created_by_actor_id: &actor.actor_id,
+            },
+        )?;
+        Ok::<_, anyhow::Error>((actor, result))
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    emit_artifact_metric(
+        "gateway_artifact_writes_total",
+        &[
+            ("project", write.record.project_ident.as_str()),
+            ("kind", write.record.kind.as_str()),
+            ("result", "created"),
+        ],
+    );
+    Ok(finalize_mutation(
+        actor,
+        &context,
+        authorization,
+        generated_resource("artifact_id", write.record.artifact_id.clone()),
+        write.warnings,
+        write.replayed,
+        write.record,
+    ))
+}
+
+pub async fn get_artifact_handler(
+    State(state): State<AppState>,
+    Path((ident, artifact_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<ArtifactReadResponse<ArtifactDetailResponse>>> {
+    require_artifact_read(&state, &headers, &ident)?;
+    let db = state.db.clone();
+    let data = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        let detail = db::get_artifact(&conn, &ident, &artifact_id)?
+            .ok_or_else(|| anyhow::anyhow!("artifact not found"))?;
+        let chunks = db::list_artifact_chunks(
+            &conn,
+            &ident,
+            &artifact_id,
+            &db::ArtifactChunkFilters {
+                include_superseded: true,
+                ..Default::default()
+            },
+        )?;
+        let status = chunking_status_for(&detail.artifact, &chunks);
+        let current_version = detail
+            .current_version
+            .map(|version| version_status(&detail.artifact, version, &chunks));
+        let accepted_version = detail
+            .accepted_version
+            .map(|version| version_status(&detail.artifact, version, &chunks));
+        Ok::<_, anyhow::Error>(ArtifactReadResponse {
+            data: ArtifactDetailResponse {
+                artifact: detail.artifact,
+                current_version,
+                accepted_version,
+            },
+            chunking_status: status,
+        })
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    Ok(Json(data))
+}
+
+pub async fn list_artifact_versions_handler(
+    State(state): State<AppState>,
+    Path((ident, artifact_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<ArtifactReadResponse<Vec<VersionReadModel>>>> {
+    require_artifact_read(&state, &headers, &ident)?;
+    let db = state.db.clone();
+    let data = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        let artifact = db::get_artifact_summary(&conn, &ident, &artifact_id)?
+            .ok_or_else(|| anyhow::anyhow!("artifact not found"))?;
+        let versions = db::list_artifact_versions(&conn, &ident, &artifact_id)?;
+        let chunks = db::list_artifact_chunks(
+            &conn,
+            &ident,
+            &artifact_id,
+            &db::ArtifactChunkFilters {
+                include_superseded: true,
+                ..Default::default()
+            },
+        )?;
+        let status = chunking_status_for(&artifact, &chunks);
+        Ok::<_, anyhow::Error>(ArtifactReadResponse {
+            data: versions
+                .into_iter()
+                .map(|v| version_status(&artifact, v, &chunks))
+                .collect(),
+            chunking_status: status,
+        })
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    Ok(Json(data))
+}
+
+pub async fn create_artifact_version_handler(
+    State(state): State<AppState>,
+    Path((ident, artifact_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<CreateArtifactVersionRequest>,
+) -> Result<Response> {
+    let (context, authorization) =
+        begin_artifact_mutation(&state, &headers, &ident, vec!["artifact_version.create"])?;
+    let body_format = body
+        .body_format
+        .as_deref()
+        .unwrap_or("markdown")
+        .to_string();
+    validate_body_format(&body_format)?;
+    artifact_body_schema_allowed(&state, &body_format, body.structured_payload.as_ref())?;
+    let version_state = body.version_state.as_deref().unwrap_or("draft").to_string();
+    if !matches!(
+        version_state.as_str(),
+        "draft" | "under_review" | "accepted" | "superseded" | "rejected"
+    ) {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "invalid_version_state".to_string(),
+        ));
+    }
+    let envelope = state.artifact_operations;
+    let db = state.db.clone();
+    let ident_for_metric = ident.clone();
+    let body_format_for_db = body_format.clone();
+    let body_format_for_metric = body_format.clone();
+    let context_for_db = context.clone();
+    let workflow_run_id_for_response = context.workflow_run_id.clone();
+    let (actor, write) = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        let actor = resolve_artifact_actor(
+            &conn,
+            &context_for_db.actor,
+            body.actor_display_name.as_deref(),
+        )?;
+        db::get_artifact_summary(&conn, &ident, &artifact_id)?
+            .ok_or_else(|| anyhow::anyhow!("artifact not found"))?;
+        let run = validate_workflow_run_for_mutation(
+            &conn,
+            &artifact_id,
+            context_for_db.workflow_run_id.as_deref(),
+        )?;
+        let result = db::create_artifact_version(
+            &conn,
+            &envelope,
+            &db::ArtifactVersionInsert {
+                artifact_id: &artifact_id,
+                version_label: body.version_label.as_deref(),
+                parent_version_id: body.parent_version_id.as_deref(),
+                body_format: &body_format_for_db,
+                body: body.body.as_deref(),
+                structured_payload: body.structured_payload.as_ref(),
+                source_format: body.source_format.as_deref(),
+                created_by_actor_id: &actor.actor_id,
+                created_via_workflow_run_id: context_for_db.workflow_run_id.as_deref(),
+                version_state: &version_state,
+                idempotency_key: Some(&context_for_db.idempotency_key),
+            },
+        )?;
+        complete_resumed_run(
+            &conn,
+            run.as_ref(),
+            None,
+            Some(result.record.artifact_version_id.clone()),
+            None,
+        )?;
+        Ok::<_, anyhow::Error>((actor, result))
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    emit_artifact_metric(
+        "gateway_artifact_version_writes_total",
+        &[
+            ("project", ident_for_metric.as_str()),
+            ("kind", "artifact_version"),
+            ("result", result_label(write.replayed)),
+        ],
+    );
+    emit_artifact_metric(
+        "gateway_artifact_version_body_bytes",
+        &[
+            ("project", ident_for_metric.as_str()),
+            ("kind", body_format_for_metric.as_str()),
+        ],
+    );
+    Ok(finalize_mutation(
+        actor,
+        &context,
+        authorization,
+        serde_json::json!({
+            "artifact_version_id": write.record.artifact_version_id,
+            "workflow_run_id": workflow_run_id_for_response,
+        }),
+        write.warnings,
+        write.replayed,
+        write.record,
+    ))
+}
+
+pub async fn get_artifact_version_handler(
+    State(state): State<AppState>,
+    Path((ident, artifact_id, version_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<ArtifactReadResponse<VersionReadModel>>> {
+    require_artifact_read(&state, &headers, &ident)?;
+    let db = state.db.clone();
+    let data = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        let artifact = db::get_artifact_summary(&conn, &ident, &artifact_id)?
+            .ok_or_else(|| anyhow::anyhow!("artifact not found"))?;
+        let version = db::get_artifact_version(&conn, &ident, &artifact_id, &version_id)?
+            .ok_or_else(|| anyhow::anyhow!("artifact_version not found"))?;
+        let chunks = db::list_artifact_chunks(
+            &conn,
+            &ident,
+            &artifact_id,
+            &db::ArtifactChunkFilters {
+                include_superseded: true,
+                artifact_version_id: Some(&version_id),
+                ..Default::default()
+            },
+        )?;
+        Ok::<_, anyhow::Error>(ArtifactReadResponse {
+            data: version_status(&artifact, version, &chunks),
+            chunking_status: chunking_status_for(&artifact, &chunks),
+        })
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    Ok(Json(data))
+}
+
+pub async fn diff_artifact_version_handler(
+    State(state): State<AppState>,
+    Path((ident, artifact_id, version_id)): Path<(String, String, String)>,
+    Query(query): Query<DiffQuery>,
+    headers: HeaderMap,
+) -> Result<Json<ArtifactReadResponse<ArtifactDiffResponse>>> {
+    require_artifact_read(&state, &headers, &ident)?;
+    let db = state.db.clone();
+    let data = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        let artifact = db::get_artifact_summary(&conn, &ident, &artifact_id)?
+            .ok_or_else(|| anyhow::anyhow!("artifact not found"))?;
+        let target = db::get_artifact_version(&conn, &ident, &artifact_id, &version_id)?
+            .ok_or_else(|| anyhow::anyhow!("artifact_version not found"))?;
+        let base_id = query
+            .base_version_id
+            .as_deref()
+            .or(target.parent_version_id.as_deref());
+        let base = base_id
+            .map(|id| db::get_artifact_version(&conn, &ident, &artifact_id, id))
+            .transpose()?
+            .flatten();
+        if base_id.is_some() && base.is_none() {
+            anyhow::bail!("base artifact_version not found");
+        }
+        let from_text = base.as_ref().map(body_text).unwrap_or_default();
+        let to_text = body_text(&target);
+        let chunks = db::list_artifact_chunks(
+            &conn,
+            &ident,
+            &artifact_id,
+            &db::ArtifactChunkFilters {
+                include_superseded: true,
+                artifact_version_id: Some(&version_id),
+                ..Default::default()
+            },
+        )?;
+        emit_artifact_metric(
+            "gateway_artifact_version_diff_bytes",
+            &[
+                ("project", ident.as_str()),
+                ("kind", target.body_format.as_str()),
+            ],
+        );
+        Ok::<_, anyhow::Error>(ArtifactReadResponse {
+            data: ArtifactDiffResponse {
+                from_version_id: base.map(|v| v.artifact_version_id),
+                to_version_id: target.artifact_version_id,
+                format: "unified",
+                byte_delta: to_text.len() as isize - from_text.len() as isize,
+                diff: simple_diff(&from_text, &to_text),
+                chunking_status: chunking_status_for(&artifact, &chunks),
+            },
+            chunking_status: chunking_status_for(&artifact, &chunks),
+        })
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    Ok(Json(data))
+}
+
+pub async fn list_artifact_comments_handler(
+    State(state): State<AppState>,
+    Path((ident, artifact_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<ArtifactReadResponse<Vec<db::ArtifactComment>>>> {
+    require_artifact_read(&state, &headers, &ident)?;
+    let db = state.db.clone();
+    let comments = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::list_artifact_comments(&conn, &ident, &artifact_id)
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    Ok(Json(ArtifactReadResponse {
+        data: comments,
+        chunking_status: ChunkingStatus {
+            status: "none",
+            current_chunk_count: 0,
+            stale_chunk_count: 0,
+            superseded_chunk_count: 0,
+            failed_addresses: Vec::new(),
+        },
+    }))
+}
+
+pub async fn create_artifact_comment_handler(
+    State(state): State<AppState>,
+    Path((ident, artifact_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<CreateCommentRequest>,
+) -> Result<Response> {
+    let (context, authorization) =
+        begin_artifact_mutation(&state, &headers, &ident, vec!["comment.write"])?;
+    let target_kind = trim_required(&body.target_kind, "target_kind")?;
+    let target_id = trim_required(&body.target_id, "target_id")?;
+    let comment_body = trim_required(&body.body, "body")?;
+    let envelope = state.artifact_operations;
+    let db = state.db.clone();
+    let ident_for_metric = ident.clone();
+    let target_kind_for_db = target_kind.clone();
+    let target_kind_for_metric = target_kind.clone();
+    let context_for_db = context.clone();
+    let (actor, write) = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::get_artifact_summary(&conn, &ident, &artifact_id)?
+            .ok_or_else(|| anyhow::anyhow!("artifact not found"))?;
+        let actor = resolve_artifact_actor(
+            &conn,
+            &context_for_db.actor,
+            body.actor_display_name.as_deref(),
+        )?;
+        let _ = validate_workflow_run_for_mutation(
+            &conn,
+            &artifact_id,
+            context_for_db.workflow_run_id.as_deref(),
+        )?;
+        let result = db::add_artifact_comment(
+            &conn,
+            &envelope,
+            &db::ArtifactCommentInsert {
+                artifact_id: &artifact_id,
+                target_kind: &target_kind_for_db,
+                target_id: &target_id,
+                child_address: body.child_address.as_deref(),
+                parent_comment_id: body.parent_comment_id.as_deref(),
+                actor_id: &actor.actor_id,
+                body: &comment_body,
+                idempotency_key: Some(&context_for_db.idempotency_key),
+            },
+        )?;
+        Ok::<_, anyhow::Error>((actor, result))
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    emit_artifact_metric(
+        "gateway_comment_writes_total",
+        &[
+            ("project", ident_for_metric.as_str()),
+            ("target_kind", target_kind_for_metric.as_str()),
+            ("result", result_label(write.replayed)),
+        ],
+    );
+    Ok(finalize_mutation(
+        actor,
+        &context,
+        authorization,
+        generated_resource("comment_id", write.record.comment_id.clone()),
+        write.warnings,
+        write.replayed,
+        write.record,
+    ))
+}
+
+pub async fn resolve_artifact_comment_handler(
+    State(state): State<AppState>,
+    Path((ident, artifact_id, comment_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<ResolveCommentRequest>,
+) -> Result<Response> {
+    let (context, authorization) =
+        begin_artifact_mutation(&state, &headers, &ident, vec!["comment.resolve"])?;
+    let db = state.db.clone();
+    let context_for_db = context.clone();
+    let (actor, comment) = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        let actor = resolve_artifact_actor(
+            &conn,
+            &context_for_db.actor,
+            body.actor_display_name.as_deref(),
+        )?;
+        validate_workflow_run_for_mutation(
+            &conn,
+            &artifact_id,
+            context_for_db.workflow_run_id.as_deref(),
+        )?;
+        let comment = db::resolve_artifact_comment(
+            &conn,
+            &ident,
+            &artifact_id,
+            &comment_id,
+            &actor.actor_id,
+            context_for_db.workflow_run_id.as_deref(),
+            body.resolution_note.as_deref(),
+        )?
+        .ok_or_else(|| anyhow::anyhow!("comment not found"))?;
+        Ok::<_, anyhow::Error>((actor, comment))
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    Ok(finalize_ok_mutation(
+        actor,
+        &context,
+        authorization,
+        generated_resource("comment_id", comment.comment_id.clone()),
+        Vec::new(),
+        comment,
+    ))
+}
+
+pub async fn reopen_artifact_comment_handler(
+    State(state): State<AppState>,
+    Path((ident, artifact_id, comment_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<ReopenCommentRequest>,
+) -> Result<Response> {
+    let (context, authorization) =
+        begin_artifact_mutation(&state, &headers, &ident, vec!["comment.write"])?;
+    let note_body = body
+        .note_body
+        .unwrap_or_else(|| "reopened comment".to_string());
+    let envelope = state.artifact_operations;
+    let db = state.db.clone();
+    let context_for_db = context.clone();
+    let (actor, comment) = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        let actor = resolve_artifact_actor(
+            &conn,
+            &context_for_db.actor,
+            body.actor_display_name.as_deref(),
+        )?;
+        validate_workflow_run_for_mutation(
+            &conn,
+            &artifact_id,
+            context_for_db.workflow_run_id.as_deref(),
+        )?;
+        let comment = db::reopen_artifact_comment(
+            &conn,
+            &envelope,
+            &ident,
+            &artifact_id,
+            &comment_id,
+            &actor.actor_id,
+            &note_body,
+            Some(&context_for_db.idempotency_key),
+        )?
+        .ok_or_else(|| anyhow::anyhow!("comment not found"))?;
+        Ok::<_, anyhow::Error>((actor, comment))
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    Ok(finalize_ok_mutation(
+        actor,
+        &context,
+        authorization,
+        generated_resource("comment_id", comment.comment_id.clone()),
+        Vec::new(),
+        comment,
+    ))
+}
+
+pub async fn list_artifact_contributions_handler(
+    State(state): State<AppState>,
+    Path((ident, artifact_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<ArtifactReadResponse<Vec<db::ArtifactContribution>>>> {
+    require_artifact_read(&state, &headers, &ident)?;
+    let db = state.db.clone();
+    let contributions = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::list_artifact_contributions(&conn, &ident, &artifact_id)
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    Ok(Json(ArtifactReadResponse {
+        data: contributions,
+        chunking_status: ChunkingStatus {
+            status: "none",
+            current_chunk_count: 0,
+            stale_chunk_count: 0,
+            superseded_chunk_count: 0,
+            failed_addresses: Vec::new(),
+        },
+    }))
+}
+
+pub async fn create_artifact_contribution_handler(
+    State(state): State<AppState>,
+    Path((ident, artifact_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<CreateContributionRequest>,
+) -> Result<Response> {
+    let (context, authorization) =
+        begin_artifact_mutation(&state, &headers, &ident, vec!["contribution.write"])?;
+    let target_kind = trim_required(&body.target_kind, "target_kind")?;
+    let target_id = trim_required(&body.target_id, "target_id")?;
+    let contribution_kind = trim_required(&body.contribution_kind, "contribution_kind")?;
+    validate_read_set_required(
+        body.phase.as_deref(),
+        &contribution_kind,
+        body.read_set.as_ref(),
+    )?;
+    let role = trim_required(&body.role, "role")?;
+    let body_format = body
+        .body_format
+        .as_deref()
+        .unwrap_or("markdown")
+        .to_string();
+    validate_body_format(&body_format)?;
+    let contribution_body = trim_required(&body.body, "body")?;
+    let envelope = state.artifact_operations;
+    let db = state.db.clone();
+    let ident_for_metric = ident.clone();
+    let contribution_kind_for_db = contribution_kind.clone();
+    let contribution_kind_for_metric = contribution_kind.clone();
+    let phase_for_metric = body.phase.clone();
+    let context_for_db = context.clone();
+    let workflow_run_id_for_response = context.workflow_run_id.clone();
+    let (actor, write) = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::get_artifact_summary(&conn, &ident, &artifact_id)?
+            .ok_or_else(|| anyhow::anyhow!("artifact not found"))?;
+        let actor = resolve_artifact_actor(
+            &conn,
+            &context_for_db.actor,
+            body.actor_display_name.as_deref(),
+        )?;
+        let run = validate_workflow_run_for_mutation(
+            &conn,
+            &artifact_id,
+            context_for_db.workflow_run_id.as_deref(),
+        )?;
+        let result = db::add_artifact_contribution(
+            &conn,
+            &envelope,
+            &db::ArtifactContributionInsert {
+                artifact_id: &artifact_id,
+                target_kind: &target_kind,
+                target_id: &target_id,
+                contribution_kind: &contribution_kind_for_db,
+                phase: body.phase.as_deref(),
+                role: &role,
+                actor_id: &actor.actor_id,
+                workflow_run_id: context_for_db.workflow_run_id.as_deref(),
+                read_set: body.read_set.as_ref(),
+                body_format: &body_format,
+                body: &contribution_body,
+                idempotency_key: Some(&context_for_db.idempotency_key),
+            },
+        )?;
+        complete_resumed_run(
+            &conn,
+            run.as_ref(),
+            Some(result.record.contribution_id.clone()),
+            None,
+            None,
+        )?;
+        Ok::<_, anyhow::Error>((actor, result))
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    emit_artifact_metric(
+        "gateway_contribution_writes_total",
+        &[
+            ("project", ident_for_metric.as_str()),
+            ("kind", contribution_kind_for_metric.as_str()),
+            ("phase", phase_for_metric.as_deref().unwrap_or("none")),
+            ("result", result_label(write.replayed)),
+        ],
+    );
+    Ok(finalize_mutation(
+        actor,
+        &context,
+        authorization,
+        serde_json::json!({
+            "contribution_id": write.record.contribution_id,
+            "workflow_run_id": workflow_run_id_for_response,
+        }),
+        write.warnings,
+        write.replayed,
+        write.record,
+    ))
+}
+
+pub async fn list_artifact_links_handler(
+    State(state): State<AppState>,
+    Path(ident): Path<String>,
+    Query(query): Query<ListLinksQuery>,
+    headers: HeaderMap,
+) -> Result<Json<ArtifactReadResponse<Vec<db::ArtifactLink>>>> {
+    require_artifact_read(&state, &headers, &ident)?;
+    let db = state.db.clone();
+    let links = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::list_artifact_links(
+            &conn,
+            &ident,
+            &db::ArtifactLinkFilters {
+                link_type: query.link_type.as_deref(),
+                source_kind: query.source_kind.as_deref(),
+                source_id: query.source_id.as_deref(),
+                target_kind: query.target_kind.as_deref(),
+                target_id: query.target_id.as_deref(),
+            },
+        )
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    Ok(Json(ArtifactReadResponse {
+        data: links,
+        chunking_status: ChunkingStatus {
+            status: "none",
+            current_chunk_count: 0,
+            stale_chunk_count: 0,
+            superseded_chunk_count: 0,
+            failed_addresses: Vec::new(),
+        },
+    }))
+}
+
+pub async fn create_artifact_link_handler(
+    State(state): State<AppState>,
+    Path(ident): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<CreateLinkRequest>,
+) -> Result<Response> {
+    let (context, authorization) =
+        begin_artifact_mutation(&state, &headers, &ident, vec!["link.write"])?;
+    let link_type = trim_required(&body.link_type, "link_type")?;
+    let source_kind = trim_required(&body.source_kind, "source_kind")?;
+    let source_id = trim_required(&body.source_id, "source_id")?;
+    let target_kind = trim_required(&body.target_kind, "target_kind")?;
+    let target_id = trim_required(&body.target_id, "target_id")?;
+    let envelope = state.artifact_operations;
+    let db = state.db.clone();
+    let ident_for_metric = ident.clone();
+    let link_type_for_db = link_type.clone();
+    let link_type_for_metric = link_type.clone();
+    let context_for_db = context.clone();
+    let (actor, write) = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::get_project(&conn, &ident)?.ok_or_else(|| anyhow::anyhow!("project not found"))?;
+        let actor = resolve_artifact_actor(
+            &conn,
+            &context_for_db.actor,
+            body.actor_display_name.as_deref(),
+        )?;
+        // Links are project-scoped: the workflow run (if supplied) does NOT
+        // need to belong to a specific artifact, but it must still be
+        // retryable per the shared `ensure_workflow_run_retryable` semantics.
+        let run_artifact =
+            load_workflow_run_for_link(&conn, context_for_db.workflow_run_id.as_deref())?;
+        let result = db::create_artifact_link(
+            &conn,
+            &envelope,
+            &db::ArtifactLinkInsert {
+                link_type: &link_type_for_db,
+                source_kind: &source_kind,
+                source_id: &source_id,
+                source_version_id: body.source_version_id.as_deref(),
+                source_child_address: body.source_child_address.as_deref(),
+                target_kind: &target_kind,
+                target_id: &target_id,
+                target_version_id: body.target_version_id.as_deref(),
+                target_child_address: body.target_child_address.as_deref(),
+                created_by_actor_id: &actor.actor_id,
+                created_via_workflow_run_id: context_for_db.workflow_run_id.as_deref(),
+                idempotency_key: Some(&context_for_db.idempotency_key),
+                supersedes_link_id: body.supersedes_link_id.as_deref(),
+            },
+        )?;
+        complete_resumed_run(
+            &conn,
+            run_artifact.as_ref(),
+            None,
+            None,
+            Some(result.record.link_id.clone()),
+        )?;
+        Ok::<_, anyhow::Error>((actor, result))
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    emit_artifact_metric(
+        "gateway_link_writes_total",
+        &[
+            ("project", ident_for_metric.as_str()),
+            ("link_type", link_type_for_metric.as_str()),
+            ("result", result_label(write.replayed)),
+        ],
+    );
+    Ok(finalize_mutation(
+        actor,
+        &context,
+        authorization,
+        generated_resource("link_id", write.record.link_id.clone()),
+        write.warnings,
+        write.replayed,
+        write.record,
+    ))
+}
+
+pub async fn list_artifact_workflow_runs_handler(
+    State(state): State<AppState>,
+    Path((ident, artifact_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<ArtifactReadResponse<Vec<db::WorkflowRun>>>> {
+    require_artifact_read(&state, &headers, &ident)?;
+    let db = state.db.clone();
+    let runs = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::list_workflow_runs(&conn, &ident, &artifact_id)
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    Ok(Json(ArtifactReadResponse {
+        data: runs,
+        chunking_status: ChunkingStatus {
+            status: "none",
+            current_chunk_count: 0,
+            stale_chunk_count: 0,
+            superseded_chunk_count: 0,
+            failed_addresses: Vec::new(),
+        },
+    }))
+}
+
+pub async fn start_artifact_workflow_run_handler(
+    State(state): State<AppState>,
+    Path((ident, artifact_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<StartWorkflowRunRequest>,
+) -> Result<Response> {
+    let (context, authorization) =
+        begin_artifact_mutation(&state, &headers, &ident, vec!["workflow_run.start"])?;
+    let workflow_kind = trim_required(&body.workflow_kind, "workflow_kind")?;
+    let envelope = state.artifact_operations;
+    let db = state.db.clone();
+    let ident_for_metric = ident.clone();
+    let workflow_kind_for_db = workflow_kind.clone();
+    let workflow_kind_for_metric = workflow_kind.clone();
+    let context_for_db = context.clone();
+    let (actor, write) = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::get_artifact_summary(&conn, &ident, &artifact_id)?
+            .ok_or_else(|| anyhow::anyhow!("artifact not found"))?;
+        let actor = resolve_artifact_actor(
+            &conn,
+            &context_for_db.actor,
+            body.actor_display_name.as_deref(),
+        )?;
+        let participants = body.participant_actor_ids.unwrap_or_default();
+        let result = db::start_workflow_run(
+            &conn,
+            &envelope,
+            &db::WorkflowRunInsert {
+                artifact_id: &artifact_id,
+                workflow_kind: &workflow_kind_for_db,
+                phase: body.phase.as_deref(),
+                round_id: body.round_id.as_deref(),
+                coordinator_actor_id: &actor.actor_id,
+                participant_actor_ids: &participants,
+                source_artifact_version_id: body.source_artifact_version_id.as_deref(),
+                read_set: body.read_set.as_ref(),
+                idempotency_key: Some(&context_for_db.idempotency_key),
+                is_resumable: body.is_resumable.unwrap_or(matches!(
+                    workflow_kind_for_db.as_str(),
+                    "spec_task_generation" | "doc_publish"
+                )),
+            },
+        )?;
+        Ok::<_, anyhow::Error>((actor, result))
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    emit_artifact_metric(
+        "gateway_workflow_runs_total",
+        &[
+            ("project", ident_for_metric.as_str()),
+            ("kind", workflow_kind_for_metric.as_str()),
+            ("state", write.record.state.as_str()),
+        ],
+    );
+    Ok(finalize_mutation(
+        actor,
+        &context,
+        authorization,
+        generated_resource("workflow_run_id", write.record.workflow_run_id.clone()),
+        write.warnings,
+        write.replayed,
+        write.record,
+    ))
+}
+
+pub async fn get_artifact_workflow_run_handler(
+    State(state): State<AppState>,
+    Path((ident, _artifact_id, workflow_run_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<ArtifactReadResponse<db::WorkflowRun>>> {
+    require_artifact_read(&state, &headers, &ident)?;
+    let db = state.db.clone();
+    let run = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::get_workflow_run(&conn, &workflow_run_id)?
+            .ok_or_else(|| anyhow::anyhow!("workflow_run not found"))
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    Ok(Json(ArtifactReadResponse {
+        data: run,
+        chunking_status: ChunkingStatus {
+            status: "none",
+            current_chunk_count: 0,
+            stale_chunk_count: 0,
+            superseded_chunk_count: 0,
+            failed_addresses: Vec::new(),
+        },
+    }))
+}
+
+pub async fn complete_artifact_workflow_run_handler(
+    State(state): State<AppState>,
+    Path((ident, artifact_id, workflow_run_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<CompleteWorkflowRunRequest>,
+) -> Result<Response> {
+    let (context, authorization) =
+        begin_artifact_mutation(&state, &headers, &ident, vec!["workflow_run.complete"])?;
+    let state_value = trim_required(&body.state, "state")?;
+    if !matches!(state_value.as_str(), "succeeded" | "failed" | "cancelled") {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "invalid_workflow_run_state".to_string(),
+        ));
+    }
+    let db = state.db.clone();
+    let ident_for_metric = ident.clone();
+    let context_for_db = context.clone();
+    let (actor, updated) = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::get_artifact_summary(&conn, &ident, &artifact_id)?
+            .ok_or_else(|| anyhow::anyhow!("artifact not found"))?;
+        let actor = resolve_artifact_actor(
+            &conn,
+            &context_for_db.actor,
+            body.actor_display_name.as_deref(),
+        )?;
+        let current = db::get_workflow_run(&conn, &workflow_run_id)?
+            .ok_or_else(|| anyhow::anyhow!("workflow_run not found"))?;
+        if current.artifact_id != artifact_id {
+            anyhow::bail!("workflow_run does not belong to artifact");
+        }
+        if current.coordinator_actor_id != actor.actor_id {
+            anyhow::bail!("workflow_run coordinator mismatch");
+        }
+        let updated = db::update_workflow_run(
+            &conn,
+            &workflow_run_id,
+            &db::WorkflowRunUpdate {
+                state: Some(&state_value),
+                failure_reason: if state_value == "failed" {
+                    Some(body.failure_reason.as_deref())
+                } else {
+                    Some(None)
+                },
+                generated_contribution_ids: body.generated_contribution_ids.as_deref(),
+                generated_version_ids: body.generated_version_ids.as_deref(),
+                generated_task_ids: body.generated_task_ids.as_deref(),
+                generated_link_ids: body.generated_link_ids.as_deref(),
+                generated_chunk_ids: body.generated_chunk_ids.as_deref(),
+                ended_at: None,
+            },
+        )?
+        .ok_or_else(|| anyhow::anyhow!("workflow_run not found"))?;
+        Ok::<_, anyhow::Error>((actor, updated))
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    emit_artifact_metric(
+        "gateway_workflow_runs_total",
+        &[
+            ("project", ident_for_metric.as_str()),
+            ("kind", updated.workflow_kind.as_str()),
+            ("state", updated.state.as_str()),
+        ],
+    );
+    let generated = generated_workflow_resources(&updated);
+    Ok(finalize_ok_mutation(
+        actor,
+        &context,
+        authorization,
+        generated,
+        Vec::new(),
+        updated,
+    ))
+}
+
+pub async fn create_design_review_handler(
+    State(state): State<AppState>,
+    Path(ident): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<DesignReviewCreateRequest>,
+) -> Result<Response> {
+    let (context, authorization) = begin_artifact_mutation(
+        &state,
+        &headers,
+        &ident,
+        vec!["artifact.write", "artifact_version.create"],
+    )?;
+    let title = trim_required(&body.title, "title")?;
+    let labels = body.labels.unwrap_or_default();
+    let body_format = body
+        .body_format
+        .as_deref()
+        .unwrap_or("markdown")
+        .to_string();
+    validate_body_format(&body_format)?;
+    let payload = design_review_payload(
+        body.source_artifact_id.clone(),
+        body.source_artifact_version_id.clone(),
+    );
+    artifact_body_schema_allowed(&state, &body_format, Some(&payload))?;
+    let envelope = state.artifact_operations;
+    let db = state.db.clone();
+    let context_for_db = context.clone();
+    let (actor, artifact_write, version_write) = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::get_project(&conn, &ident)?.ok_or_else(|| anyhow::anyhow!("project not found"))?;
+        let actor = resolve_artifact_actor(
+            &conn,
+            &context_for_db.actor,
+            body.actor_display_name.as_deref(),
+        )?;
+        let artifact_write = db::create_artifact(
+            &conn,
+            &envelope,
+            &db::ArtifactInsert {
+                project_ident: &ident,
+                kind: "design_review",
+                subkind: None,
+                title: &title,
+                labels: &labels,
+                created_by_actor_id: &actor.actor_id,
+            },
+        )?;
+        let version_write = if body.body.is_some() {
+            let version_key = format!("{}:initial-version", context_for_db.idempotency_key);
+            Some(db::create_artifact_version(
+                &conn,
+                &envelope,
+                &db::ArtifactVersionInsert {
+                    artifact_id: &artifact_write.record.artifact_id,
+                    version_label: Some("source"),
+                    parent_version_id: None,
+                    body_format: &body_format,
+                    body: body.body.as_deref(),
+                    structured_payload: Some(&payload),
+                    source_format: None,
+                    created_by_actor_id: &actor.actor_id,
+                    created_via_workflow_run_id: None,
+                    version_state: "under_review",
+                    idempotency_key: Some(&version_key),
+                },
+            )?)
+        } else {
+            None
+        };
+        Ok::<_, anyhow::Error>((actor, artifact_write, version_write))
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    let mut warnings = artifact_write.warnings;
+    if let Some(version) = &version_write {
+        warnings.extend(version.warnings.clone());
+    }
+    let generated = serde_json::json!({
+        "artifact_id": artifact_write.record.artifact_id,
+        "artifact_version_id": version_write.as_ref().map(|write| write.record.artifact_version_id.clone()),
+    });
+    Ok(finalize_mutation(
+        actor,
+        &context,
+        authorization,
+        generated,
+        warnings,
+        artifact_write.replayed && version_write.as_ref().is_some_and(|write| write.replayed),
+        serde_json::json!({
+            "artifact": artifact_write.record,
+            "version": version_write.map(|write| write.record),
+        }),
+    ))
+}
+
+pub async fn create_design_review_round_handler(
+    State(state): State<AppState>,
+    Path((ident, artifact_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<DesignReviewRoundRequest>,
+) -> Result<Response> {
+    let (context, authorization) = begin_artifact_mutation(
+        &state,
+        &headers,
+        &ident,
+        vec!["workflow_run.start", "artifact.write"],
+    )?;
+    let source_version_id = trim_required(
+        &body.source_artifact_version_id,
+        "source_artifact_version_id",
+    )?;
+    let round_id = body
+        .round_id
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| format!("review-round:{}", context.idempotency_key));
+    let envelope = state.artifact_operations;
+    let db = state.db.clone();
+    let context_for_db = context.clone();
+    let (actor, write, artifact) = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        let artifact = db::get_artifact_summary(&conn, &ident, &artifact_id)?
+            .ok_or_else(|| anyhow::anyhow!("artifact not found"))?;
+        if artifact.kind != "design_review" {
+            anyhow::bail!("artifact is not a design_review");
+        }
+        let actor = resolve_artifact_actor(
+            &conn,
+            &context_for_db.actor,
+            body.actor_display_name.as_deref(),
+        )?;
+        let participants = body.participant_actor_ids.unwrap_or_default();
+        let write = db::start_workflow_run(
+            &conn,
+            &envelope,
+            &db::WorkflowRunInsert {
+                artifact_id: &artifact_id,
+                workflow_kind: "design_review_round",
+                phase: Some("pass_1"),
+                round_id: Some(&round_id),
+                coordinator_actor_id: &actor.actor_id,
+                participant_actor_ids: &participants,
+                source_artifact_version_id: Some(&source_version_id),
+                read_set: body.read_set.as_ref(),
+                idempotency_key: Some(&context_for_db.idempotency_key),
+                is_resumable: false,
+            },
+        )?;
+        let artifact = db::update_artifact(
+            &conn,
+            &ident,
+            &artifact_id,
+            &db::ArtifactUpdate {
+                lifecycle_state: Some("active"),
+                review_state: Some("collecting_reviews"),
+                ..Default::default()
+            },
+            &envelope,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("artifact not found"))?;
+        Ok::<_, anyhow::Error>((actor, write, artifact))
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    Ok(finalize_mutation(
+        actor,
+        &context,
+        authorization,
+        generated_resource("workflow_run_id", write.record.workflow_run_id.clone()),
+        write.warnings,
+        write.replayed,
+        serde_json::json!({
+            "workflow_run": write.record,
+            "artifact": artifact,
+        }),
+    ))
+}
+
+pub async fn create_design_review_contribution_handler(
+    State(state): State<AppState>,
+    Path((ident, artifact_id, workflow_run_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<DesignReviewContributionRequest>,
+) -> Result<Response> {
+    let (mut context, authorization) =
+        begin_artifact_mutation(&state, &headers, &ident, vec!["contribution.write"])?;
+    context.workflow_run_id = Some(workflow_run_id.clone());
+    let phase = trim_required(&body.phase, "phase")?;
+    let role = body.role.unwrap_or_else(|| "reviewer".to_string());
+    let role = trim_required(&role, "role")?;
+    let body_format = body
+        .body_format
+        .as_deref()
+        .unwrap_or("markdown")
+        .to_string();
+    validate_body_format(&body_format)?;
+    let contribution_body = trim_required(&body.body, "body")?;
+    let envelope = state.artifact_operations;
+    let db = state.db.clone();
+    let context_for_db = context.clone();
+    let workflow_run_id_for_response = workflow_run_id.clone();
+    let (actor, write) = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        let artifact = db::get_artifact_summary(&conn, &ident, &artifact_id)?
+            .ok_or_else(|| anyhow::anyhow!("artifact not found"))?;
+        if artifact.kind != "design_review" {
+            anyhow::bail!("artifact is not a design_review");
+        }
+        let actor = resolve_artifact_actor(
+            &conn,
+            &context_for_db.actor,
+            body.actor_display_name.as_deref(),
+        )?;
+        let run = validate_workflow_run_for_mutation(&conn, &artifact_id, Some(&workflow_run_id))?
+            .ok_or_else(|| anyhow::anyhow!("workflow run not found"))?;
+        if run.workflow_kind != "design_review_round" {
+            anyhow::bail!("workflow run is not a design_review_round");
+        }
+        let reviewed_version_id = body
+            .reviewed_version_id
+            .as_deref()
+            .or(run.source_artifact_version_id.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("reviewed version required"))?
+            .to_string();
+        let read_set = body
+            .read_set
+            .unwrap_or_else(|| read_set_for_reviewed_version(&reviewed_version_id));
+        validate_design_review_phase(&phase, Some(&read_set)).map_err(|e| anyhow::anyhow!(e.1))?;
+        let write = db::add_artifact_contribution(
+            &conn,
+            &envelope,
+            &db::ArtifactContributionInsert {
+                artifact_id: &artifact_id,
+                target_kind: "artifact_version",
+                target_id: &reviewed_version_id,
+                contribution_kind: "review",
+                phase: Some(&phase),
+                role: &role,
+                actor_id: &actor.actor_id,
+                workflow_run_id: Some(&workflow_run_id),
+                read_set: Some(&read_set),
+                body_format: &body_format,
+                body: &contribution_body,
+                idempotency_key: Some(&context_for_db.idempotency_key),
+            },
+        )?;
+        db::append_workflow_run_outputs(
+            &conn,
+            &workflow_run_id,
+            Some(&write.record.contribution_id),
+            None,
+        )?;
+        Ok::<_, anyhow::Error>((actor, write))
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    Ok(finalize_mutation(
+        actor,
+        &context,
+        authorization,
+        serde_json::json!({
+            "contribution_id": write.record.contribution_id,
+            "workflow_run_id": workflow_run_id_for_response,
+        }),
+        write.warnings,
+        write.replayed,
+        write.record,
+    ))
+}
+
+pub async fn create_design_review_synthesis_handler(
+    State(state): State<AppState>,
+    Path((ident, artifact_id, workflow_run_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<DesignReviewSynthesisRequest>,
+) -> Result<Response> {
+    let (mut context, authorization) = begin_artifact_mutation(
+        &state,
+        &headers,
+        &ident,
+        vec![
+            "contribution.write",
+            "artifact_version.create",
+            "artifact.write",
+        ],
+    )?;
+    context.workflow_run_id = Some(workflow_run_id.clone());
+    validate_synthesis_read_set(&body.read_set)?;
+    let body_format = body
+        .body_format
+        .as_deref()
+        .unwrap_or("markdown")
+        .to_string();
+    validate_body_format(&body_format)?;
+    let synthesis_body = trim_required(&body.body, "body")?;
+    let should_create_version = body.create_version.unwrap_or(true);
+    let envelope = state.artifact_operations;
+    let db = state.db.clone();
+    let context_for_db = context.clone();
+    let workflow_run_id_for_response = workflow_run_id.clone();
+    let (actor, contribution_write, version_write, artifact) = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        let artifact = db::get_artifact_summary(&conn, &ident, &artifact_id)?
+            .ok_or_else(|| anyhow::anyhow!("artifact not found"))?;
+        if artifact.kind != "design_review" {
+            anyhow::bail!("artifact is not a design_review");
+        }
+        let actor = resolve_artifact_actor(
+            &conn,
+            &context_for_db.actor,
+            body.actor_display_name.as_deref(),
+        )?;
+        let run = validate_workflow_run_for_mutation(&conn, &artifact_id, Some(&workflow_run_id))?
+            .ok_or_else(|| anyhow::anyhow!("workflow run not found"))?;
+        if run.workflow_kind != "design_review_round" {
+            anyhow::bail!("workflow run is not a design_review_round");
+        }
+        let reviewed_version_id = body
+            .reviewed_version_id
+            .as_deref()
+            .or(run.source_artifact_version_id.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("reviewed version required"))?
+            .to_string();
+        let contribution_write = db::add_artifact_contribution(
+            &conn,
+            &envelope,
+            &db::ArtifactContributionInsert {
+                artifact_id: &artifact_id,
+                target_kind: "artifact_version",
+                target_id: &reviewed_version_id,
+                contribution_kind: "synthesis",
+                phase: Some("synthesis"),
+                role: "analyst",
+                actor_id: &actor.actor_id,
+                workflow_run_id: Some(&workflow_run_id),
+                read_set: Some(&body.read_set),
+                body_format: &body_format,
+                body: &synthesis_body,
+                idempotency_key: Some(&context_for_db.idempotency_key),
+            },
+        )?;
+        let version_write = if should_create_version {
+            let version_key = format!("{}:synthesis-version", context_for_db.idempotency_key);
+            let payload = serde_json::json!({
+                "workflow": "design_review_synthesis",
+                "round_id": run.round_id,
+                "source_artifact_version_id": reviewed_version_id,
+                "synthesis_contribution_id": contribution_write.record.contribution_id,
+                "read_set": body.read_set,
+            });
+            Some(db::create_artifact_version(
+                &conn,
+                &envelope,
+                &db::ArtifactVersionInsert {
+                    artifact_id: &artifact_id,
+                    version_label: body.version_label.as_deref(),
+                    parent_version_id: Some(&reviewed_version_id),
+                    body_format: &body_format,
+                    body: Some(&synthesis_body),
+                    structured_payload: Some(&payload),
+                    source_format: None,
+                    created_by_actor_id: &actor.actor_id,
+                    created_via_workflow_run_id: Some(&workflow_run_id),
+                    version_state: "draft",
+                    idempotency_key: Some(&version_key),
+                },
+            )?)
+        } else {
+            None
+        };
+        db::append_workflow_run_outputs(
+            &conn,
+            &workflow_run_id,
+            Some(&contribution_write.record.contribution_id),
+            version_write
+                .as_ref()
+                .map(|write| write.record.artifact_version_id.as_str()),
+        )?;
+        let artifact = db::update_artifact(
+            &conn,
+            &ident,
+            &artifact_id,
+            &db::ArtifactUpdate {
+                review_state: Some("needs_user_decision"),
+                ..Default::default()
+            },
+            &envelope,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("artifact not found"))?;
+        Ok::<_, anyhow::Error>((actor, contribution_write, version_write, artifact))
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    let mut warnings = contribution_write.warnings;
+    if let Some(version) = &version_write {
+        warnings.extend(version.warnings.clone());
+    }
+    Ok(finalize_mutation(
+        actor,
+        &context,
+        authorization,
+        serde_json::json!({
+            "contribution_id": contribution_write.record.contribution_id,
+            "artifact_version_id": version_write.as_ref().map(|write| write.record.artifact_version_id.clone()),
+            "workflow_run_id": workflow_run_id_for_response,
+        }),
+        warnings,
+        contribution_write.replayed && version_write.as_ref().is_some_and(|write| write.replayed),
+        serde_json::json!({
+            "contribution": contribution_write.record,
+            "version": version_write.map(|write| write.record),
+            "artifact": artifact,
+        }),
+    ))
+}
+
+pub async fn update_design_review_state_handler(
+    State(state): State<AppState>,
+    Path((ident, artifact_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<DesignReviewStateRequest>,
+) -> Result<Response> {
+    let (context, authorization) = begin_artifact_mutation(
+        &state,
+        &headers,
+        &ident,
+        vec!["artifact.write", "contribution.write"],
+    )?;
+    if body.lifecycle_state.is_none() && body.review_state.is_none() {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "state_required".to_string(),
+        ));
+    }
+    let note = body
+        .note
+        .unwrap_or_else(|| "design review state transition".to_string());
+    let envelope = state.artifact_operations;
+    let db = state.db.clone();
+    let context_for_db = context.clone();
+    let workflow_run_id_for_response = context.workflow_run_id.clone();
+    let (actor, artifact, contribution) = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        let artifact = db::get_artifact_summary(&conn, &ident, &artifact_id)?
+            .ok_or_else(|| anyhow::anyhow!("artifact not found"))?;
+        if artifact.kind != "design_review" {
+            anyhow::bail!("artifact is not a design_review");
+        }
+        let actor = resolve_artifact_actor(
+            &conn,
+            &context_for_db.actor,
+            body.actor_display_name.as_deref(),
+        )?;
+        let run = validate_workflow_run_for_mutation(
+            &conn,
+            &artifact_id,
+            context_for_db.workflow_run_id.as_deref(),
+        )?;
+        let contribution = db::add_artifact_contribution(
+            &conn,
+            &envelope,
+            &db::ArtifactContributionInsert {
+                artifact_id: &artifact_id,
+                target_kind: "artifact",
+                target_id: &artifact_id,
+                contribution_kind: "state_transition",
+                phase: Some("state_transition"),
+                role: "coordinator",
+                actor_id: &actor.actor_id,
+                workflow_run_id: context_for_db.workflow_run_id.as_deref(),
+                read_set: None,
+                body_format: "markdown",
+                body: &note,
+                idempotency_key: Some(&context_for_db.idempotency_key),
+            },
+        )?;
+        if let Some(run) = run.as_ref() {
+            db::append_workflow_run_outputs(
+                &conn,
+                &run.workflow_run_id,
+                Some(&contribution.record.contribution_id),
+                None,
+            )?;
+        }
+        let artifact = db::update_artifact(
+            &conn,
+            &ident,
+            &artifact_id,
+            &db::ArtifactUpdate {
+                lifecycle_state: body.lifecycle_state.as_deref(),
+                review_state: body.review_state.as_deref(),
+                ..Default::default()
+            },
+            &envelope,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("artifact not found"))?;
+        Ok::<_, anyhow::Error>((actor, artifact, contribution))
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    Ok(finalize_mutation(
+        actor,
+        &context,
+        authorization,
+        serde_json::json!({
+            "artifact_id": artifact.artifact_id,
+            "contribution_id": contribution.record.contribution_id,
+            "workflow_run_id": workflow_run_id_for_response,
+        }),
+        contribution.warnings,
+        contribution.replayed,
+        serde_json::json!({
+            "artifact": artifact,
+            "contribution": contribution.record,
+        }),
+    ))
+}
+
+pub async fn list_design_review_contributions_handler(
+    State(state): State<AppState>,
+    Path((ident, artifact_id)): Path<(String, String)>,
+    Query(query): Query<ListDesignReviewContributionsQuery>,
+    headers: HeaderMap,
+) -> Result<Json<ArtifactReadResponse<Vec<db::ArtifactContribution>>>> {
+    require_artifact_read(&state, &headers, &ident)?;
+    let db = state.db.clone();
+    let contributions = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::list_design_review_contributions(
+            &conn,
+            &ident,
+            &artifact_id,
+            &db::DesignReviewContributionFilters {
+                round_id: query.round_id.as_deref(),
+                phase: query.phase.as_deref(),
+                role: query.role.as_deref(),
+                reviewed_version_id: query.reviewed_version_id.as_deref(),
+                read_set_contains: query.read_set_contains.as_deref(),
+            },
+        )
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    Ok(Json(ArtifactReadResponse {
+        data: contributions,
+        chunking_status: ChunkingStatus {
+            status: "none",
+            current_chunk_count: 0,
+            stale_chunk_count: 0,
+            superseded_chunk_count: 0,
+            failed_addresses: Vec::new(),
+        },
+    }))
+}
+
+pub async fn create_spec_handler(
+    State(state): State<AppState>,
+    Path(ident): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<SpecImportRequest>,
+) -> Result<Response> {
+    let (context, authorization) = begin_artifact_mutation(
+        &state,
+        &headers,
+        &ident,
+        vec!["artifact.write", "artifact_version.create"],
+    )?;
+    let title = trim_required(&body.title, "title")?;
+    let labels = body.labels.unwrap_or_default();
+    let payload = spec_structured_payload(
+        body.manifest,
+        body.file_bodies,
+        body.source_doc,
+        body.source_artifact_id,
+        body.source_artifact_version_id,
+    )?;
+    artifact_body_schema_allowed(&state, "markdown", Some(&payload))?;
+    let envelope = state.artifact_operations;
+    let db = state.db.clone();
+    let context_for_db = context.clone();
+    let (actor, artifact_write, version_write) = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::get_project(&conn, &ident)?.ok_or_else(|| anyhow::anyhow!("project not found"))?;
+        let actor = resolve_artifact_actor(
+            &conn,
+            &context_for_db.actor,
+            body.actor_display_name.as_deref(),
+        )?;
+        let artifact_write = db::create_artifact(
+            &conn,
+            &envelope,
+            &db::ArtifactInsert {
+                project_ident: &ident,
+                kind: "spec",
+                subkind: Some("implementation"),
+                title: &title,
+                labels: &labels,
+                created_by_actor_id: &actor.actor_id,
+            },
+        )?;
+        let version_key = format!("{}:initial-version", context_for_db.idempotency_key);
+        let version_write = db::create_artifact_version(
+            &conn,
+            &envelope,
+            &db::ArtifactVersionInsert {
+                artifact_id: &artifact_write.record.artifact_id,
+                version_label: Some("imported"),
+                parent_version_id: None,
+                body_format: "markdown",
+                body: body.body.as_deref(),
+                structured_payload: Some(&payload),
+                source_format: Some("gateway-spec-directory"),
+                created_by_actor_id: &actor.actor_id,
+                created_via_workflow_run_id: None,
+                version_state: "draft",
+                idempotency_key: Some(&version_key),
+            },
+        )?;
+        Ok::<_, anyhow::Error>((actor, artifact_write, version_write))
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    let generated = serde_json::json!({
+        "artifact_id": artifact_write.record.artifact_id,
+        "artifact_version_id": version_write.record.artifact_version_id
+    });
+    let mut warnings = artifact_write.warnings;
+    warnings.extend(version_write.warnings);
+    Ok(finalize_mutation(
+        actor,
+        &context,
+        authorization,
+        generated,
+        warnings,
+        artifact_write.replayed && version_write.replayed,
+        serde_json::json!({
+            "artifact": artifact_write.record,
+            "version": version_write.record,
+        }),
+    ))
+}
+
+pub async fn create_spec_version_handler(
+    State(state): State<AppState>,
+    Path((ident, artifact_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<SpecVersionRequest>,
+) -> Result<Response> {
+    let (context, authorization) =
+        begin_artifact_mutation(&state, &headers, &ident, vec!["artifact_version.create"])?;
+    let payload =
+        spec_structured_payload(body.manifest, body.file_bodies, body.source_doc, None, None)?;
+    artifact_body_schema_allowed(&state, "markdown", Some(&payload))?;
+    let envelope = state.artifact_operations;
+    let db = state.db.clone();
+    let context_for_db = context.clone();
+    let workflow_run_id_for_response = context.workflow_run_id.clone();
+    let (actor, write) = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        let artifact = db::get_artifact_summary(&conn, &ident, &artifact_id)?
+            .ok_or_else(|| anyhow::anyhow!("artifact not found"))?;
+        if artifact.kind != "spec" {
+            anyhow::bail!("artifact is not a spec");
+        }
+        let actor = resolve_artifact_actor(
+            &conn,
+            &context_for_db.actor,
+            body.actor_display_name.as_deref(),
+        )?;
+        let run = validate_workflow_run_for_mutation(
+            &conn,
+            &artifact_id,
+            context_for_db.workflow_run_id.as_deref(),
+        )?;
+        let result = db::create_artifact_version(
+            &conn,
+            &envelope,
+            &db::ArtifactVersionInsert {
+                artifact_id: &artifact_id,
+                version_label: body.version_label.as_deref(),
+                parent_version_id: body.parent_version_id.as_deref(),
+                body_format: "markdown",
+                body: body.body.as_deref(),
+                structured_payload: Some(&payload),
+                source_format: Some("gateway-spec-directory"),
+                created_by_actor_id: &actor.actor_id,
+                created_via_workflow_run_id: context_for_db.workflow_run_id.as_deref(),
+                version_state: "draft",
+                idempotency_key: Some(&context_for_db.idempotency_key),
+            },
+        )?;
+        complete_resumed_run(
+            &conn,
+            run.as_ref(),
+            None,
+            Some(result.record.artifact_version_id.clone()),
+            None,
+        )?;
+        Ok::<_, anyhow::Error>((actor, result))
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    Ok(finalize_mutation(
+        actor,
+        &context,
+        authorization,
+        serde_json::json!({
+            "artifact_version_id": write.record.artifact_version_id,
+            "workflow_run_id": workflow_run_id_for_response,
+        }),
+        write.warnings,
+        write.replayed,
+        write.record,
+    ))
+}
+
+pub async fn accept_spec_version_handler(
+    State(state): State<AppState>,
+    Path((ident, artifact_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<SpecAcceptRequest>,
+) -> Result<Response> {
+    let (context, authorization) = begin_artifact_mutation(
+        &state,
+        &headers,
+        &ident,
+        vec!["artifact_version.accept", "artifact.write"],
+    )?;
+    let version_id = trim_required(&body.version_id, "version_id")?;
+    let db = state.db.clone();
+    let context_for_db = context.clone();
+    let version_id_for_response = version_id.clone();
+    let (actor, contribution) = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        let artifact = db::get_artifact_summary(&conn, &ident, &artifact_id)?
+            .ok_or_else(|| anyhow::anyhow!("artifact not found"))?;
+        if artifact.kind != "spec" {
+            anyhow::bail!("artifact is not a spec");
+        }
+        let actor = resolve_artifact_actor(
+            &conn,
+            &context_for_db.actor,
+            body.actor_display_name.as_deref(),
+        )?;
+        validate_workflow_run_for_mutation(
+            &conn,
+            &artifact_id,
+            context_for_db.workflow_run_id.as_deref(),
+        )?;
+        let contribution = db::accept_artifact_version(
+            &conn,
+            &ident,
+            &artifact_id,
+            &version_id,
+            &actor.actor_id,
+            context_for_db.workflow_run_id.as_deref(),
+            Some(&context_for_db.idempotency_key),
+        )?;
+        Ok::<_, anyhow::Error>((actor, contribution))
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    Ok(finalize_ok_mutation(
+        actor,
+        &context,
+        authorization,
+        serde_json::json!({
+            "artifact_version_id": version_id_for_response,
+            "contribution_id": contribution.contribution_id,
+        }),
+        Vec::new(),
+        contribution,
+    ))
+}
+
+pub async fn get_spec_manifest_handler(
+    State(state): State<AppState>,
+    Path((ident, artifact_id)): Path<(String, String)>,
+    Query(query): Query<SpecManifestQuery>,
+    headers: HeaderMap,
+) -> Result<Json<ArtifactReadResponse<SpecManifestResponse>>> {
+    require_artifact_read(&state, &headers, &ident)?;
+    let db = state.db.clone();
+    let response = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        let detail = db::get_artifact(&conn, &ident, &artifact_id)?
+            .ok_or_else(|| anyhow::anyhow!("artifact not found"))?;
+        if detail.artifact.kind != "spec" {
+            anyhow::bail!("artifact is not a spec");
+        }
+        let version = if let Some(version_id) = query.version_id {
+            db::get_artifact_version(&conn, &ident, &artifact_id, &version_id)?
+                .ok_or_else(|| anyhow::anyhow!("version not found"))?
+        } else {
+            detail
+                .accepted_version
+                .or(detail.current_version)
+                .ok_or_else(|| anyhow::anyhow!("spec version not found"))?
+        };
+        spec_manifest_from_version(&artifact_id, &version).map_err(|err| anyhow::anyhow!(err.1))
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    Ok(Json(ArtifactReadResponse {
+        data: response,
+        chunking_status: ChunkingStatus {
+            status: "none",
+            current_chunk_count: 0,
+            stale_chunk_count: 0,
+            superseded_chunk_count: 0,
+            failed_addresses: Vec::new(),
+        },
+    }))
+}
+
+pub async fn get_spec_manifest_item_handler(
+    State(state): State<AppState>,
+    Path((ident, artifact_id, manifest_item_id)): Path<(String, String, String)>,
+    Query(query): Query<SpecManifestQuery>,
+    headers: HeaderMap,
+) -> Result<Json<ArtifactReadResponse<SpecManifestItem>>> {
+    let manifest = get_spec_manifest_handler(
+        State(state),
+        Path((ident, artifact_id)),
+        Query(query),
+        headers,
+    )
+    .await?
+    .0
+    .data;
+    let item = manifest
+        .items
+        .into_iter()
+        .find(|item| item.manifest_item_id == manifest_item_id)
+        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "manifest_item not found".to_string()))?;
+    Ok(Json(ArtifactReadResponse {
+        data: item,
+        chunking_status: ChunkingStatus {
+            status: "none",
+            current_chunk_count: 0,
+            stale_chunk_count: 0,
+            superseded_chunk_count: 0,
+            failed_addresses: Vec::new(),
+        },
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn link_task_to_spec_item(
+    conn: &rusqlite::Connection,
+    envelope: &db::ArtifactOperationsEnvelope,
+    actor_id: &str,
+    workflow_run_id: &str,
+    source_version_id: &str,
+    manifest_item_id: &str,
+    task_id: &str,
+) -> anyhow::Result<db::ArtifactWriteResult<db::ArtifactLink>> {
+    let child_address = format!("manifest.items[{manifest_item_id}]");
+    db::create_artifact_link(
+        conn,
+        envelope,
+        &db::ArtifactLinkInsert {
+            link_type: "task_generated_from_spec",
+            source_kind: "artifact_version",
+            source_id: source_version_id,
+            source_version_id: Some(source_version_id),
+            source_child_address: Some(&child_address),
+            target_kind: "task",
+            target_id: task_id,
+            target_version_id: Some(source_version_id),
+            target_child_address: None,
+            created_by_actor_id: actor_id,
+            created_via_workflow_run_id: Some(workflow_run_id),
+            idempotency_key: Some(&item_generation_key(source_version_id, manifest_item_id)),
+            supersedes_link_id: None,
+        },
+    )
+}
+
+pub async fn generate_spec_tasks_handler(
+    State(state): State<AppState>,
+    Path((ident, artifact_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<GenerateSpecTasksRequest>,
+) -> Result<Response> {
+    let (context, authorization) = begin_artifact_mutation(
+        &state,
+        &headers,
+        &ident,
+        vec![
+            "task.generate_from_spec",
+            "workflow_run.start",
+            "link.write",
+        ],
+    )?;
+    if !body.confirmed {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "task_generation_confirmation_required".to_string(),
+        ));
+    }
+    let envelope = state.artifact_operations;
+    let db = state.db.clone();
+    let context_for_db = context.clone();
+    let (actor, output) = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        let detail = db::get_artifact(&conn, &ident, &artifact_id)?
+            .ok_or_else(|| anyhow::anyhow!("artifact not found"))?;
+        if detail.artifact.kind != "spec" {
+            anyhow::bail!("artifact is not a spec");
+        }
+        let accepted = detail
+            .accepted_version
+            .ok_or_else(|| anyhow::anyhow!("accepted spec version required"))?;
+        let manifest = spec_manifest_from_version(&artifact_id, &accepted)
+            .map_err(|err| anyhow::anyhow!(err.1))?;
+        let selected: std::collections::BTreeSet<String> = body
+            .manifest_item_ids
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let actor = resolve_artifact_actor(
+            &conn,
+            &context_for_db.actor,
+            body.actor_display_name.as_deref(),
+        )?;
+        let read_set = serde_json::json!({
+            "artifact_version_ids": [accepted.artifact_version_id.clone()]
+        });
+        let run_write = db::start_workflow_run(
+            &conn,
+            &envelope,
+            &db::WorkflowRunInsert {
+                artifact_id: &artifact_id,
+                workflow_kind: "spec_task_generation",
+                phase: Some("generate_tasks"),
+                round_id: None,
+                coordinator_actor_id: &actor.actor_id,
+                participant_actor_ids: &[],
+                source_artifact_version_id: Some(&accepted.artifact_version_id),
+                read_set: Some(&read_set),
+                idempotency_key: Some(&context_for_db.idempotency_key),
+                is_resumable: true,
+            },
+        )?;
+        ensure_workflow_run_retryable(&run_write.record)?;
+
+        let mut task_ids = run_write.record.generated_task_ids.clone();
+        let mut link_ids = run_write.record.generated_link_ids.clone();
+        let mut item_outputs = Vec::new();
+        let reporter = body
+            .reporter
+            .as_deref()
+            .unwrap_or(&context_for_db.actor.agent_id)
+            .to_string();
+        for item in manifest.items {
+            if !selected.is_empty() && !selected.contains(&item.manifest_item_id) {
+                continue;
+            }
+            let child_address = format!("manifest.items[{}]", item.manifest_item_id);
+            let existing_link = db::list_artifact_links(
+                &conn,
+                &ident,
+                &db::ArtifactLinkFilters {
+                    link_type: Some("task_generated_from_spec"),
+                    source_kind: Some("artifact_version"),
+                    source_id: Some(&accepted.artifact_version_id),
+                    target_kind: Some("task"),
+                    target_id: None,
+                },
+            )?
+            .into_iter()
+            .find(|link| link.source_child_address.as_deref() == Some(child_address.as_str()));
+            if let Some(link) = existing_link {
+                if !task_ids.contains(&link.target_id) {
+                    task_ids.push(link.target_id.clone());
+                }
+                if !link_ids.contains(&link.link_id) {
+                    link_ids.push(link.link_id.clone());
+                }
+                item_outputs.push(serde_json::json!({
+                    "manifest_item_id": item.manifest_item_id,
+                    "task_id": link.target_id,
+                    "link_id": link.link_id,
+                    "reused": true
+                }));
+                continue;
+            }
+
+            let task = if let Some(task_id) = item.gateway_task_id.as_deref() {
+                db::get_task_detail(&conn, &ident, task_id)?.map(|detail| detail.task)
+            } else {
+                db::find_task_by_spec_source(
+                    &conn,
+                    &ident,
+                    &artifact_id,
+                    &accepted.artifact_version_id,
+                    &item.manifest_item_id,
+                )?
+            };
+            let task = match task {
+                Some(task) => task,
+                None => {
+                    let mut labels = item.labels.clone();
+                    if !labels.iter().any(|label| label == "generated-from-spec") {
+                        labels.push("generated-from-spec".to_string());
+                    }
+                    if let Some(team) = &item.team {
+                        labels.push(team.clone());
+                    }
+                    db::insert_task(
+                        &conn,
+                        &ident,
+                        &generated_spec_task_title(&item),
+                        Some(&format!(
+                            "Generated from spec artifact {} version {} manifest item {}.",
+                            artifact_id, accepted.artifact_version_id, item.manifest_item_id
+                        )),
+                        Some(&generated_task_specification(
+                            &artifact_id,
+                            &accepted.artifact_version_id,
+                            &item,
+                        )),
+                        &labels,
+                        body.hostname.as_deref(),
+                        &reporter,
+                    )?
+                }
+            };
+            let link = link_task_to_spec_item(
+                &conn,
+                &envelope,
+                &actor.actor_id,
+                &run_write.record.workflow_run_id,
+                &accepted.artifact_version_id,
+                &item.manifest_item_id,
+                &task.id,
+            )?;
+            db::insert_comment(
+                &conn,
+                &task.id,
+                "system",
+                "system",
+                &format!(
+                    "Generated from spec artifact `{}` accepted version `{}` manifest item `{}`. Compatibility fallback: the current task schema has no dedicated source fields, so the source tuple is embedded in this task's specification/details and mirrored by artifact link `{}`.",
+                    artifact_id,
+                    accepted.artifact_version_id,
+                    item.manifest_item_id,
+                    link.record.link_id
+                ),
+            )?;
+            if !task_ids.contains(&task.id) {
+                task_ids.push(task.id.clone());
+            }
+            if !link_ids.contains(&link.record.link_id) {
+                link_ids.push(link.record.link_id.clone());
+            }
+            item_outputs.push(serde_json::json!({
+                "manifest_item_id": item.manifest_item_id,
+                "task_id": task.id,
+                "link_id": link.record.link_id,
+                "reused": false
+            }));
+        }
+        let updated_run = db::update_workflow_run(
+            &conn,
+            &run_write.record.workflow_run_id,
+            &db::WorkflowRunUpdate {
+                state: Some("succeeded"),
+                failure_reason: Some(None),
+                generated_contribution_ids: Some(&run_write.record.generated_contribution_ids),
+                generated_version_ids: Some(&run_write.record.generated_version_ids),
+                generated_task_ids: Some(&task_ids),
+                generated_link_ids: Some(&link_ids),
+                generated_chunk_ids: Some(&run_write.record.generated_chunk_ids),
+                ended_at: None,
+            },
+        )?
+        .ok_or_else(|| anyhow::anyhow!("workflow_run not found"))?;
+        Ok::<_, anyhow::Error>((
+            actor,
+            GenerateSpecTasksResponse {
+                artifact_id,
+                artifact_version_id: accepted.artifact_version_id,
+                workflow_run_id: updated_run.workflow_run_id,
+                generated_task_ids: task_ids,
+                generated_link_ids: link_ids,
+                items: item_outputs,
+                replayed: run_write.replayed,
+            },
+        ))
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    Ok(finalize_mutation(
+        actor,
+        &context,
+        authorization,
+        serde_json::json!({
+            "workflow_run_id": output.workflow_run_id,
+            "generated_task_ids": output.generated_task_ids.clone(),
+            "generated_link_ids": output.generated_link_ids.clone(),
+        }),
+        Vec::new(),
+        output.replayed,
+        output,
+    ))
+}
+
+pub async fn link_existing_spec_task_handler(
+    State(state): State<AppState>,
+    Path((ident, artifact_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<LinkSpecTaskRequest>,
+) -> Result<Response> {
+    let (context, authorization) = begin_artifact_mutation(
+        &state,
+        &headers,
+        &ident,
+        vec![
+            "task.generate_from_spec",
+            "workflow_run.start",
+            "link.write",
+        ],
+    )?;
+    let manifest_item_id = trim_required(&body.manifest_item_id, "manifest_item_id")?;
+    let task_id = trim_required(&body.task_id, "task_id")?;
+    let envelope = state.artifact_operations;
+    let db = state.db.clone();
+    let context_for_db = context.clone();
+    let (actor, link) = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        let detail = db::get_artifact(&conn, &ident, &artifact_id)?
+            .ok_or_else(|| anyhow::anyhow!("artifact not found"))?;
+        if detail.artifact.kind != "spec" {
+            anyhow::bail!("artifact is not a spec");
+        }
+        db::get_task_detail(&conn, &ident, &task_id)?
+            .ok_or_else(|| anyhow::anyhow!("task not found"))?;
+        let version = if let Some(version_id) = body.version_id {
+            db::get_artifact_version(&conn, &ident, &artifact_id, &version_id)?
+                .ok_or_else(|| anyhow::anyhow!("version not found"))?
+        } else {
+            detail
+                .accepted_version
+                .ok_or_else(|| anyhow::anyhow!("accepted spec version required"))?
+        };
+        let manifest = spec_manifest_from_version(&artifact_id, &version)
+            .map_err(|err| anyhow::anyhow!(err.1))?;
+        if !manifest
+            .items
+            .iter()
+            .any(|item| item.manifest_item_id == manifest_item_id)
+        {
+            anyhow::bail!("manifest_item not found");
+        }
+        let actor = resolve_artifact_actor(
+            &conn,
+            &context_for_db.actor,
+            body.actor_display_name.as_deref(),
+        )?;
+        let read_set = serde_json::json!({
+            "artifact_version_ids": [version.artifact_version_id.clone()]
+        });
+        let run_write = db::start_workflow_run(
+            &conn,
+            &envelope,
+            &db::WorkflowRunInsert {
+                artifact_id: &artifact_id,
+                workflow_kind: "spec_task_generation",
+                phase: Some("link_existing_task"),
+                round_id: None,
+                coordinator_actor_id: &actor.actor_id,
+                participant_actor_ids: &[],
+                source_artifact_version_id: Some(&version.artifact_version_id),
+                read_set: Some(&read_set),
+                idempotency_key: Some(&context_for_db.idempotency_key),
+                is_resumable: true,
+            },
+        )?;
+        ensure_workflow_run_retryable(&run_write.record)?;
+        let link = link_task_to_spec_item(
+            &conn,
+            &envelope,
+            &actor.actor_id,
+            &run_write.record.workflow_run_id,
+            &version.artifact_version_id,
+            &manifest_item_id,
+            &task_id,
+        )?;
+        let mut task_ids = run_write.record.generated_task_ids;
+        let mut link_ids = run_write.record.generated_link_ids;
+        if !task_ids.contains(&task_id) {
+            task_ids.push(task_id.clone());
+        }
+        if !link_ids.contains(&link.record.link_id) {
+            link_ids.push(link.record.link_id.clone());
+        }
+        db::update_workflow_run(
+            &conn,
+            &run_write.record.workflow_run_id,
+            &db::WorkflowRunUpdate {
+                state: Some("succeeded"),
+                failure_reason: Some(None),
+                generated_contribution_ids: Some(&run_write.record.generated_contribution_ids),
+                generated_version_ids: Some(&run_write.record.generated_version_ids),
+                generated_task_ids: Some(&task_ids),
+                generated_link_ids: Some(&link_ids),
+                generated_chunk_ids: Some(&run_write.record.generated_chunk_ids),
+                ended_at: None,
+            },
+        )?;
+        Ok::<_, anyhow::Error>((actor, link))
+    })
+    .await
+    .map_err(AppError::from)?
+    .map_err(map_db_error)?;
+    Ok(finalize_mutation(
+        actor,
+        &context,
+        authorization,
+        generated_resource("link_id", link.record.link_id.clone()),
+        link.warnings,
+        link.replayed,
+        link.record,
+    ))
 }
 
 // ── Theme (GET/POST /theme) ──────────────────────────────────────────────────
@@ -504,6 +4208,10 @@ pub struct ListApiDocsQuery {
     pub app: Option<String>,
     pub label: Option<String>,
     pub kind: Option<String>,
+    #[serde(default)]
+    pub include_history: bool,
+    #[serde(default)]
+    pub envelope: bool,
 }
 
 #[derive(Deserialize)]
@@ -870,12 +4578,27 @@ pub async fn list_api_doc_chunks_handler(
     State(state): State<AppState>,
     Path(ident): Path<String>,
     Query(q): Query<ListApiDocsQuery>,
-) -> Result<Json<Vec<ApiDocChunk>>> {
+) -> Result<Response> {
     let db = state.db.clone();
-    let (project_exists, chunks) = spawn_blocking(move || {
+    let envelope = q.envelope;
+    let (project_exists, chunk_list) = spawn_blocking(move || {
         let conn = db.lock().unwrap();
         if db::get_project(&conn, &ident)?.is_none() {
-            return Ok::<_, anyhow::Error>((false, Vec::new()));
+            return Ok::<_, anyhow::Error>((
+                false,
+                db::ApiDocChunkList {
+                    chunks: Vec::new(),
+                    chunking_status: db::ApiDocChunkingStatus {
+                        status: "none".to_string(),
+                        current_chunk_count: 0,
+                        stale_chunk_count: 0,
+                        superseded_chunk_count: 0,
+                        failed_addresses: Vec::new(),
+                    },
+                    retrieval_scope: "current".to_string(),
+                    include_history: false,
+                },
+            ));
         }
         let filters = db::ApiDocFilters {
             query: q.q.as_deref(),
@@ -883,13 +4606,7 @@ pub async fn list_api_doc_chunks_handler(
             label: q.label.as_deref(),
             kind: q.kind.as_deref(),
         };
-        let docs = db::list_api_docs(&conn, &ident, &filters)?;
-        let mut chunks = Vec::new();
-        for summary in docs {
-            if let Some(doc) = db::get_api_doc(&conn, &ident, &summary.id)? {
-                chunks.extend(api_doc_chunks(&doc));
-            }
-        }
+        let chunks = db::list_api_doc_chunks(&conn, &ident, &filters, q.include_history)?;
         Ok::<_, anyhow::Error>((true, chunks))
     })
     .await??;
@@ -899,7 +4616,11 @@ pub async fn list_api_doc_chunks_handler(
             "project not found".to_string(),
         ));
     }
-    Ok(Json(chunks))
+    if envelope {
+        Ok(Json(chunk_list).into_response())
+    } else {
+        Ok(Json(chunk_list.chunks).into_response())
+    }
 }
 
 // ── POST /v1/projects ─────────────────────────────────────────────────────────
@@ -1884,6 +5605,32 @@ fn he(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+fn truncate_text(s: &str, max_chars: usize) -> String {
+    let mut out = s.chars().take(max_chars).collect::<String>();
+    if s.chars().count() > max_chars {
+        out.push_str("...");
+    }
+    out
+}
+
+fn empty_table_rows(rows: String, colspan: usize) -> String {
+    if rows.is_empty() {
+        format!(
+            r#"<tr><td colspan="{colspan}" class="nd-text-center nd-text-muted">No records.</td></tr>"#
+        )
+    } else {
+        rows
+    }
+}
+
+fn artifact_auth_signal(state: &AppState) -> &'static str {
+    if state.artifact_auth_enforced {
+        "Authorization: project-scoped"
+    } else {
+        "Authorization: trusted-single-tenant"
+    }
+}
+
 fn path_segment(s: &str) -> String {
     let mut out = String::new();
     for &b in s.as_bytes() {
@@ -2292,6 +6039,588 @@ pub async fn api_doc_detail_page(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
         head = control_panel_head("agent-gateway - API doc", &theme, ""),
         open = control_panel_open(&page_title, "api-docs"),
+        content = content,
+        close = control_panel_close(&state.api_key),
+    );
+    Ok(Html(html))
+}
+
+pub async fn artifacts_index_page(State(state): State<AppState>) -> Result<Html<String>> {
+    let db = state.db.clone();
+    let (theme, projects) = spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = db.lock().unwrap();
+        Ok((db::get_theme(&conn)?, db::list_project_stats(&conn)?))
+    })
+    .await??;
+
+    let rows = if projects.is_empty() {
+        r#"<tr><td colspan="5" class="nd-text-center nd-text-muted">No projects registered.</td></tr>"#
+            .to_string()
+    } else {
+        projects
+            .iter()
+            .map(|project| {
+                format!(
+                    r#"<tr>
+  <td><a class="nd-btn-ghost nd-text-left" href="/projects/{ident}/artifacts"><strong>{ident}</strong></a></td>
+  <td>{api_docs}</td>
+  <td>{tasks}</td>
+  <td>{messages}</td>
+  <td><a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/artifacts">Open workspace</a></td>
+</tr>"#,
+                    ident = he(&project.ident),
+                    api_docs = project.api_doc_count,
+                    tasks = "—",
+                    messages = project.total_messages,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let content = format!(
+        r#"  <div class="nd-alert nd-mb-md">{auth_signal}</div>
+
+  <section class="nd-card">
+    <div class="nd-card-header"><strong>Artifact Workspaces</strong></div>
+    <div class="nd-card-body nd-p-0">
+      <table class="nd-table nd-table-hover">
+        <thead><tr><th>Project</th><th>API docs</th><th>Tasks</th><th>Messages</th><th></th></tr></thead>
+        <tbody>{rows}</tbody>
+      </table>
+    </div>
+  </section>"#,
+        auth_signal = he(artifact_auth_signal(&state)),
+        rows = rows,
+    );
+
+    let html = format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
+        head = control_panel_head("agent-gateway - Artifacts", &theme, ""),
+        open = control_panel_open("Artifacts", "artifacts"),
+        content = content,
+        close = control_panel_close(&state.api_key),
+    );
+    Ok(Html(html))
+}
+
+pub async fn artifact_workspace_page(
+    State(state): State<AppState>,
+    Path(ident): Path<String>,
+    Query(query): Query<ArtifactWorkspaceQuery>,
+) -> Result<Html<String>> {
+    let db = state.db.clone();
+    let ident_for_lookup = ident.clone();
+    let kind = query.kind.clone();
+    let status = query.status.clone();
+    let label = query.label.clone();
+    let actor = query.actor.clone();
+    let q = query.q.clone();
+    let (project, artifacts, docs, theme) = spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = db.lock().unwrap();
+        let project = db::get_project(&conn, &ident_for_lookup)?;
+        let artifacts = db::list_artifacts(
+            &conn,
+            &ident_for_lookup,
+            &db::ArtifactFilters {
+                kind: kind.as_deref(),
+                subkind: None,
+                lifecycle_state: status.as_deref(),
+                label: label.as_deref(),
+                actor_id: actor.as_deref(),
+                query: q.as_deref(),
+            },
+        )?;
+        let docs = db::list_api_docs(
+            &conn,
+            &ident_for_lookup,
+            &db::ApiDocFilters {
+                query: q.as_deref(),
+                app: None,
+                label: label.as_deref(),
+                kind: None,
+            },
+        )?;
+        let theme = db::get_theme(&conn)?;
+        Ok((project, artifacts, docs, theme))
+    })
+    .await??;
+
+    let project = project.ok_or_else(|| {
+        AppError(
+            StatusCode::NOT_FOUND,
+            format!("project '{}' not found", ident),
+        )
+    })?;
+    let ident_attr = he(&project.ident);
+    let artifacts_rows = if artifacts.is_empty() {
+        r#"<tr><td colspan="8" class="nd-text-center nd-text-muted">No artifacts match these filters.</td></tr>"#.to_string()
+    } else {
+        artifacts
+            .iter()
+            .map(|artifact| {
+                let labels = artifact
+                    .labels
+                    .iter()
+                    .map(|label| format!(r#"<span class="nd-badge nd-badge-sm">{}</span>"#, he(label)))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!(
+                    r#"<tr>
+  <td><a class="nd-btn-ghost nd-text-left" href="/projects/{ident}/artifacts/{artifact_id}"><strong>{title}</strong><div class="nd-text-xs nd-text-muted">{artifact_id}</div></a></td>
+  <td>{kind}<div class="nd-text-xs nd-text-muted">{subkind}</div></td>
+  <td>{lifecycle}</td>
+  <td>{review}</td>
+  <td>{implementation}</td>
+  <td>{labels}</td>
+  <td><code>{current}</code></td>
+  <td><code>{accepted}</code></td>
+</tr>"#,
+                    ident = ident_attr,
+                    artifact_id = he(&artifact.artifact_id),
+                    title = he(&artifact.title),
+                    kind = he(&artifact.kind),
+                    subkind = he(artifact.subkind.as_deref().unwrap_or("")),
+                    lifecycle = he(&artifact.lifecycle_state),
+                    review = he(&artifact.review_state),
+                    implementation = he(&artifact.implementation_state),
+                    labels = labels,
+                    current = he(artifact.current_version_id.as_deref().unwrap_or("")),
+                    accepted = he(artifact.accepted_version_id.as_deref().unwrap_or("")),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let docs_rows = if docs.is_empty() {
+        r#"<tr><td colspan="5" class="nd-text-center nd-text-muted">No documentation contexts match these filters.</td></tr>"#.to_string()
+    } else {
+        docs.iter()
+            .map(|doc| {
+                format!(
+                    r#"<tr><td><a href="/projects/{ident}/api-docs/{id}">{app}</a></td><td>{kind}</td><td>{subkind}</td><td>{version}</td><td>{summary}</td></tr>"#,
+                    ident = ident_attr,
+                    id = he(&doc.id),
+                    app = he(&doc.app),
+                    kind = he(&doc.kind),
+                    subkind = he(&doc.subkind),
+                    version = he(doc.version.as_deref().unwrap_or("")),
+                    summary = he(doc.summary.as_deref().unwrap_or("")),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let filter_value = |value: &Option<String>| he(value.as_deref().unwrap_or(""));
+    let content = format!(
+        r#"  <div class="nd-flex nd-gap-md nd-mb-md">
+    <a class="nd-btn-secondary nd-btn-sm" href="/artifacts">All projects</a>
+    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/api-docs">API docs</a>
+    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/tasks">Tasks</a>
+  </div>
+
+  <div class="nd-alert nd-mb-md">{auth_signal}</div>
+
+  <section class="nd-card">
+    <div class="nd-card-header"><strong>Artifact filters</strong></div>
+    <div class="nd-card-body">
+      <form class="nd-grid nd-gap-sm" method="get" action="/projects/{ident}/artifacts">
+        <input class="nd-input" name="q" placeholder="Search artifacts, bodies, contributions, links, docs" value="{q}">
+        <input class="nd-input" name="kind" placeholder="kind: spec, design_review, documentation" value="{kind}">
+        <input class="nd-input" name="status" placeholder="lifecycle status" value="{status}">
+        <input class="nd-input" name="label" placeholder="label" value="{label}">
+        <input class="nd-input" name="actor" placeholder="actor id" value="{actor}">
+        <button class="nd-btn-primary" type="submit">Filter</button>
+      </form>
+    </div>
+  </section>
+
+  <section class="nd-card nd-mt-lg">
+    <div class="nd-card-header"><strong>Artifacts</strong></div>
+    <div class="nd-card-body nd-p-0">
+      <table class="nd-table nd-table-hover">
+        <thead><tr><th>Artifact</th><th>Kind</th><th>Lifecycle</th><th>Review</th><th>Implementation</th><th>Labels</th><th>Current</th><th>Accepted</th></tr></thead>
+        <tbody>{artifacts_rows}</tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="nd-card nd-mt-lg">
+    <div class="nd-card-header"><strong>Documentation browser</strong></div>
+    <div class="nd-card-body nd-p-0">
+      <table class="nd-table nd-table-hover">
+        <thead><tr><th>App</th><th>Legacy kind</th><th>Subkind</th><th>Version</th><th>Summary</th></tr></thead>
+        <tbody>{docs_rows}</tbody>
+      </table>
+    </div>
+  </section>"#,
+        ident = ident_attr,
+        q = filter_value(&query.q),
+        kind = filter_value(&query.kind),
+        status = filter_value(&query.status),
+        label = filter_value(&query.label),
+        actor = filter_value(&query.actor),
+        auth_signal = he(artifact_auth_signal(&state)),
+        artifacts_rows = artifacts_rows,
+        docs_rows = docs_rows,
+    );
+
+    let page_title = format!("Artifacts - {}", project.ident);
+    let html = format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
+        head = control_panel_head("agent-gateway - Artifacts", &theme, ""),
+        open = control_panel_open(&page_title, "artifacts"),
+        content = content,
+        close = control_panel_close(&state.api_key),
+    );
+    Ok(Html(html))
+}
+
+pub async fn artifact_detail_page(
+    State(state): State<AppState>,
+    Path((ident, artifact_id)): Path<(String, String)>,
+    Query(query): Query<ArtifactWorkspaceQuery>,
+) -> Result<Html<String>> {
+    let db = state.db.clone();
+    let ident_for_lookup = ident.clone();
+    let artifact_for_lookup = artifact_id.clone();
+    let chunk_q = query.chunk_q.clone();
+    let include_history = query.include_history.unwrap_or(false);
+    let (
+        project,
+        detail,
+        versions,
+        contributions,
+        comments,
+        links,
+        chunks,
+        review_contributions,
+        theme,
+    ) = spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = db.lock().unwrap();
+        let project = db::get_project(&conn, &ident_for_lookup)?;
+        let detail = db::get_artifact(&conn, &ident_for_lookup, &artifact_for_lookup)?;
+        let versions = db::list_artifact_versions(&conn, &ident_for_lookup, &artifact_for_lookup)?;
+        let contributions =
+            db::list_artifact_contributions(&conn, &ident_for_lookup, &artifact_for_lookup)?;
+        let comments = db::list_artifact_comments(&conn, &ident_for_lookup, &artifact_for_lookup)?;
+        let mut links = db::list_artifact_links(
+            &conn,
+            &ident_for_lookup,
+            &db::ArtifactLinkFilters::default(),
+        )?;
+        links.retain(|link| {
+            link.source_id == artifact_for_lookup
+                || link.target_id == artifact_for_lookup
+                || detail.as_ref().is_some_and(|d| {
+                    let current = d.artifact.current_version_id.as_deref();
+                    let accepted = d.artifact.accepted_version_id.as_deref();
+                    [
+                        link.source_version_id.as_deref(),
+                        link.target_version_id.as_deref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .any(|id| Some(id) == current || Some(id) == accepted)
+                })
+        });
+        let chunks = db::list_artifact_chunks(
+            &conn,
+            &ident_for_lookup,
+            &artifact_for_lookup,
+            &db::ArtifactChunkFilters {
+                artifact_version_id: None,
+                app: None,
+                label: None,
+                kind: None,
+                include_superseded: include_history,
+                query: chunk_q.as_deref(),
+            },
+        )?;
+        let review_contributions = if detail
+            .as_ref()
+            .is_some_and(|d| d.artifact.kind == "design_review")
+        {
+            db::list_design_review_contributions(
+                &conn,
+                &ident_for_lookup,
+                &artifact_for_lookup,
+                &db::DesignReviewContributionFilters::default(),
+            )?
+        } else {
+            Vec::new()
+        };
+        let theme = db::get_theme(&conn)?;
+        Ok((
+            project,
+            detail,
+            versions,
+            contributions,
+            comments,
+            links,
+            chunks,
+            review_contributions,
+            theme,
+        ))
+    })
+    .await??;
+
+    let project = project.ok_or_else(|| {
+        AppError(
+            StatusCode::NOT_FOUND,
+            format!("project '{}' not found", ident),
+        )
+    })?;
+    let detail = detail.ok_or_else(|| {
+        AppError(
+            StatusCode::NOT_FOUND,
+            format!("artifact '{}' not found", artifact_id),
+        )
+    })?;
+    let artifact = &detail.artifact;
+    let ident_attr = he(&project.ident);
+    let artifact_attr = he(&artifact.artifact_id);
+    let version_rows = versions
+        .iter()
+        .map(|version| {
+            format!(
+                r#"<tr><td><code>{id}</code></td><td>{label}</td><td>{state}</td><td>{format}</td><td><code>{parent}</code></td><td>{bytes}</td></tr>"#,
+                id = he(&version.artifact_version_id),
+                label = he(version.version_label.as_deref().unwrap_or("")),
+                state = he(&version.version_state),
+                format = he(&version.body_format),
+                parent = he(version.parent_version_id.as_deref().unwrap_or("")),
+                bytes = version.body.as_ref().map_or(0, |body| body.len()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let contribution_rows = contributions
+        .iter()
+        .map(|c| {
+            format!(
+                r#"<tr><td>{kind}</td><td>{phase}</td><td>{role}</td><td><code>{target}</code></td><td>{body}</td></tr>"#,
+                kind = he(&c.contribution_kind),
+                phase = he(c.phase.as_deref().unwrap_or("")),
+                role = he(&c.role),
+                target = he(&c.target_id),
+                body = he(&truncate_text(&c.body, 160)),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let comment_rows = comments
+        .iter()
+        .map(|c| {
+            format!(
+                r#"<tr><td>{state}</td><td>{target}</td><td>{child}</td><td>{body}</td></tr>"#,
+                state = he(&c.state),
+                target = he(&c.target_id),
+                child = he(c.child_address.as_deref().unwrap_or("")),
+                body = he(&truncate_text(&c.body, 160)),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let link_rows = links
+        .iter()
+        .map(|link| {
+            format!(
+                r#"<tr><td>{typ}</td><td>{source}</td><td>{target}</td><td><code>{source_version}</code></td><td><code>{target_version}</code></td></tr>"#,
+                typ = he(&link.link_type),
+                source = he(&format!("{}:{}", link.source_kind, link.source_id)),
+                target = he(&format!("{}:{}", link.target_kind, link.target_id)),
+                source_version = he(link.source_version_id.as_deref().unwrap_or("")),
+                target_version = he(link.target_version_id.as_deref().unwrap_or("")),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let chunk_rows = chunks
+        .iter()
+        .map(|chunk| {
+            let status = chunk
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("status").or_else(|| m.get("chunking_status")))
+                .and_then(Value::as_str)
+                .unwrap_or("ok");
+            format!(
+                r#"<tr><td><code>{address}</code></td><td>{kind}</td><td>{label}</td><td>{status}</td><td>{text}</td></tr>"#,
+                address = he(&chunk.child_address),
+                kind = he(chunk.kind.as_deref().unwrap_or("")),
+                label = he(chunk.label.as_deref().unwrap_or("")),
+                status = he(status),
+                text = he(&truncate_text(&chunk.text, 180)),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let diff_section = if let (Some(current), Some(accepted)) =
+        (&detail.current_version, &detail.accepted_version)
+    {
+        if current.artifact_version_id != accepted.artifact_version_id {
+            let diff = simple_diff(&body_text(accepted), &body_text(current));
+            format!(
+                r#"<section class="nd-card nd-mt-lg"><div class="nd-card-header"><strong>Accepted to current diff</strong></div><div class="nd-card-body"><pre><code>{}</code></pre></div></section>"#,
+                he(&diff)
+            )
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+    let spec_section = if artifact.kind == "spec" {
+        detail
+            .current_version
+            .as_ref()
+            .and_then(|version| spec_manifest_from_version(&artifact.artifact_id, version).ok())
+            .map(|manifest| {
+                let rows = manifest
+                    .items
+                    .iter()
+                    .map(|item| {
+                        format!(
+                            r#"<tr><td><code>{id}</code></td><td>{phase}</td><td>{team}</td><td>{status}</td><td>{title}</td><td>{deps}</td><td><code>{task}</code></td></tr>"#,
+                            id = he(&item.manifest_item_id),
+                            phase = he(item.phase.as_deref().unwrap_or("")),
+                            team = he(item.team.as_deref().unwrap_or("")),
+                            status = he(item.status.as_deref().unwrap_or("")),
+                            title = he(&item.title),
+                            deps = he(&item.dependencies.join(", ")),
+                            task = he(item.gateway_task_id.as_deref().unwrap_or("")),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!(
+                    r#"<section class="nd-card nd-mt-lg"><div class="nd-card-header"><strong>Spec manifest</strong></div><div class="nd-card-body nd-p-0"><table class="nd-table nd-table-hover"><thead><tr><th>Stable item</th><th>Phase</th><th>Team</th><th>Status</th><th>Title</th><th>Deps</th><th>Gateway task</th></tr></thead><tbody>{rows}</tbody></table></div></section>"#,
+                    rows = rows,
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let review_section = if artifact.kind == "design_review" {
+        let rows = review_contributions
+            .iter()
+            .map(|c| {
+                let read_set = c
+                    .read_set
+                    .as_ref()
+                    .map(Value::to_string)
+                    .unwrap_or_default();
+                format!(
+                    r#"<tr><td>{phase}</td><td>{role}</td><td><code>{run}</code></td><td>{read_set}</td><td>{body}</td></tr>"#,
+                    phase = he(c.phase.as_deref().unwrap_or("")),
+                    role = he(&c.role),
+                    run = he(c.workflow_run_id.as_deref().unwrap_or("")),
+                    read_set = he(&truncate_text(&read_set, 160)),
+                    body = he(&truncate_text(&c.body, 180)),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            r#"<section class="nd-card nd-mt-lg"><div class="nd-card-header"><strong>Review rounds</strong></div><div class="nd-card-body nd-p-0"><table class="nd-table nd-table-hover"><thead><tr><th>Phase</th><th>Role</th><th>Workflow run</th><th>Read set</th><th>Contribution</th></tr></thead><tbody>{rows}</tbody></table></div></section>"#
+        )
+    } else {
+        String::new()
+    };
+    let docs_section = if artifact.kind == "documentation" {
+        format!(
+            r#"<section class="nd-card nd-mt-lg">
+  <div class="nd-card-header"><strong>Documentation chunks</strong></div>
+  <div class="nd-card-body">
+    <form class="nd-grid nd-gap-sm" method="get" action="/projects/{ident}/artifacts/{artifact_id}">
+      <input class="nd-input" name="chunk_q" placeholder="Search chunks" value="{chunk_q}">
+      <label><input type="checkbox" name="include_history" value="true" {checked}> Include superseded/history chunks</label>
+      <button class="nd-btn-secondary" type="submit">Search chunks</button>
+    </form>
+  </div>
+  <div class="nd-card-body nd-p-0"><table class="nd-table nd-table-hover"><thead><tr><th>Address</th><th>Kind</th><th>Label</th><th>Status</th><th>Text</th></tr></thead><tbody>{chunk_rows}</tbody></table></div>
+</section>"#,
+            ident = ident_attr,
+            artifact_id = artifact_attr,
+            chunk_q = he(query.chunk_q.as_deref().unwrap_or("")),
+            checked = if include_history { "checked" } else { "" },
+            chunk_rows = if chunk_rows.is_empty() {
+                r#"<tr><td colspan="5" class="nd-text-center nd-text-muted">No chunks match.</td></tr>"#.to_string()
+            } else {
+                chunk_rows.clone()
+            },
+        )
+    } else {
+        String::new()
+    };
+
+    let content = format!(
+        r#"  <div class="nd-flex nd-gap-md nd-mb-md">
+    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/artifacts">Back to artifacts</a>
+    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/api-docs">API docs</a>
+    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/tasks">Tasks</a>
+  </div>
+
+  <div class="nd-alert nd-mb-md">{auth_signal}</div>
+
+  <section class="nd-card">
+    <div class="nd-card-header"><strong>{title}</strong></div>
+    <div class="nd-card-body">
+      <div class="nd-row nd-gap-md">
+        <div class="nd-col-3"><div class="nd-text-xs nd-text-muted">Kind</div><strong>{kind}</strong></div>
+        <div class="nd-col-3"><div class="nd-text-xs nd-text-muted">Lifecycle</div><strong>{lifecycle}</strong></div>
+        <div class="nd-col-3"><div class="nd-text-xs nd-text-muted">Review</div><strong>{review}</strong></div>
+        <div class="nd-col-3"><div class="nd-text-xs nd-text-muted">Implementation</div><strong>{implementation}</strong></div>
+      </div>
+      <div class="nd-grid nd-gap-xs nd-mt-md">
+        <div>Current version: <code>{current}</code></div>
+        <div>Accepted version: <code>{accepted}</code></div>
+        <div>Labels: {labels}</div>
+      </div>
+    </div>
+  </section>
+
+  {diff_section}
+  {spec_section}
+  {review_section}
+  {docs_section}
+
+  <section class="nd-card nd-mt-lg"><div class="nd-card-header"><strong>Version history</strong></div><div class="nd-card-body nd-p-0"><table class="nd-table nd-table-hover"><thead><tr><th>Version</th><th>Label</th><th>State</th><th>Format</th><th>Parent</th><th>Body bytes</th></tr></thead><tbody>{version_rows}</tbody></table></div></section>
+  <section class="nd-card nd-mt-lg"><div class="nd-card-header"><strong>Contributions</strong></div><div class="nd-card-body nd-p-0"><table class="nd-table nd-table-hover"><thead><tr><th>Kind</th><th>Phase</th><th>Role</th><th>Target</th><th>Body</th></tr></thead><tbody>{contribution_rows}</tbody></table></div></section>
+  <section class="nd-card nd-mt-lg"><div class="nd-card-header"><strong>Comments</strong></div><div class="nd-card-body nd-p-0"><table class="nd-table nd-table-hover"><thead><tr><th>State</th><th>Target</th><th>Child</th><th>Body</th></tr></thead><tbody>{comment_rows}</tbody></table></div></section>
+  <section class="nd-card nd-mt-lg"><div class="nd-card-header"><strong>Links</strong></div><div class="nd-card-body nd-p-0"><table class="nd-table nd-table-hover"><thead><tr><th>Type</th><th>Source</th><th>Target</th><th>Source version</th><th>Target version</th></tr></thead><tbody>{link_rows}</tbody></table></div></section>"#,
+        ident = ident_attr,
+        title = he(&artifact.title),
+        kind = he(&artifact.kind),
+        lifecycle = he(&artifact.lifecycle_state),
+        review = he(&artifact.review_state),
+        implementation = he(&artifact.implementation_state),
+        current = he(artifact.current_version_id.as_deref().unwrap_or("")),
+        accepted = he(artifact.accepted_version_id.as_deref().unwrap_or("")),
+        labels = artifact
+            .labels
+            .iter()
+            .map(|label| format!(r#"<span class="nd-badge nd-badge-sm">{}</span>"#, he(label)))
+            .collect::<Vec<_>>()
+            .join(" "),
+        auth_signal = he(artifact_auth_signal(&state)),
+        diff_section = diff_section,
+        spec_section = spec_section,
+        review_section = review_section,
+        docs_section = docs_section,
+        version_rows = empty_table_rows(version_rows, 6),
+        contribution_rows = empty_table_rows(contribution_rows, 5),
+        comment_rows = empty_table_rows(comment_rows, 4),
+        link_rows = empty_table_rows(link_rows, 5),
+    );
+
+    let page_title = format!("Artifact - {}", artifact.title);
+    let html = format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
+        head = control_panel_head("agent-gateway - Artifact", &theme, ""),
+        open = control_panel_open(&page_title, "artifacts"),
         content = content,
         close = control_panel_close(&state.api_key),
     );
@@ -4691,6 +9020,7 @@ fn control_panel_open(page_title: &str, active: &str) -> String {
     <ul class="nd-nav-menu">
       <li><a href="/"{dashboard}>Dashboard</a></li>
       <li><a href="/api-docs"{api_docs}>API Docs</a></li>
+      <li><a href="/artifacts"{artifacts}>Artifacts</a></li>
       <li><a href="/tasks"{tasks}>Tasks</a></li>
       <li><a href="/patterns"{patterns}>Patterns</a></li>
       <li><a href="/skills"{skills}>Skills</a></li>
@@ -4712,6 +9042,7 @@ fn control_panel_open(page_title: &str, active: &str) -> String {
     <main class="app-content">"#,
         dashboard = cls("dashboard"),
         api_docs = cls("api-docs"),
+        artifacts = cls("artifacts"),
         tasks = cls("tasks"),
         patterns = cls("patterns"),
         skills = cls("skills"),
@@ -5254,5 +9585,1676 @@ mod tests {
         let html = control_panel_open("API Docs", "api-docs");
 
         assert!(html.contains(r#"<li><a href="/api-docs" class="nd-active">API Docs</a></li>"#));
+    }
+
+    #[test]
+    fn control_panel_nav_exposes_artifacts() {
+        let html = control_panel_open("Artifacts", "artifacts");
+
+        assert!(html.contains(r#"<li><a href="/artifacts" class="nd-active">Artifacts</a></li>"#));
+    }
+
+    fn test_state_with_operations(artifact_operations: db::ArtifactOperationsEnvelope) -> AppState {
+        let db = db::open(":memory:").unwrap();
+        {
+            let conn = db.lock().unwrap();
+            db::insert_project(
+                &conn,
+                &db::Project {
+                    ident: "demo".to_string(),
+                    channel_name: "discord".to_string(),
+                    room_id: "room-demo".to_string(),
+                    last_msg_id: None,
+                    created_at: db::now_ms(),
+                    repo_provider: None,
+                    repo_namespace: None,
+                    repo_name: None,
+                    repo_full_name: None,
+                },
+            )
+            .unwrap();
+        }
+        AppState {
+            db,
+            plugins: std::sync::Arc::new(std::collections::HashMap::new()),
+            default_channel: "discord".to_string(),
+            api_key: "test-key".to_string(),
+            artifact_operations,
+            artifact_api_enabled: true,
+            artifact_body_schema_enabled: true,
+            artifact_auth_enforced: false,
+            update_available: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    fn test_state() -> AppState {
+        test_state_with_operations(db::ArtifactOperationsEnvelope::production_defaults())
+    }
+
+    fn hardened_test_state() -> AppState {
+        let mut state = test_state();
+        state.artifact_auth_enforced = true;
+        state
+    }
+
+    fn t008_operations_fixture() -> db::ArtifactOperationsEnvelope {
+        db::t008_shrunken_artifact_operations_fixture()
+    }
+
+    fn mutation_headers(key: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-agent-id", HeaderValue::from_static("codex-test"));
+        headers.insert("x-agent-system", HeaderValue::from_static("codex"));
+        headers.insert("idempotency-key", HeaderValue::from_str(key).unwrap());
+        headers
+    }
+
+    fn authorized_headers(key: &str, scopes: &str) -> HeaderMap {
+        let mut headers = mutation_headers(key);
+        headers.insert("x-agent-project", HeaderValue::from_static("demo"));
+        headers.insert("x-agent-scopes", HeaderValue::from_str(scopes).unwrap());
+        headers
+    }
+
+    fn read_headers(scopes: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-agent-project", HeaderValue::from_static("demo"));
+        headers.insert("x-agent-scopes", HeaderValue::from_str(scopes).unwrap());
+        headers
+    }
+
+    async fn response_json(response: Response) -> (StatusCode, Value) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value = serde_json::from_slice(&bytes).unwrap();
+        (status, value)
+    }
+
+    async fn create_test_artifact(state: &AppState, key: &str) -> String {
+        let response = create_artifact_handler(
+            State(state.clone()),
+            Path("demo".to_string()),
+            mutation_headers(key),
+            Json(CreateArtifactRequest {
+                kind: "spec".to_string(),
+                subkind: Some("implementation".to_string()),
+                title: "Test spec".to_string(),
+                labels: Some(vec!["test".to_string()]),
+                actor_display_name: Some("Codex Test".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        let (status, value) = response_json(response).await;
+        assert_eq!(status, StatusCode::CREATED, "{value}");
+        assert_eq!(
+            value["provenance"]["authorization"]["boundary"],
+            "trusted-single-tenant"
+        );
+        value["data"]["artifact_id"].as_str().unwrap().to_string()
+    }
+
+    async fn create_test_version(
+        state: &AppState,
+        artifact_id: &str,
+        key: &str,
+        workflow_run_id: Option<&str>,
+        parent_version_id: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, Value) {
+        let mut headers = mutation_headers(key);
+        if let Some(run_id) = workflow_run_id {
+            headers.insert("x-workflow-run-id", HeaderValue::from_str(run_id).unwrap());
+        }
+        let response = create_artifact_version_handler(
+            State(state.clone()),
+            Path(("demo".to_string(), artifact_id.to_string())),
+            headers,
+            Json(CreateArtifactVersionRequest {
+                version_label: Some(key.to_string()),
+                parent_version_id: parent_version_id.map(str::to_string),
+                body_format: Some("markdown".to_string()),
+                body: Some(body.to_string()),
+                structured_payload: None,
+                source_format: None,
+                version_state: Some("draft".to_string()),
+                actor_display_name: Some("Codex Test".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        response_json(response).await
+    }
+
+    async fn start_test_run(state: &AppState, artifact_id: &str, key: &str) -> String {
+        let response = start_artifact_workflow_run_handler(
+            State(state.clone()),
+            Path(("demo".to_string(), artifact_id.to_string())),
+            mutation_headers(key),
+            Json(StartWorkflowRunRequest {
+                workflow_kind: "spec_iteration".to_string(),
+                phase: Some("test".to_string()),
+                round_id: None,
+                participant_actor_ids: None,
+                source_artifact_version_id: None,
+                read_set: None,
+                is_resumable: Some(false),
+                actor_display_name: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let (status, value) = response_json(response).await;
+        assert_eq!(status, StatusCode::CREATED, "{value}");
+        value["data"]["workflow_run_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn artifact_workspace_pages_show_operational_sections() {
+        let state = test_state();
+        let artifact_id = create_test_artifact(&state, "workspace-artifact").await;
+        let (status, _version) = create_test_version(
+            &state,
+            &artifact_id,
+            "workspace-version",
+            None,
+            None,
+            "body",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let list = artifact_workspace_page(
+            State(state.clone()),
+            Path("demo".to_string()),
+            Query(ArtifactWorkspaceQuery {
+                kind: Some("spec".to_string()),
+                status: None,
+                label: Some("test".to_string()),
+                actor: None,
+                q: Some("Test spec".to_string()),
+                chunk_q: None,
+                include_history: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(list.0.contains("Artifact filters"));
+        assert!(list.0.contains("Documentation browser"));
+        assert!(list.0.contains(&artifact_id));
+
+        let detail = artifact_detail_page(
+            State(state),
+            Path(("demo".to_string(), artifact_id)),
+            Query(ArtifactWorkspaceQuery::default()),
+        )
+        .await
+        .unwrap();
+        assert!(detail.0.contains("Version history"));
+        assert!(detail.0.contains("Contributions"));
+        assert!(detail.0.contains("Comments"));
+        assert!(detail.0.contains("Links"));
+        assert!(detail.0.contains("Test spec"));
+    }
+
+    #[tokio::test]
+    async fn design_review_routes_cover_two_pass_query_and_synthesis_version() {
+        let state = test_state();
+        let create_response = create_design_review_handler(
+            State(state.clone()),
+            Path("demo".to_string()),
+            mutation_headers("review-create"),
+            Json(DesignReviewCreateRequest {
+                title: "Gateway review".to_string(),
+                labels: Some(vec!["review".to_string()]),
+                body: Some("# Design".to_string()),
+                body_format: Some("markdown".to_string()),
+                source_artifact_id: None,
+                source_artifact_version_id: None,
+                actor_display_name: Some("Codex Test".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        let (status, value) = response_json(create_response).await;
+        assert_eq!(status, StatusCode::CREATED, "{value}");
+        let artifact_id = value["data"]["artifact"]["artifact_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let source_version_id = value["data"]["version"]["artifact_version_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let round_response = create_design_review_round_handler(
+            State(state.clone()),
+            Path(("demo".to_string(), artifact_id.clone())),
+            mutation_headers("review-round"),
+            Json(DesignReviewRoundRequest {
+                round_id: Some("round-a".to_string()),
+                participant_actor_ids: None,
+                source_artifact_version_id: source_version_id.clone(),
+                read_set: None,
+                actor_display_name: Some("Codex Test".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        let (status, value) = response_json(round_response).await;
+        assert_eq!(status, StatusCode::CREATED, "{value}");
+        let workflow_run_id = value["data"]["workflow_run"]["workflow_run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            value["data"]["artifact"]["review_state"],
+            "collecting_reviews"
+        );
+
+        let pass1_response = create_design_review_contribution_handler(
+            State(state.clone()),
+            Path((
+                "demo".to_string(),
+                artifact_id.clone(),
+                workflow_run_id.clone(),
+            )),
+            mutation_headers("review-pass1"),
+            Json(DesignReviewContributionRequest {
+                phase: "pass_1".to_string(),
+                role: None,
+                reviewed_version_id: None,
+                read_set: None,
+                body_format: None,
+                body: "pass one".to_string(),
+                actor_display_name: Some("Codex Test".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        let (status, value) = response_json(pass1_response).await;
+        assert_eq!(status, StatusCode::CREATED, "{value}");
+        let pass1_id = value["data"]["contribution_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let pass2_read_set = serde_json::json!({
+            "versions": [source_version_id],
+            "contributions": [pass1_id.clone()],
+        });
+        let pass2_response = create_design_review_contribution_handler(
+            State(state.clone()),
+            Path((
+                "demo".to_string(),
+                artifact_id.clone(),
+                workflow_run_id.clone(),
+            )),
+            mutation_headers("review-pass2"),
+            Json(DesignReviewContributionRequest {
+                phase: "pass_2".to_string(),
+                role: None,
+                reviewed_version_id: None,
+                read_set: Some(pass2_read_set.clone()),
+                body_format: None,
+                body: "pass two".to_string(),
+                actor_display_name: Some("Codex Test".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        let (status, value) = response_json(pass2_response).await;
+        assert_eq!(status, StatusCode::CREATED, "{value}");
+        let pass2_id = value["data"]["contribution_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let list = list_design_review_contributions_handler(
+            State(state.clone()),
+            Path(("demo".to_string(), artifact_id.clone())),
+            Query(ListDesignReviewContributionsQuery {
+                round_id: Some("round-a".to_string()),
+                phase: Some("pass_2".to_string()),
+                role: Some("reviewer".to_string()),
+                reviewed_version_id: None,
+                read_set_contains: Some(pass1_id.clone()),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(list.data.len(), 1);
+        assert_eq!(list.data[0].contribution_id, pass2_id);
+
+        let synthesis_response = create_design_review_synthesis_handler(
+            State(state.clone()),
+            Path((
+                "demo".to_string(),
+                artifact_id.clone(),
+                workflow_run_id.clone(),
+            )),
+            mutation_headers("review-synthesis"),
+            Json(DesignReviewSynthesisRequest {
+                reviewed_version_id: None,
+                read_set: serde_json::json!({ "contributions": [pass2_id] }),
+                body_format: None,
+                body: "# Synthesized design".to_string(),
+                create_version: Some(true),
+                version_label: Some("synthesis".to_string()),
+                actor_display_name: Some("Codex Test".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        let (status, value) = response_json(synthesis_response).await;
+        assert_eq!(status, StatusCode::CREATED, "{value}");
+        assert!(value["data"]["version"]["artifact_version_id"]
+            .as_str()
+            .is_some());
+        assert_eq!(
+            value["data"]["artifact"]["review_state"],
+            "needs_user_decision"
+        );
+    }
+
+    fn spec_fixture_manifest() -> Value {
+        serde_json::json!({
+            "spec_version": 1,
+            "source_doc": "../gateway-features.md",
+            "phases": [
+                {
+                    "id": "phase-1",
+                    "name": "Phase 1",
+                    "tasks": [
+                        {
+                            "id": "T001",
+                            "team": "backend",
+                            "title": "Create substrate contract",
+                            "depends_on": [],
+                            "labels": ["gateway-features", "phase-1"],
+                            "touch_surface": ["docs/artifact-substrate-v1.md"],
+                            "acceptance_criteria": ["contract is durable"],
+                            "validation_plan": ["cargo test -p gateway"],
+                            "spec_file": "backend/T001.md",
+                            "status": "todo"
+                        },
+                        {
+                            "id": "T002",
+                            "team": "backend",
+                            "title": "Implement task generation",
+                            "depends_on": ["T001"],
+                            "labels": ["gateway-features", "phase-1"],
+                            "touch_surface": ["crates/gateway/src/routes.rs"],
+                            "acceptance_criteria": ["tasks are generated idempotently"],
+                            "validation_plan": ["cargo test -p gateway"],
+                            "spec_file": "backend/T002.md",
+                            "status": "todo"
+                        }
+                    ]
+                }
+            ]
+        })
+    }
+
+    fn spec_fixture_files() -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::from([
+            (
+                "backend/T001.md".to_string(),
+                "# T001\n\nFocused handoff for substrate.".to_string(),
+            ),
+            (
+                "backend/T002.md".to_string(),
+                "# T002\n\nFocused handoff for task generation.".to_string(),
+            ),
+        ])
+    }
+
+    async fn import_spec_fixture(state: &AppState, key: &str) -> (String, String) {
+        let response = create_spec_handler(
+            State(state.clone()),
+            Path("demo".to_string()),
+            mutation_headers(key),
+            Json(SpecImportRequest {
+                title: "Gateway Features".to_string(),
+                labels: Some(vec!["gateway-features".to_string()]),
+                body: Some("# Gateway Features Spec".to_string()),
+                manifest: spec_fixture_manifest(),
+                file_bodies: Some(spec_fixture_files()),
+                source_doc: Some("../gateway-features.md".to_string()),
+                source_artifact_id: None,
+                source_artifact_version_id: None,
+                actor_display_name: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let (status, value) = response_json(response).await;
+        assert_eq!(status, StatusCode::CREATED, "{value}");
+        (
+            value["data"]["artifact"]["artifact_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            value["data"]["version"]["artifact_version_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        )
+    }
+
+    async fn accept_spec_fixture(state: &AppState, artifact_id: &str, version_id: &str) {
+        let response = accept_spec_version_handler(
+            State(state.clone()),
+            Path(("demo".to_string(), artifact_id.to_string())),
+            mutation_headers("accept-spec-fixture"),
+            Json(SpecAcceptRequest {
+                version_id: version_id.to_string(),
+                actor_display_name: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let (status, value) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+    }
+
+    async fn generate_spec_tasks(
+        state: &AppState,
+        artifact_id: &str,
+        key: &str,
+        manifest_item_ids: Option<Vec<String>>,
+    ) -> (StatusCode, Value) {
+        let response = generate_spec_tasks_handler(
+            State(state.clone()),
+            Path(("demo".to_string(), artifact_id.to_string())),
+            mutation_headers(key),
+            Json(GenerateSpecTasksRequest {
+                confirmed: true,
+                manifest_item_ids,
+                reporter: Some("codex-test".to_string()),
+                hostname: Some("test-host".to_string()),
+                actor_display_name: None,
+            }),
+        )
+        .await
+        .unwrap();
+        response_json(response).await
+    }
+
+    #[tokio::test]
+    async fn spec_routes_import_manifest_round_trip_and_fetch_stable_item() {
+        let state = test_state();
+        let (artifact_id, version_id) = import_spec_fixture(&state, "spec-import-roundtrip").await;
+
+        let manifest = get_spec_manifest_handler(
+            State(state.clone()),
+            Path(("demo".to_string(), artifact_id.clone())),
+            Query(SpecManifestQuery {
+                version_id: Some(version_id.clone()),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(manifest.0.data.artifact_version_id, version_id);
+        assert_eq!(manifest.0.data.items.len(), 2);
+        assert_eq!(manifest.0.data.items[0].manifest_item_id, "phase-1:T001");
+        assert_eq!(
+            manifest.0.data.items[0].spec_body.as_deref(),
+            Some("# T001\n\nFocused handoff for substrate.")
+        );
+        assert_eq!(
+            manifest.0.data.stability_policy["renamed"],
+            "preserve manifest_item_id when the task id/code is unchanged"
+        );
+
+        let item = get_spec_manifest_item_handler(
+            State(state),
+            Path(("demo".to_string(), artifact_id, "phase-1:T002".to_string())),
+            Query(SpecManifestQuery { version_id: None }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(item.0.data.task_code.as_deref(), Some("T002"));
+        assert_eq!(
+            item.0.data.acceptance_criteria,
+            vec!["tasks are generated idempotently".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn spec_generate_tasks_uses_accepted_version_and_idempotent_rerun() {
+        let state = test_state();
+        let (artifact_id, version_id) = import_spec_fixture(&state, "spec-generate").await;
+        accept_spec_fixture(&state, &artifact_id, &version_id).await;
+
+        let (status, first) = generate_spec_tasks(&state, &artifact_id, "generate-run", None).await;
+        assert_eq!(status, StatusCode::CREATED, "{first}");
+        let first_tasks = first["data"]["generated_task_ids"].as_array().unwrap();
+        let first_links = first["data"]["generated_link_ids"].as_array().unwrap();
+        assert_eq!(first_tasks.len(), 2, "{first}");
+        assert_eq!(first_links.len(), 2, "{first}");
+
+        let (status, replay) =
+            generate_spec_tasks(&state, &artifact_id, "generate-run", None).await;
+        assert_eq!(status, StatusCode::OK, "{replay}");
+        assert_eq!(replay["provenance"]["replay"], true);
+        assert_eq!(
+            replay["data"]["generated_task_ids"],
+            first["data"]["generated_task_ids"]
+        );
+        assert_eq!(
+            replay["data"]["generated_link_ids"],
+            first["data"]["generated_link_ids"]
+        );
+
+        let task_id = first_tasks[0].as_str().unwrap();
+        let detail = {
+            let conn = state.db.lock().unwrap();
+            db::get_task_detail(&conn, "demo", task_id)
+                .unwrap()
+                .unwrap()
+        };
+        let details = detail.task.details.unwrap();
+        assert!(details.contains(&format!("source_spec_artifact_id: {artifact_id}")));
+        assert!(details.contains(&format!("source_spec_version_id: {version_id}")));
+        assert!(details.contains("manifest_item_id: phase-1:T001"));
+        assert!(detail.comments.iter().any(|comment| {
+            comment
+                .content
+                .contains("current task schema has no dedicated source fields")
+        }));
+
+        let links = {
+            let conn = state.db.lock().unwrap();
+            db::list_artifact_links(
+                &conn,
+                "demo",
+                &db::ArtifactLinkFilters {
+                    link_type: Some("task_generated_from_spec"),
+                    source_kind: Some("artifact_version"),
+                    source_id: Some(&version_id),
+                    target_kind: Some("task"),
+                    target_id: Some(task_id),
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0].source_version_id.as_deref(),
+            Some(version_id.as_str())
+        );
+        assert_eq!(
+            links[0].source_child_address.as_deref(),
+            Some("manifest.items[phase-1:T001]")
+        );
+        assert_eq!(links[0].target_kind, "task");
+    }
+
+    #[tokio::test]
+    async fn spec_generate_tasks_recovers_existing_unlinked_task_after_partial_failure() {
+        let state = test_state();
+        let (artifact_id, version_id) = import_spec_fixture(&state, "spec-partial").await;
+        accept_spec_fixture(&state, &artifact_id, &version_id).await;
+        let orphan_task = {
+            let conn = state.db.lock().unwrap();
+            db::insert_task(
+                &conn,
+                "demo",
+                "T001 Create substrate contract",
+                Some("orphan from interrupted generation"),
+                Some(&format!(
+                    "Source:\nsource_spec_artifact_id: {artifact_id}\nsource_spec_version_id: {version_id}\nmanifest_item_id: phase-1:T001\n"
+                )),
+                &["generated-from-spec".to_string()],
+                Some("test-host"),
+                "codex-test",
+            )
+            .unwrap()
+        };
+
+        let (status, value) = generate_spec_tasks(
+            &state,
+            &artifact_id,
+            "recover-partial",
+            Some(vec!["phase-1:T001".to_string()]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{value}");
+        assert_eq!(
+            value["data"]["generated_task_ids"][0].as_str().unwrap(),
+            orphan_task.id
+        );
+        let task_count: i64 = {
+            let conn = state.db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM tasks WHERE project_ident = 'demo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            task_count, 1,
+            "rerun should link existing task, not duplicate it"
+        );
+    }
+
+    #[tokio::test]
+    async fn spec_link_existing_task_creates_back_link() {
+        let state = test_state();
+        let (artifact_id, version_id) = import_spec_fixture(&state, "spec-link-existing").await;
+        accept_spec_fixture(&state, &artifact_id, &version_id).await;
+        let task = {
+            let conn = state.db.lock().unwrap();
+            db::insert_task(
+                &conn,
+                "demo",
+                "Existing implementation task",
+                None,
+                Some("pre-existing handoff"),
+                &[],
+                None,
+                "codex-test",
+            )
+            .unwrap()
+        };
+        let response = link_existing_spec_task_handler(
+            State(state.clone()),
+            Path(("demo".to_string(), artifact_id.clone())),
+            mutation_headers("link-existing-task"),
+            Json(LinkSpecTaskRequest {
+                version_id: None,
+                manifest_item_id: "phase-1:T002".to_string(),
+                task_id: task.id.clone(),
+                actor_display_name: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let (status, value) = response_json(response).await;
+        assert_eq!(status, StatusCode::CREATED, "{value}");
+        assert_eq!(value["data"]["target_id"].as_str().unwrap(), task.id);
+        assert_eq!(
+            value["data"]["source_child_address"].as_str().unwrap(),
+            "manifest.items[phase-1:T002]"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_routes_cover_happy_path_and_idempotent_retry() {
+        let state = test_state();
+        let artifact_id = create_test_artifact(&state, "artifact-create-1").await;
+        let run_id = start_test_run(&state, &artifact_id, "version-run-1").await;
+
+        let (status, first_version) = create_test_version(
+            &state,
+            &artifact_id,
+            "version-1",
+            Some(&run_id),
+            None,
+            "hello",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{first_version}");
+        let version_id = first_version["data"]["artifact_version_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let (status, replayed_version) = create_test_version(
+            &state,
+            &artifact_id,
+            "version-1",
+            Some(&run_id),
+            None,
+            "hello",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{replayed_version}");
+        assert_eq!(replayed_version["provenance"]["replay"], true);
+        assert_eq!(
+            replayed_version["data"]["artifact_version_id"],
+            first_version["data"]["artifact_version_id"]
+        );
+
+        let (status, second_version) = create_test_version(
+            &state,
+            &artifact_id,
+            "version-2",
+            Some(&run_id),
+            Some(&version_id),
+            "hello\nnew",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{second_version}");
+        let second_version_id = second_version["data"]["artifact_version_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let diff = diff_artifact_version_handler(
+            State(state.clone()),
+            Path(("demo".to_string(), artifact_id.clone(), second_version_id)),
+            Query(DiffQuery {
+                base_version_id: Some(version_id.clone()),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(diff.0.data.diff.contains("+new"));
+        assert_eq!(diff.0.chunking_status.status, "none");
+
+        let comment_response = create_artifact_comment_handler(
+            State(state.clone()),
+            Path(("demo".to_string(), artifact_id.clone())),
+            mutation_headers("comment-1"),
+            Json(CreateCommentRequest {
+                target_kind: "artifact".to_string(),
+                target_id: artifact_id.clone(),
+                child_address: None,
+                parent_comment_id: None,
+                body: "Looks good".to_string(),
+                actor_display_name: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response_json(comment_response).await.0, StatusCode::CREATED);
+
+        let contribution_response = create_artifact_contribution_handler(
+            State(state.clone()),
+            Path(("demo".to_string(), artifact_id.clone())),
+            mutation_headers("contribution-1"),
+            Json(CreateContributionRequest {
+                target_kind: "artifact".to_string(),
+                target_id: artifact_id.clone(),
+                contribution_kind: "note".to_string(),
+                phase: None,
+                role: "author".to_string(),
+                read_set: None,
+                body_format: Some("markdown".to_string()),
+                body: "Implementation note".to_string(),
+                actor_display_name: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response_json(contribution_response).await.0,
+            StatusCode::CREATED
+        );
+
+        let link_response = create_artifact_link_handler(
+            State(state.clone()),
+            Path("demo".to_string()),
+            mutation_headers("link-1"),
+            Json(CreateLinkRequest {
+                link_type: "doc_referenced_by_spec".to_string(),
+                source_kind: "artifact".to_string(),
+                source_id: artifact_id.clone(),
+                source_version_id: None,
+                source_child_address: None,
+                target_kind: "artifact_version".to_string(),
+                target_id: version_id.clone(),
+                target_version_id: Some(version_id),
+                target_child_address: None,
+                supersedes_link_id: None,
+                actor_display_name: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response_json(link_response).await.0, StatusCode::CREATED);
+
+        let fetched = get_artifact_handler(
+            State(state),
+            Path(("demo".to_string(), artifact_id)),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(fetched.0.data.current_version.is_some());
+        assert_eq!(fetched.0.chunking_status.status, "none");
+    }
+
+    #[tokio::test]
+    async fn artifact_authorization_enforces_project_and_scopes_when_hardened() {
+        let state = hardened_test_state();
+
+        let missing_project = create_artifact_handler(
+            State(state.clone()),
+            Path("demo".to_string()),
+            mutation_headers("auth-missing-project"),
+            Json(CreateArtifactRequest {
+                kind: "spec".to_string(),
+                subkind: None,
+                title: "Unauthorized".to_string(),
+                labels: None,
+                actor_display_name: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing_project.0, StatusCode::FORBIDDEN);
+        assert!(missing_project.1.contains("x-agent-project"));
+
+        let missing_scope = create_artifact_handler(
+            State(state.clone()),
+            Path("demo".to_string()),
+            authorized_headers("auth-missing-scope", "artifact.read"),
+            Json(CreateArtifactRequest {
+                kind: "spec".to_string(),
+                subkind: None,
+                title: "Unauthorized".to_string(),
+                labels: None,
+                actor_display_name: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing_scope.0, StatusCode::FORBIDDEN);
+        assert!(missing_scope.1.contains("artifact.write"));
+
+        let response = create_artifact_handler(
+            State(state.clone()),
+            Path("demo".to_string()),
+            authorized_headers("auth-create", "artifact.write"),
+            Json(CreateArtifactRequest {
+                kind: "spec".to_string(),
+                subkind: None,
+                title: "Authorized".to_string(),
+                labels: None,
+                actor_display_name: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let (status, value) = response_json(response).await;
+        assert_eq!(status, StatusCode::CREATED, "{value}");
+        assert_eq!(
+            value["provenance"]["authorization"]["boundary"],
+            "project-scoped"
+        );
+        assert_eq!(
+            value["provenance"]["authorization"]["required_scopes"][0],
+            "artifact.write"
+        );
+        let artifact_id = value["data"]["artifact_id"].as_str().unwrap().to_string();
+
+        let read_reject = get_artifact_handler(
+            State(state.clone()),
+            Path(("demo".to_string(), artifact_id.clone())),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(read_reject.0, StatusCode::FORBIDDEN);
+
+        let fetched = get_artifact_handler(
+            State(state),
+            Path(("demo".to_string(), artifact_id)),
+            read_headers("artifact.read"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fetched.0.data.artifact.title, "Authorized");
+    }
+
+    #[tokio::test]
+    async fn artifact_quota_override_requires_project_administer_when_hardened() {
+        let state = hardened_test_state();
+
+        let mut non_admin = authorized_headers("quota-override-forbidden", "artifact.write");
+        non_admin.insert(
+            "x-artifact-quota-override",
+            HeaderValue::from_static("true"),
+        );
+        let err = create_artifact_handler(
+            State(state.clone()),
+            Path("demo".to_string()),
+            non_admin,
+            Json(CreateArtifactRequest {
+                kind: "spec".to_string(),
+                subkind: None,
+                title: "Override denied".to_string(),
+                labels: None,
+                actor_display_name: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(err.1.contains("project.administer"));
+
+        let mut admin =
+            authorized_headers("quota-override-admin", "artifact.write project.administer");
+        admin.insert(
+            "x-artifact-quota-override",
+            HeaderValue::from_static("true"),
+        );
+        let response = create_artifact_handler(
+            State(state),
+            Path("demo".to_string()),
+            admin,
+            Json(CreateArtifactRequest {
+                kind: "spec".to_string(),
+                subkind: None,
+                title: "Override allowed".to_string(),
+                labels: None,
+                actor_display_name: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response_json(response).await.0, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn artifact_routes_validate_actor_idempotency_and_immutable_refs() {
+        let state = test_state();
+        let artifact_id = create_test_artifact(&state, "artifact-create-validation").await;
+
+        let mut missing_agent = mutation_headers("missing-agent");
+        missing_agent.remove("x-agent-id");
+        let missing_agent_error = create_artifact_version_handler(
+            State(state.clone()),
+            Path(("demo".to_string(), artifact_id.clone())),
+            missing_agent,
+            Json(CreateArtifactVersionRequest {
+                version_label: None,
+                parent_version_id: None,
+                body_format: Some("markdown".to_string()),
+                body: Some("body".to_string()),
+                structured_payload: None,
+                source_format: None,
+                version_state: None,
+                actor_display_name: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing_agent_error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(missing_agent_error.1, "x_agent_id_required");
+
+        let missing_parent = create_artifact_version_handler(
+            State(state.clone()),
+            Path(("demo".to_string(), artifact_id.clone())),
+            mutation_headers("missing-parent"),
+            Json(CreateArtifactVersionRequest {
+                version_label: None,
+                parent_version_id: Some("missing-version".to_string()),
+                body_format: Some("markdown".to_string()),
+                body: Some("body".to_string()),
+                structured_payload: None,
+                source_format: None,
+                version_state: None,
+                actor_display_name: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing_parent.0, StatusCode::BAD_REQUEST);
+
+        let read_set_error = create_artifact_contribution_handler(
+            State(state),
+            Path(("demo".to_string(), artifact_id.clone())),
+            mutation_headers("read-set-required"),
+            Json(CreateContributionRequest {
+                target_kind: "artifact".to_string(),
+                target_id: artifact_id,
+                contribution_kind: "synthesis".to_string(),
+                phase: Some("synthesis".to_string()),
+                role: "analyst".to_string(),
+                read_set: None,
+                body_format: Some("markdown".to_string()),
+                body: "synthesis".to_string(),
+                actor_display_name: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(read_set_error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(read_set_error.1, "read_set_required");
+    }
+
+    #[tokio::test]
+    async fn artifact_routes_return_stable_t004_size_limit_errors() {
+        let state = test_state_with_operations(t008_operations_fixture());
+        let artifact_id = create_test_artifact(&state, "t008-size-artifact").await;
+
+        let oversized_version = create_artifact_version_handler(
+            State(state.clone()),
+            Path(("demo".to_string(), artifact_id.clone())),
+            mutation_headers("t008-oversized-version"),
+            Json(CreateArtifactVersionRequest {
+                version_label: None,
+                parent_version_id: None,
+                body_format: Some("markdown".to_string()),
+                body: Some("x".repeat(4097)),
+                structured_payload: None,
+                source_format: None,
+                version_state: None,
+                actor_display_name: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(oversized_version.0, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(oversized_version.1, "artifact_version_body_too_large");
+
+        let oversized_contribution = create_artifact_contribution_handler(
+            State(state.clone()),
+            Path(("demo".to_string(), artifact_id.clone())),
+            mutation_headers("t008-oversized-contribution"),
+            Json(CreateContributionRequest {
+                target_kind: "artifact".to_string(),
+                target_id: artifact_id.clone(),
+                contribution_kind: "note".to_string(),
+                phase: None,
+                role: "author".to_string(),
+                read_set: None,
+                body_format: Some("markdown".to_string()),
+                body: "x".repeat(2049),
+                actor_display_name: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(oversized_contribution.0, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(oversized_contribution.1, "contribution_body_too_large");
+
+        let oversized_comment = create_artifact_comment_handler(
+            State(state),
+            Path(("demo".to_string(), artifact_id.clone())),
+            mutation_headers("t008-oversized-comment"),
+            Json(CreateCommentRequest {
+                target_kind: "artifact".to_string(),
+                target_id: artifact_id,
+                child_address: None,
+                parent_comment_id: None,
+                body: "x".repeat(513),
+                actor_display_name: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(oversized_comment.0, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(oversized_comment.1, "comment_body_too_large");
+    }
+
+    #[tokio::test]
+    async fn artifact_routes_surface_soft_quota_warning_and_hard_reject() {
+        let state = test_state_with_operations(t008_operations_fixture());
+
+        async fn post_artifact(
+            state: &AppState,
+            key: &str,
+            title: &str,
+        ) -> std::result::Result<Response, AppError> {
+            create_artifact_handler(
+                State(state.clone()),
+                Path("demo".to_string()),
+                mutation_headers(key),
+                Json(CreateArtifactRequest {
+                    kind: "spec".to_string(),
+                    subkind: None,
+                    title: title.to_string(),
+                    labels: Some(vec!["qa".to_string()]),
+                    actor_display_name: None,
+                }),
+            )
+            .await
+        }
+
+        for idx in 1..=2 {
+            let response = post_artifact(
+                &state,
+                &format!("t008-quota-{idx}"),
+                &format!("quota fixture {idx}"),
+            )
+            .await
+            .unwrap();
+            let (status, value) = response_json(response).await;
+            assert_eq!(status, StatusCode::CREATED, "{value}");
+            assert_eq!(value["provenance"]["warnings"].as_array().unwrap().len(), 0);
+        }
+
+        let soft_response = post_artifact(&state, "t008-quota-3", "quota fixture 3")
+            .await
+            .unwrap();
+        let (status, soft_value) = response_json(soft_response).await;
+        assert_eq!(status, StatusCode::CREATED, "{soft_value}");
+        assert_eq!(
+            soft_value["provenance"]["warnings"][0],
+            "quota_artifact_soft"
+        );
+
+        let hard_reject = post_artifact(&state, "t008-quota-4", "quota fixture 4")
+            .await
+            .unwrap_err();
+        assert_eq!(hard_reject.0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(hard_reject.1, "quota_artifact_exceeded");
+
+        let count: i64 = {
+            let conn = state.db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM artifacts WHERE project_ident = 'demo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count, 3, "hard quota reject must not insert a row");
+    }
+
+    #[tokio::test]
+    async fn artifact_routes_expose_stale_and_partial_chunking_status() {
+        let state = test_state();
+        let artifact_id = create_test_artifact(&state, "t008-chunks-artifact").await;
+        let (status, v1) =
+            create_test_version(&state, &artifact_id, "t008-chunks-v1", None, None, "v1").await;
+        assert_eq!(status, StatusCode::CREATED, "{v1}");
+        let v1_id = v1["data"]["artifact_version_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, v2) = create_test_version(
+            &state,
+            &artifact_id,
+            "t008-chunks-v2",
+            None,
+            Some(&v1_id),
+            "v2",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{v2}");
+        let v2_id = v2["data"]["artifact_version_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        {
+            let conn = state.db.lock().unwrap();
+            db::create_artifact_chunk(
+                &conn,
+                &state.artifact_operations,
+                &db::ArtifactChunkInsert {
+                    artifact_id: &artifact_id,
+                    artifact_version_id: &v1_id,
+                    child_address: "manifest.items[T008-stale]",
+                    text: "stale chunk",
+                    embedding_model: None,
+                    embedding_vector: None,
+                    app: Some("spec"),
+                    label: Some("qa"),
+                    kind: Some("manifest_item"),
+                    metadata: Some(&serde_json::json!({"status": "ok"})),
+                },
+            )
+            .unwrap();
+        }
+
+        let stale = get_artifact_handler(
+            State(state.clone()),
+            Path(("demo".to_string(), artifact_id.clone())),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stale.0.chunking_status.status, "stale");
+        assert_eq!(stale.0.chunking_status.current_chunk_count, 0);
+        assert_eq!(stale.0.chunking_status.stale_chunk_count, 1);
+        assert_eq!(stale.0.chunking_status.superseded_chunk_count, 0);
+        assert!(stale.0.chunking_status.failed_addresses.is_empty());
+
+        {
+            let conn = state.db.lock().unwrap();
+            db::create_artifact_chunk(
+                &conn,
+                &state.artifact_operations,
+                &db::ArtifactChunkInsert {
+                    artifact_id: &artifact_id,
+                    artifact_version_id: &v2_id,
+                    child_address: "manifest.items[T008-partial]",
+                    text: "partial chunk",
+                    embedding_model: None,
+                    embedding_vector: None,
+                    app: Some("spec"),
+                    label: Some("qa"),
+                    kind: Some("manifest_item"),
+                    metadata: Some(&serde_json::json!({"status": "failed"})),
+                },
+            )
+            .unwrap();
+        }
+
+        let partial_version = get_artifact_version_handler(
+            State(state.clone()),
+            Path(("demo".to_string(), artifact_id.clone(), v2_id.clone())),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(partial_version.0.chunking_status.status, "partial");
+        assert_eq!(partial_version.0.data.chunking_status.status, "partial");
+        assert_eq!(
+            partial_version.0.chunking_status.failed_addresses,
+            vec!["manifest.items[T008-partial]".to_string()]
+        );
+
+        let partial_diff = diff_artifact_version_handler(
+            State(state),
+            Path(("demo".to_string(), artifact_id, v2_id)),
+            Query(DiffQuery {
+                base_version_id: Some(v1_id),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(partial_diff.0.chunking_status.status, "partial");
+        assert_eq!(partial_diff.0.data.chunking_status.status, "partial");
+        assert_eq!(
+            partial_diff.0.data.chunking_status.failed_addresses,
+            vec!["manifest.items[T008-partial]".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn api_doc_chunks_route_keeps_legacy_array_and_opt_in_envelope() {
+        let state = test_state();
+        let created = create_api_doc_handler(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("demo".to_string()),
+            Json(CreateApiDocRequest {
+                app: "billing-api".to_string(),
+                title: "Billing API agent context".to_string(),
+                summary: Some("System of record for invoices.".to_string()),
+                kind: "agent_context".to_string(),
+                source_format: "agent_context".to_string(),
+                source_ref: Some(".agent/api/billing.yaml".to_string()),
+                version: Some("2026-05-13".to_string()),
+                labels: serde_json::json!(["billing"]),
+                content: serde_json::json!({
+                    "purpose": "Owns invoice state.",
+                    "endpoints": [{
+                        "method": "POST",
+                        "path": "/v1/invoices",
+                        "intent": "Create draft invoice"
+                    }]
+                }),
+                author: Some("tester".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.0.kind, "agent_context");
+        assert_eq!(created.0.subkind, "api_context");
+
+        let legacy = list_api_doc_chunks_handler(
+            State(state.clone()),
+            Path("demo".to_string()),
+            Query(ListApiDocsQuery {
+                q: Some("draft invoice".to_string()),
+                app: None,
+                label: Some("billing".to_string()),
+                kind: Some("agent_context".to_string()),
+                include_history: false,
+                envelope: false,
+            }),
+        )
+        .await
+        .unwrap();
+        let (status, value) = response_json(legacy).await;
+        assert_eq!(status, StatusCode::OK);
+        let chunks = value.as_array().unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0]["doc_id"], created.0.id);
+        assert_eq!(chunks[0]["chunk_type"], "endpoints");
+        assert_eq!(chunks[0]["freshness"], "current");
+        assert_eq!(chunks[0]["retrieval_scope"], "current");
+        assert_eq!(chunks[0]["artifact_id"], created.0.artifact_id);
+        assert_eq!(
+            chunks[0]["artifact_version_id"],
+            created.0.artifact_version_id.clone().unwrap()
+        );
+
+        let envelope = list_api_doc_chunks_handler(
+            State(state),
+            Path("demo".to_string()),
+            Query(ListApiDocsQuery {
+                q: Some("draft invoice".to_string()),
+                app: None,
+                label: Some("billing".to_string()),
+                kind: Some("agent_context".to_string()),
+                include_history: false,
+                envelope: true,
+            }),
+        )
+        .await
+        .unwrap();
+        let (status, value) = response_json(envelope).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["retrieval_scope"], "current");
+        assert_eq!(value["include_history"], false);
+        assert_eq!(value["chunking_status"]["status"], "current");
+        assert_eq!(value["chunking_status"]["current_chunk_count"], 1);
+        assert_eq!(value["chunks"].as_array().unwrap().len(), 1);
+    }
+
+    /// Regression for T030: after consolidating artifact mutation route
+    /// scaffolding into `begin_artifact_mutation` / `finalize_mutation`,
+    /// replayed mutations across the four create-style handlers must still
+    /// return `200 OK`, surface `provenance.replay == true`, echo the
+    /// originally-generated resource id, and not double-count metric writes.
+    /// The original (first) responses must continue to return `201 CREATED`
+    /// with `provenance.replay == false`.
+    #[tokio::test]
+    async fn artifact_mutation_helpers_preserve_replay_envelope_after_consolidation() {
+        let state = test_state();
+        let artifact_id = create_test_artifact(&state, "t030-artifact").await;
+        let run_id = start_test_run(&state, &artifact_id, "t030-run").await;
+
+        // 1. version: idempotent retry must return OK + replay=true + same id.
+        //    Versions' idempotency index is keyed on
+        //    (artifact_id, created_via_workflow_run_id, idempotency_key) so we
+        //    must hold the workflow_run_id constant across both calls.
+        let (first_status, first_version) = create_test_version(
+            &state,
+            &artifact_id,
+            "t030-version",
+            Some(&run_id),
+            None,
+            "body-a",
+        )
+        .await;
+        assert_eq!(first_status, StatusCode::CREATED, "{first_version}");
+        assert_eq!(first_version["provenance"]["replay"], false);
+        let version_id = first_version["data"]["artifact_version_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let (replay_status, replay_version) = create_test_version(
+            &state,
+            &artifact_id,
+            "t030-version",
+            Some(&run_id),
+            None,
+            "body-a",
+        )
+        .await;
+        assert_eq!(replay_status, StatusCode::OK, "{replay_version}");
+        assert_eq!(replay_version["provenance"]["replay"], true);
+        assert_eq!(
+            replay_version["data"]["artifact_version_id"]
+                .as_str()
+                .unwrap(),
+            version_id
+        );
+        assert_eq!(
+            replay_version["provenance"]["generated_resources"]["artifact_version_id"]
+                .as_str()
+                .unwrap(),
+            version_id
+        );
+        // Authorization scopes must be preserved by `finalize_mutation`.
+        assert_eq!(
+            replay_version["provenance"]["authorization"]["required_scopes"][0],
+            "artifact_version.create"
+        );
+
+        // 2. contribution: same replay invariants through the consolidated helper.
+        async fn post_contribution(
+            state: &AppState,
+            artifact_id: &str,
+            key: &str,
+        ) -> (StatusCode, Value) {
+            let response = create_artifact_contribution_handler(
+                State(state.clone()),
+                Path(("demo".to_string(), artifact_id.to_string())),
+                mutation_headers(key),
+                Json(CreateContributionRequest {
+                    target_kind: "artifact".to_string(),
+                    target_id: artifact_id.to_string(),
+                    contribution_kind: "note".to_string(),
+                    phase: None,
+                    role: "author".to_string(),
+                    read_set: None,
+                    body_format: Some("markdown".to_string()),
+                    body: "consolidated".to_string(),
+                    actor_display_name: None,
+                }),
+            )
+            .await
+            .unwrap();
+            response_json(response).await
+        }
+        let (status, first_contrib) = post_contribution(&state, &artifact_id, "t030-contrib").await;
+        assert_eq!(status, StatusCode::CREATED);
+        let contrib_id = first_contrib["data"]["contribution_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, replay_contrib) =
+            post_contribution(&state, &artifact_id, "t030-contrib").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replay_contrib["provenance"]["replay"], true);
+        assert_eq!(
+            replay_contrib["data"]["contribution_id"].as_str().unwrap(),
+            contrib_id
+        );
+
+        // 3. link: project-scoped helper must apply the same idempotency
+        //    semantics. Links only carry idempotency uniqueness when a
+        //    workflow_run_id is supplied (per the DB unique-index condition),
+        //    so set `x-workflow-run-id` to exercise the replay path through
+        //    `load_workflow_run_for_link`.
+        async fn post_link(
+            state: &AppState,
+            artifact_id: &str,
+            version_id: &str,
+            run_id: &str,
+            key: &str,
+        ) -> (StatusCode, Value) {
+            let mut headers = mutation_headers(key);
+            headers.insert("x-workflow-run-id", HeaderValue::from_str(run_id).unwrap());
+            let response = create_artifact_link_handler(
+                State(state.clone()),
+                Path("demo".to_string()),
+                headers,
+                Json(CreateLinkRequest {
+                    link_type: "doc_referenced_by_spec".to_string(),
+                    source_kind: "artifact".to_string(),
+                    source_id: artifact_id.to_string(),
+                    source_version_id: None,
+                    source_child_address: None,
+                    target_kind: "artifact_version".to_string(),
+                    target_id: version_id.to_string(),
+                    target_version_id: Some(version_id.to_string()),
+                    target_child_address: None,
+                    supersedes_link_id: None,
+                    actor_display_name: None,
+                }),
+            )
+            .await
+            .unwrap();
+            response_json(response).await
+        }
+        let (status, first_link) =
+            post_link(&state, &artifact_id, &version_id, &run_id, "t030-link").await;
+        assert_eq!(status, StatusCode::CREATED);
+        let link_id = first_link["data"]["link_id"].as_str().unwrap().to_string();
+        let (status, replay_link) =
+            post_link(&state, &artifact_id, &version_id, &run_id, "t030-link").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replay_link["provenance"]["replay"], true);
+        assert_eq!(replay_link["data"]["link_id"].as_str().unwrap(), link_id);
+        assert_eq!(
+            replay_link["provenance"]["authorization"]["required_scopes"][0],
+            "link.write"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_routes_allow_resumable_failed_run_retry_and_reject_cancelled() {
+        let state = test_state();
+        let artifact_id = create_test_artifact(&state, "artifact-create-workflow").await;
+        let (_, version) = create_test_version(
+            &state,
+            &artifact_id,
+            "workflow-source-version",
+            None,
+            None,
+            "source",
+        )
+        .await;
+        let source_version_id = version["data"]["artifact_version_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let started = start_artifact_workflow_run_handler(
+            State(state.clone()),
+            Path(("demo".to_string(), artifact_id.clone())),
+            mutation_headers("run-resumable"),
+            Json(StartWorkflowRunRequest {
+                workflow_kind: "spec_task_generation".to_string(),
+                phase: Some("generation".to_string()),
+                round_id: None,
+                participant_actor_ids: None,
+                source_artifact_version_id: Some(source_version_id.clone()),
+                read_set: None,
+                is_resumable: Some(true),
+                actor_display_name: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let (_, started_json) = response_json(started).await;
+        let run_id = started_json["data"]["workflow_run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let failed = complete_artifact_workflow_run_handler(
+            State(state.clone()),
+            Path(("demo".to_string(), artifact_id.clone(), run_id.clone())),
+            mutation_headers("run-resumable-fail"),
+            Json(CompleteWorkflowRunRequest {
+                state: "failed".to_string(),
+                failure_reason: Some("transient".to_string()),
+                generated_contribution_ids: None,
+                generated_version_ids: None,
+                generated_task_ids: None,
+                generated_link_ids: None,
+                generated_chunk_ids: None,
+                actor_display_name: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response_json(failed).await.0, StatusCode::OK);
+
+        let mut retry_headers = mutation_headers("version-after-failed-run");
+        retry_headers.insert("x-workflow-run-id", HeaderValue::from_str(&run_id).unwrap());
+        let recovered = create_artifact_version_handler(
+            State(state.clone()),
+            Path(("demo".to_string(), artifact_id.clone())),
+            retry_headers,
+            Json(CreateArtifactVersionRequest {
+                version_label: Some("resumed".to_string()),
+                parent_version_id: Some(source_version_id.clone()),
+                body_format: Some("markdown".to_string()),
+                body: Some("recovered".to_string()),
+                structured_payload: None,
+                source_format: None,
+                version_state: None,
+                actor_display_name: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response_json(recovered).await.0, StatusCode::CREATED);
+
+        let cancelled = start_artifact_workflow_run_handler(
+            State(state.clone()),
+            Path(("demo".to_string(), artifact_id.clone())),
+            mutation_headers("run-cancelled"),
+            Json(StartWorkflowRunRequest {
+                workflow_kind: "doc_publish".to_string(),
+                phase: None,
+                round_id: None,
+                participant_actor_ids: None,
+                source_artifact_version_id: Some(source_version_id.clone()),
+                read_set: None,
+                is_resumable: Some(true),
+                actor_display_name: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let (_, cancelled_json) = response_json(cancelled).await;
+        let cancelled_run_id = cancelled_json["data"]["workflow_run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let cancelled_done = complete_artifact_workflow_run_handler(
+            State(state.clone()),
+            Path((
+                "demo".to_string(),
+                artifact_id.clone(),
+                cancelled_run_id.clone(),
+            )),
+            mutation_headers("run-cancelled-complete"),
+            Json(CompleteWorkflowRunRequest {
+                state: "cancelled".to_string(),
+                failure_reason: None,
+                generated_contribution_ids: None,
+                generated_version_ids: None,
+                generated_task_ids: None,
+                generated_link_ids: None,
+                generated_chunk_ids: None,
+                actor_display_name: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response_json(cancelled_done).await.0, StatusCode::OK);
+
+        let mut cancelled_retry_headers = mutation_headers("version-after-cancelled-run");
+        cancelled_retry_headers.insert(
+            "x-workflow-run-id",
+            HeaderValue::from_str(&cancelled_run_id).unwrap(),
+        );
+        let rejected = create_artifact_version_handler(
+            State(state),
+            Path(("demo".to_string(), artifact_id)),
+            cancelled_retry_headers,
+            Json(CreateArtifactVersionRequest {
+                version_label: Some("cancelled".to_string()),
+                parent_version_id: Some(source_version_id),
+                body_format: Some("markdown".to_string()),
+                body: Some("must reject".to_string()),
+                structured_payload: None,
+                source_format: None,
+                version_state: None,
+                actor_display_name: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
     }
 }
