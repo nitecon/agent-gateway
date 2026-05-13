@@ -1,0 +1,597 @@
+spec_version: 1
+source_doc: ../gateway-features.md
+generated_at: 2026-05-12T00:00:00Z
+generated_from_revision: bc5aa42ec4b319c8c2c5462ed8dd8c25b61858d6
+metadata:
+  title: "Gateway Features Vision"
+  scope: "Add durable project artifacts for reviews, specs, and documentation, with versioning, contributions, comments, links, workflow provenance, and gateway-backed handoff."
+phases:
+  - id: phase-1
+    name: "Phase 1 - Contracts and Production Boundaries"
+    description: "Set the decisions that gate schema/API work: documentation integration, body model, permissions, provenance, idempotency, and operating envelope."
+    tasks:
+      - id: T001
+        team: docs
+        title: "Resolve API docs integration strategy"
+        depends_on: []
+        spec_file: docs/T001-api-docs-integration-strategy.md
+        acceptance_criteria:
+          - "Decision document states whether current API docs become artifact-backed docs or remain a separate resource family with equivalent guarantees."
+          - "Decision explicitly maps current API doc IDs, chunks, comments, and versions to the chosen artifact/docs model."
+          - "Decision identifies the canonical agent retrieval path for docs during and after migration."
+          - "Decision lists compatibility requirements for existing `agent-tools docs` commands."
+          - "Open questions from `gateway-features.md` about docs export and source-adjacent repository docs are answered or deferred with owners."
+        touch_surface:
+          - docs/artifacts-api-docs-integration.md
+          - README.md
+        gateway_task_id: 019e1d6b-6f63-7b32-856d-24893cf89b56
+        status: done
+        notes: |
+          Prior review converged that this decision should happen before artifact schema or client work hardens.
+      - id: T002
+        team: backend
+        title: "Define artifact substrate v1 contract"
+        depends_on: [T001]
+        spec_file: backend/T002-artifact-substrate-contract.md
+        acceptance_criteria:
+          - "Contract defines artifacts, immutable artifact versions, contributions, comments, links, actors, and workflow runs/activities."
+          - "Contract chooses the v1 body model: markdown, structured JSON blocks, or both, and names the migration path for future stable block IDs."
+          - "Contract preserves the invariant that audit and handoff links target immutable versions plus stable child identifiers where applicable."
+          - "Contract separates artifact lifecycle, current version, accepted version, review state, and implementation state."
+          - "Contract includes supported v1 comment targets, open/resolved state transitions, resolution provenance, and defers block/range comments with selector requirements."
+          - "Contract includes stable manifest item or child-address fields for spec-to-task handoff."
+        touch_surface:
+          - docs/artifact-substrate-v1.md
+        gateway_task_id: 019e1d86-ceb5-75f3-ae0f-d7fe4db553b0
+        status: done
+      - id: T003
+        team: backend
+        title: "Define workflow mutation, permissions, and idempotency contract"
+        depends_on: [T002]
+        spec_file: backend/T003-workflow-mutation-contract.md
+        acceptance_criteria:
+          - "Contract lists required authorization scope for artifact reads, version writes, comments, link writes, accepting versions, and task generation."
+          - "Contract states the initial trusted single-user/project boundary if full project/object authorization is deferred."
+          - "Contract defines idempotency key shape and uniqueness rules for mutating workflow endpoints."
+          - "Contract defines retry and partial-failure behavior for generated versions, contributions, links, chunks, and task records."
+          - "Contract requires actor/provenance fields on every workflow mutation result."
+        touch_surface:
+          - docs/workflow-mutation-contract.md
+          - crates/gateway/src/routes.rs
+        gateway_task_id: 019e1db9-d902-70e1-ab5e-2396b948e26f
+        status: done
+      - id: T004
+        team: infra
+        title: "Define operations envelope and migration rollback plan"
+        depends_on: [T002, T003]
+        spec_file: infra/T004-operations-envelope-and-rollout.md
+        acceptance_criteria:
+          - "Operations document defines maximum artifact body and contribution sizes, quota or warning behavior, and retention/archive policy."
+          - "Operations document defines backup and restore expectations for artifact tables, bodies, chunks, and links."
+          - "Operations document defines metrics for writes, diffs, search, chunking, failed chunks, and stale chunks."
+          - "Migration plan covers importing or linking existing task/spec/doc state where useful."
+          - "Rollback plan documents how clients return to existing task/docs behavior if artifact endpoints or body schemas need rework."
+          - "Dual-read/deprecation criteria for scratch files and legacy docs behavior are explicit."
+        touch_surface:
+          - docs/artifact-operations-rollout.md
+          - README.md
+        gateway_task_id: 019e1dcf-44bf-79b2-9dbf-68c8a428845f
+        status: done
+  - id: phase-2
+    name: "Phase 2 - Artifact Storage and Core API"
+    description: "Implement the durable substrate in SQLite and expose generic artifact APIs."
+    tasks:
+      - id: T005
+        team: backend
+        title: "Add artifact schema migrations and Rust models"
+        depends_on: [T002, T003, T004]
+        spec_file: backend/T005-artifact-schema-and-models.md
+        gateway_task_id: 019e1e04-ecde-7922-a5c5-773fee870374
+        acceptance_criteria:
+          - "Implementation includes a contract-to-table traceability matrix mapping T002/T003/T004 decisions to tables, columns, indexes, routes, and tests."
+          - "SQLite migration creates tables for artifacts, artifact_versions, artifact_chunks or the T002-approved chunk table, artifact_contributions, artifact_comments, artifact_links, artifact_actors, and workflow_runs or activities."
+          - "Schema enforces immutable versions and idempotency uniqueness for workflow mutations."
+          - "Schema stores current and accepted version references without collapsing them into lifecycle state."
+          - "Rust structs cover summary/detail models needed by routes and UI without leaking raw SQL rows."
+          - "Chunk schema and models cover immutable version anchoring, stable child addresses, stale/current-version query semantics, and search/index fields needed by documentation retrieval."
+          - "Chunk schema includes soft-supersession (`superseded_by_chunk_id` or equivalent) and tests prove historical retrieval can reconstruct superseded chunks."
+          - "Comment schema supports nullable child addresses/selectors for artifact-version comments, with a test that anchors a comment to `manifest.items[<manifest_item_id>]`."
+          - "Workflow run schema/tests allow resumable fan-out workflow kinds to recover from failed to succeeded under the same idempotency scope while keeping cancelled terminal."
+          - "DB unit tests cover insert, version immutability, accepted/current version behavior, link uniqueness, and workflow idempotency."
+        touch_surface:
+          - crates/gateway/src/db.rs
+        status: done
+      - id: T006
+        team: backend
+        title: "Implement artifact repository functions"
+        depends_on: [T016, T022]
+        spec_file: backend/T006-artifact-repository-functions.md
+        gateway_task_id: 019e1f0d-821f-7843-8cac-0411c063e7f1
+        acceptance_criteria:
+          - "DB layer can create/list/get artifacts by project, kind, status, label, actor, and search query."
+          - "DB layer can create immutable versions and retrieve version history and version bodies."
+          - "DB layer can add contributions, comments, links, and workflow run records with actor provenance."
+          - "DB layer exposes search over artifact body, contribution text, linked task ID, linked pattern ID, and linked doc ID."
+          - "DB layer consumes typed operations-envelope errors and helper queries from T016 rather than reimplementing T004 limit, quota, purge, or restore-check logic ad hoc."
+          - "Repository tests cover all public artifact DB functions and at least one retry/idempotency path."
+        touch_surface:
+          - crates/gateway/src/db.rs
+        status: done
+      - id: T023
+        team: backend
+        title: "Introduce DB-local artifact query builder"
+        depends_on: [T006]
+        spec_file: backend/T023-artifact-query-builder.md
+        gateway_task_id: 019e1f2d-55e4-7613-8868-54fd5903bf76
+        acceptance_criteria:
+          - "list_artifacts, list_artifact_links, and list_artifact_chunks use the shared DB-local query helper."
+          - "Existing filter/search behavior and ordering remain unchanged."
+          - "cargo test -p gateway db::tests passes."
+          - "cargo clippy -p gateway --all-targets -- -D warnings is clean."
+        touch_surface:
+          - crates/gateway/src/db.rs
+        status: done
+        notes: |
+          Promoted from T006 DRY check. Narrow DB-local query helper only; no route abstraction.
+          Completed in wave 5. Added private ArtifactQueryBuilder and migrated list_artifacts, list_artifact_links, and list_artifact_chunks without changing filter/search/order semantics.
+      - id: T024
+        team: backend
+        title: "Consolidate artifact idempotent write envelopes"
+        depends_on: [T006]
+        spec_file: backend/T024-artifact-idempotent-write-envelope.md
+        gateway_task_id: 019e1f2d-7aa4-70a3-ae68-96b30b99b873
+        acceptance_criteria:
+          - "Idempotent replay returns the original generated resource without rerunning aggregate side effects unless a guarded repair predicate is satisfied."
+          - "create_artifact_version preserves T003 partial-failure repair intent but cannot regress current_version_id after a newer version exists."
+          - "Repeated ArtifactWriteResult replay/insert/reload boilerplate is reduced where practical."
+          - "Tests cover partial pointer repair and stale replay non-regression."
+          - "cargo test -p gateway db::tests passes."
+          - "cargo clippy -p gateway --all-targets -- -D warnings is clean."
+        touch_surface:
+          - crates/gateway/src/db.rs
+        status: done
+        notes: |
+          Promoted from T006 DRY/semantic review. Semantic replay guard comes before mechanical write-envelope consolidation.
+          Completed in wave T024/T025/T028. Added repair_artifact_current_pointer_for_replay guard (stale replay cannot regress current_version_id), plus replayed_write_result helper consolidating 6 replay return sites. +214 LOC, 57/57 tests pass, clippy clean.
+      - id: T025
+        team: backend
+        title: "Extract project-scoped artifact link visibility predicate"
+        depends_on: [T006]
+        spec_file: backend/T025-artifact-link-visibility-predicate.md
+        gateway_task_id: 019e1f2e-062e-73c2-8db5-b27331cb03ad
+        acceptance_criteria:
+          - "Link quota counting and list_artifact_links use the same predicate/helper."
+          - "Tests cover source artifact, target artifact, source version, target version, and external/discovery-only cases."
+          - "Helper is suitable for T007 link routes and T017 authorization checks."
+          - "cargo test -p gateway db::tests passes."
+          - "cargo clippy -p gateway --all-targets -- -D warnings is clean."
+        touch_surface:
+          - crates/gateway/src/db.rs
+        status: done
+        notes: |
+          Promoted from T006 DRY check. Authorization substrate for later route/auth work.
+          Completed in wave T024/T025/T028. Added artifact_link_visibility_clause helper used by both list_artifact_links and link quota counter. +212 LOC, 50/50 tests pass, clippy clean.
+      - id: T027
+        team: backend
+        title: "Split or harden ArtifactUpdate pointer fields"
+        depends_on: [T006]
+        spec_file: backend/T027-artifact-update-pointer-safety.md
+        gateway_task_id: 019e1f2e-285d-7621-9fb1-b21139de2391
+        acceptance_criteria:
+          - "Generic artifact metadata/state updates cannot create dangling or cross-artifact current_version_id/accepted_version_id pointers."
+          - "Dedicated pointer mutation path validates version membership and keeps existing create/accept semantics intact."
+          - "Tests cover rejected missing/cross-artifact pointer updates and successful valid pointer updates through the dedicated path if one remains public."
+          - "cargo test -p gateway db::tests passes."
+          - "cargo clippy -p gateway --all-targets -- -D warnings is clean."
+        touch_surface:
+          - crates/gateway/src/db.rs
+        status: done
+        notes: |
+          Promoted from T006 semantic review. Must land before generic artifact update routes.
+      - id: T028
+        team: backend
+        title: "Define contribution/comment target and read_set validation boundary"
+        depends_on: [T006]
+        spec_file: backend/T028-artifact-target-readset-validation.md
+        gateway_task_id: 019e1f2e-49a3-7f62-8ee6-e64c19523433
+        acceptance_criteria:
+          - "Boundary is explicit in code/spec comments: repository-level validators or route-level validation contract."
+          - "Missing and cross-artifact target_kind/target_id references cannot be inserted through the chosen public write path."
+          - "read_set reference resolution is validated for artifact version, manifest item/chunk/comment/workflow-run references that T006/T007 can reasonably resolve."
+          - "Deferred reference kinds are documented with owner task."
+          - "Tests cover missing target, cross-artifact target, unresolved read_set ref, and valid refs."
+          - "cargo test -p gateway db::tests or route tests pass, depending on chosen layer."
+          - "cargo clippy -p gateway --all-targets -- -D warnings is clean."
+        touch_surface:
+          - crates/gateway/src/db.rs
+          - crates/gateway/src/routes.rs
+        status: done
+        notes: |
+          Promoted from T006 semantic review. Land before public contribution/comment writers or workflow writers depend on these rows.
+          Completed in wave T024/T025/T028. Boundary chosen: repository-level (DB layer). Validators validate_target_ref/validate_read_set_refs wired into add_artifact_contribution and add_artifact_comment so all callers inherit. routes.rs untouched (no contribution/comment routes yet — T007 plugs in). +403 LOC, 55/55 tests pass, clippy clean. Deferred read_set kinds: manifest_item (T011), task (T009), pattern/memory/commit/external_url (no owner).
+      - id: T029
+        team: backend
+        title: "Fold parent_comment_id check into validate_target_ref"
+        depends_on: [T028]
+        spec_file: backend/T029-fold-parent-comment-into-validate-target-ref.md
+        gateway_task_id: 019e2209-6175-7302-88b7-f956ee343251
+        acceptance_criteria:
+          - "validate_target_ref accepts 'comment' kind and validates artifact ownership."
+          - "add_artifact_comment parent-comment check delegates to validate_target_ref."
+          - "Existing T028 tests pass unchanged; a new test exercises cross-artifact parent rejection via add_artifact_comment."
+          - "cargo test -p gateway passes."
+          - "cargo clippy -p gateway --all-targets -- -D warnings is clean."
+        touch_surface:
+          - crates/gateway/src/db.rs
+        status: done
+        notes: |
+          Promoted from T024/T025/T028 DRY check (refactor-proposals lens, finding dry-001).
+          ~-8 LOC, low risk, 10-15 min.
+          Completed in wave 6. validate_target_ref now accepts target_kind=comment, add_artifact_comment delegates parent_comment_id validation to it, and a focused cross-artifact parent rejection test was added. Validation passed: cargo test -p gateway and cargo clippy -p gateway --all-targets -- -D warnings.
+      - id: T018
+        team: backend
+        title: "Extract artifact insert/serialization helpers in db.rs"
+        depends_on: [T005]
+        spec_file: backend/T018-artifact-db-helper-extraction.md
+        gateway_task_id: 019e1e77-b65b-7b13-950b-f52a0f10334f
+        acceptance_criteria:
+          - "Zero remaining inline occurrences of the JSON-or-null serialize pattern in db.rs."
+          - "serialize_labels is renamed to serialize_string_array; no call site references the old name."
+          - "All T005 tests pass without modification."
+          - "cargo clippy -p gateway --all-targets -- -D warnings is clean."
+          - "If a macro/helper for inserts was introduced, at least 3 of the 6 pure-insert helpers use it; otherwise an inline comment justifies the rejection."
+        touch_surface:
+          - crates/gateway/src/db.rs
+        status: done
+        notes: |
+          Promoted from wave-1 DRY check (refactor-proposals + semantic-duplication peers converged).
+          Preventative refactor — must land before T006 to avoid multiplying boilerplate.
+      - id: T019
+        team: qa
+        title: "Extract artifact test fixture helpers"
+        depends_on: [T007, T008]
+        spec_file: qa/T019-artifact-test-fixture-helpers.md
+        acceptance_criteria:
+          - "All artifact-substrate tests still pass with the same pass count."
+          - "At least 3 named test fixture helpers exist and are used by at least 2 tests each."
+          - "No test body contains a 3+ line setup block that has an exact duplicate elsewhere."
+          - "cargo clippy -p gateway --all-targets -- -D warnings is clean."
+          - "PR diff is restricted to #[cfg(test)] modules; no production code touched."
+        touch_surface:
+          - crates/gateway/src/db.rs
+          - crates/gateway/src/routes.rs
+        status: done
+        notes: |
+          Completed in wave 6. Added generic artifact HTTP handlers, route wiring, rollback flags, README endpoint documentation, and focused route tests. Validation passed: cargo test -p gateway routes::tests, cargo test -p gateway, cargo clippy -p gateway --all-targets -- -D warnings, and git diff --check for README/main/routes.
+        notes: |
+          Promoted from wave-1 DRY check. Cleanup task — runs after T007/T008 stabilize the test surface.
+      - id: T016
+        team: backend
+        title: "Wire artifact operations envelope runtime support"
+        depends_on: [T004, T005, T018]
+        spec_file: backend/T016-artifact-operations-runtime-support.md
+        acceptance_criteria:
+          - "Runtime loads and normalizes the T004 size, quota, retention, purge, and restore-check configuration keys once through a typed operations envelope."
+          - "Shared helpers expose stable typed errors for size-limit and quota failures, including soft quota warnings and hard quota rejects."
+          - "Repository/runtime layer exposes archived body and structured-payload purge entry points matching the T004 retention policy."
+          - "Repository/runtime layer exposes restore-check helper queries for artifact pointer consistency, audit-path links, workflow run consistency, idempotency mappings, and chunk regeneration validation."
+          - "Unit tests cover default values and shrunken T008 fixture values without duplicating T004 constants in route code."
+        touch_surface:
+          - crates/gateway/src/db.rs
+          - crates/gateway/src/routes.rs
+        gateway_task_id: 019e1de1-157d-7bd3-a8b7-9d28d1f80aec
+        status: done
+      - id: T020
+        team: backend
+        title: "Consolidate numeric env parsers in db.rs"
+        depends_on: [T016]
+        spec_file: backend/T020-consolidate-env-parsers.md
+        gateway_task_id: 019e1ed9-dd19-7951-91a2-53f1b5523995
+        acceptance_criteria:
+          - "One generic parse_positive (or macro) replaces the three near-identical helpers; no behavior change."
+          - "All T016 unit tests pass unmodified."
+          - "cargo clippy -p gateway --all-targets -- -D warnings is clean."
+          - "PR diff restricted to crates/gateway/src/db.rs."
+        touch_surface:
+          - crates/gateway/src/db.rs
+        status: done
+        notes: |
+          Promoted from wave-2 DRY check (refactor + semantic peers converged).
+          Pre-T006 cleanup to avoid multiplying boilerplate.
+      - id: T021
+        team: backend
+        title: "Consolidate restore-check helpers via RestoreFindingCollector"
+        depends_on: [T016]
+        spec_file: backend/T021-restore-check-collector.md
+        gateway_task_id: 019e1ed9-dd57-7ac3-bccd-82a5a6b0ecf9
+        acceptance_criteria:
+          - "Shared collector abstraction replaces the five restore_check_* per-helper loops."
+          - "RestoreCheckReport shape and run_restore_check signature unchanged."
+          - "All T016 restore-check tests pass unmodified."
+          - "Net LOC reduction of at least 60 lines across the five helpers."
+          - "cargo clippy -p gateway --all-targets -- -D warnings is clean."
+          - "PR diff restricted to crates/gateway/src/db.rs."
+        touch_surface:
+          - crates/gateway/src/db.rs
+        status: done
+        notes: |
+          Promoted from wave-2 DRY check (highest-ROI consolidation; both lenses converged).
+          Pre-T006/T014 cleanup; preserves no-auto-repair invariant.
+      - id: T022
+        team: backend
+        title: "Propagate restore-check collector row errors"
+        depends_on: [T021]
+        spec_file: backend/T022-restore-collector-row-errors.md
+        gateway_task_id: 019e1f05-35f5-7c23-96e5-6eb1dc1a174d
+        acceptance_criteria:
+          - "RestoreFindingCollector::collect propagates row mapper errors instead of dropping them."
+          - "RestoreCheckReport shape and run_restore_check signature are unchanged."
+          - "Existing restore-check tests pass unmodified."
+          - "A focused DB test proves row mapper errors are not swallowed, or the task comment explains why it was impractical."
+          - "cargo test -p gateway passes."
+          - "cargo clippy -p gateway --all-targets -- -D warnings is clean."
+        touch_surface:
+          - crates/gateway/src/db.rs
+        status: done
+        notes: |
+          Promoted from T021 DRY check. Narrow pre-T006 hardening only; keep RestoreFindingCollector restore-check-local.
+      - id: T007
+        team: backend
+        title: "Expose generic artifact HTTP API"
+        depends_on: [T006, T023, T024, T025, T027, T028]
+        spec_file: backend/T007-generic-artifact-http-api.md
+        acceptance_criteria:
+          - "Route family is explicitly named, starting from `/v1/projects/:ident/artifacts` with nested version, comment, contribution, and link routes unless T002/T003 justify a different shape."
+          - "Routes expose artifact list, create, get, versions, version create, diff, comments, contributions, and links operations."
+          - "Every mutating endpoint validates authorization boundary, idempotency key requirements, actor fields, immutable source references, size limits, and T004 soft/hard quota behavior."
+          - "Routes allow retrying declared resumable mutations on a failed workflow_run and reject retries on cancelled or non-resumable failed runs according to T003."
+          - "Responses and read models expose T004 freshness/chunking status fields, including partial chunk status where chunks failed or are stale."
+          - "Routes emit the T004 metrics surface for writes, diffs, search, chunking, failed chunks, stale chunks, quota warnings, and quota rejects."
+          - "Rollback feature flags can disable artifact endpoints or body-schema-dependent behavior while preserving documented legacy task/docs fallback behavior."
+          - "Responses include stable artifact, version, contribution, comment, link, actor, and workflow run IDs where applicable."
+          - "Route tests cover validation failures, happy paths, idempotent retry, and missing immutable source version failures."
+          - "README API reference includes the generic artifact endpoints and v1 contract summary."
+        touch_surface:
+          - crates/gateway/src/routes.rs
+          - crates/gateway/src/main.rs
+          - README.md
+        gateway_task_id: 019e221d-9fcd-7ef0-82df-5d1f27f8d963
+        status: done
+        notes: |
+          Completed in wave 6. Added generic artifact HTTP handlers, route wiring, rollback flags, README endpoint documentation, and focused route tests. Validation passed: cargo test -p gateway routes::tests, cargo test -p gateway, cargo clippy -p gateway --all-targets -- -D warnings, and git diff --check for README/main/routes.
+      - id: T030
+        team: backend
+        title: "Consolidate artifact mutation route context"
+        depends_on: [T007, T029]
+        spec_file: backend/T030-consolidate-artifact-mutation-route-context.md
+        gateway_task_id: 019e2231-7bd6-7a13-8ee8-0064c147e762
+        acceptance_criteria:
+          - "A shared route-local helper handles common artifact mutation scaffolding without hiding endpoint-specific validation or DB write semantics."
+          - "Artifact mutation handlers no longer duplicate feature-gate, mutation-context parse, actor-resolution, spawn-blocking/error-map, provenance, replay-status, and metric-result scaffolding."
+          - "`create_artifact_link_handler` no longer open-codes workflow-run retryability checks; link workflow-run validation shares canonical cancelled/non-resumable/not-found semantics with artifact-scoped mutations."
+          - "Existing T007 route tests pass unchanged or with only assertion updates needed by helper extraction."
+          - "At least one focused regression proves replayed mutations still return the expected HTTP status, `provenance.replayed`, generated resource IDs, and metric result behavior after consolidation."
+          - "cargo test -p gateway routes::tests passes."
+          - "cargo test -p gateway passes."
+          - "cargo clippy -p gateway --all-targets -- -D warnings is clean."
+        touch_surface:
+          - crates/gateway/src/routes.rs
+        status: done
+        notes: |
+          Promoted from wave 6 DRY check. Both peers converged that T007's repeated mutation route scaffolding, actor/idempotency parsing, and link workflow-run retryability checks should be consolidated before T009/T010/T011 add specialized workflow routes.
+          Completed in wave 7. Added six route-local helpers (begin_artifact_mutation, finalize_mutation, finalize_ok_mutation, ensure_workflow_run_retryable, load_workflow_run_for_link, result_label) consolidating mutation-context scaffolding across nine artifact mutation handlers. Link handler now shares cancelled/non-resumable-failed semantics via load_workflow_run_for_link. New regression test artifact_mutation_helpers_preserve_replay_envelope_after_consolidation. Validation: cargo test -p gateway routes::tests 9/9, cargo test -p gateway 62/62, cargo clippy -p gateway --all-targets -- -D warnings clean. Net +185 LOC in routes.rs. Downstream guidance for T009/T010/T011: use begin_artifact_mutation + finalize_mutation/finalize_ok_mutation; project-scoped handlers use load_workflow_run_for_link, artifact-scoped use validate_workflow_run_for_mutation.
+      - id: T008
+        team: qa
+        title: "Add artifact substrate regression tests"
+        depends_on: [T004, T005, T006, T007]
+        spec_file: qa/T008-artifact-substrate-regression-tests.md
+        gateway_task_id: 019e2232-cc14-7e50-a35a-be25275e99ab
+        acceptance_criteria:
+          - "`cargo test -p gateway` includes coverage for artifact lifecycle, immutable versions, accepted/current version divergence, comments, links, and workflow provenance."
+          - "Tests verify body and contribution size limit failures return stable client errors using fixture values from T004."
+          - "Tests verify T004 quota soft warnings and hard rejects using the documented shrunken fixture values."
+          - "Tests verify stale chunks and partial chunking failures surface stable status fields for route and documentation retrieval consumers."
+          - "Tests verify retrying a mutation with the same idempotency key returns or references the original generated resource."
+          - "Tests verify search and retrieval can find artifacts by body text, contribution text, and linked task/doc/pattern IDs."
+          - "Tests include at least one migration compatibility check for existing task and API doc tables."
+        touch_surface:
+          - crates/gateway/src/db.rs
+          - crates/gateway/src/routes.rs
+        status: done
+        notes: |
+          Completed in wave 8. Expanded DB artifact search regression coverage for linked task/API doc/pattern IDs plus body and contribution text. Added route regressions for T004 stable 413 size-limit errors, soft quota warning vs hard quota reject behavior, and stale/partial chunking status on artifact/version/diff retrieval. Validation passed: cargo test -p gateway artifact_routes_return_stable_t004_size_limit_errors, cargo test -p gateway artifact_routes_surface_soft_quota_warning_and_hard_reject, cargo test -p gateway artifact_routes_expose_stale_and_partial_chunking_status, cargo test -p gateway artifact_repository_filters_detail_and_search_related_rows, cargo test -p gateway, and cargo clippy -p gateway --all-targets -- -D warnings.
+      - id: T031
+        team: qa
+        title: "Centralize T004 shrunken artifact operations test fixture"
+        depends_on: [T008]
+        spec_file: qa/T031-centralize-t004-shrunken-artifact-operations-test-fixture.md
+        gateway_task_id: 019e22ad-4b64-76f2-a850-5692518a967e
+        acceptance_criteria:
+          - "DB envelope tests and route regression tests derive shrunken T004 limits/quotas from one shared test-only source."
+          - "DB tests still prove env-style key/value parsing through `from_env_with`."
+          - "Route tests still assert stable 413 size-limit errors, quota soft warning vs hard reject behavior, and stale/partial chunking status."
+          - "No broad route helper extraction obscures acceptance-criteria readability."
+          - "`cargo test -p gateway` passes."
+          - "`cargo clippy -p gateway --all-targets -- -D warnings` is clean."
+        touch_surface:
+          - crates/gateway/src/db.rs
+          - crates/gateway/src/routes.rs
+        status: done
+        notes: |
+          Completed after T009/T010/T011. Centralized the T004 shrunken artifact operations fixture into db::t008_shrunken_artifact_operations_fixture_env / db::t008_shrunken_artifact_operations_fixture and reused it from route tests. DB tests still exercise from_env_with parsing; route tests keep endpoint-specific request/assertion readability. Validation passed: cargo test -p gateway operations_envelope_loads_shrunken_fixture, cargo test -p gateway artifact_routes_surface_soft_quota_warning_and_hard_reject, cargo test -p gateway (75 tests), and cargo clippy -p gateway --all-targets -- -D warnings.
+  - id: phase-3
+    name: "Phase 3 - Specialized Workflows"
+    description: "Build spec, design review, and project documentation behavior on top of the shared substrate."
+    tasks:
+      - id: T009
+        team: backend
+        title: "Implement spec artifact workflow and retry-safe task generation"
+        depends_on: [T007, T008, T024, T028, T030]
+        spec_file: backend/T009-spec-artifact-workflow.md
+        gateway_task_id: 019e2232-cc17-76f2-b318-5293fa4a5ee0
+        acceptance_criteria:
+          - "Spec workflow stores source links, manifest versions, per-task detail, phase/task metadata, touch surfaces, acceptance criteria, validation plans, focused task spec body/file path, gateway task IDs, and stable manifest item IDs in artifact versions."
+          - "Route/repository API exposes create/import, iterate/version, accept, manifest retrieval, manifest-item retrieval, generate-tasks, and link-existing-task operations."
+          - "Manifest item ID stability rules cover unchanged, renamed, split, merged, and deleted items across spec versions, including collision/replacement behavior."
+          - "Task generation requires the authorization/confirmation policy chosen in T003 and records source spec artifact ID, immutable version ID, and manifest item ID in both the gateway task source field and an artifact link."
+          - "Task generation is idempotent across reruns and partial failures, linking existing gateway task IDs instead of duplicating work."
+          - "Failed task-generation runs are resumable under T003: retry fills missing manifest items, preserves existing task/link IDs, and moves the same workflow_run to succeeded when complete."
+          - "Workflow records contributions or workflow run outputs for generated tasks and implementation handoff notes."
+          - "Tests cover accepted-version generation, manifest import from a spec-directory-shaped fixture, manifest-item retrieval by stable ID, rerun behavior, partial failure recovery, and task source/back-links."
+        touch_surface:
+          - crates/gateway/src/db.rs
+          - crates/gateway/src/routes.rs
+        status: done
+        notes: |
+          Completed in serialized wave after T008. Added spec create/import, iterate/version, accept, manifest retrieval, manifest-item retrieval, generate-tasks, and link-existing-task handlers/routes on the generic artifact substrate. Generation uses accepted immutable spec versions, stable manifest item IDs, deterministic per-item link idempotency keys, resumable spec_task_generation workflow runs, existing-link reuse, existing-task recovery from embedded source metadata, and task_generated_from_spec artifact links. Compatibility fallback: current task schema lacks first-class source fields, so generated task details/specification and a system task comment carry source_spec_artifact_id, source_spec_version_id, and manifest_item_id while artifact links provide the durable graph edge. Validation passed: cargo test -p gateway (69 tests) and cargo clippy -p gateway --all-targets -- -D warnings.
+      - id: T010
+        team: backend
+        title: "Implement design review artifact workflow"
+        depends_on: [T007, T008, T024, T028, T030]
+        spec_file: backend/T010-design-review-artifact-workflow.md
+        gateway_task_id: 019e2232-cc22-7390-bfc9-a0536a8df4f8
+        acceptance_criteria:
+          - "Design review workflow can create review artifacts, record review rounds, pass 1 contributions, pass 2 contributions, and synthesis contributions."
+          - "Pass 2 and synthesis records preserve deterministic read-set or prior contribution IDs."
+          - "Workflow state supports draft, collecting reviews, synthesizing, needs user decision, accepted, and superseded without corrupting artifact version state."
+          - "Research analyst retrieval can fetch all contributions by artifact ID, round, phase, actor role, and reviewed version."
+          - "Tests cover two-pass contribution provenance and synthesis creating a new artifact version."
+        touch_surface:
+          - crates/gateway/src/db.rs
+          - crates/gateway/src/routes.rs
+        status: done
+        notes: |
+          Completed in serialized wave after T009. Implemented design-review artifact workflow primitives: create review artifact, start review rounds, record pass 1/pass 2 contributions, synthesis with optional new artifact version, state transitions, and analyst retrieval filters by round/phase/role/reviewed version/read set. Validation passed: cargo test -p gateway (72 passed; 0 failed) and cargo clippy -p gateway --all-targets -- -D warnings.
+      - id: T011
+        team: backend
+        title: "Integrate project documentation artifacts and chunks"
+        depends_on: [T001, T007, T008, T024, T030]
+        spec_file: backend/T011-project-documentation-artifacts.md
+        gateway_task_id: 019e2232-cc1f-7572-b69f-d18f8ce02198
+        acceptance_criteria:
+          - "Documentation publishing follows the T001 decision and writes artifact-backed docs with API-doc compatibility behavior."
+          - "Chunks reference immutable artifact or docs versions and expose whether retrieval searches current versions only or history."
+          - "Existing generated API-doc chunks migrate to artifact-backed chunks anchored by immutable artifact_version_id plus stable child_address, with tests for current-version-only and history-aware retrieval."
+          - "API context documentation artifacts carry the T004 `retain:permanent` behavior unless an explicit operator override is documented."
+          - "Documentation retrieval exposes exact `chunking_status=partial` behavior for stale or failed chunks and includes `manifest.chunk_count` in structured payloads for restore validation."
+          - "Docs workflow implements the T004 Phase 3 API-doc/read-source migration and rollback behavior without breaking legacy API-doc reads."
+          - "Existing API docs endpoints continue working during migration or return documented compatibility redirects/aliases."
+          - "Legacy api_docs.kind remains a response/filter field with current semantics; it is not collapsed into artifact kind=documentation or subkind=api_context."
+          - "Docs can link to specs, tasks, patterns, and source repository refs."
+          - "Tests cover chunk source immutability, docs search behavior, and compatibility for existing `api-docs` handlers."
+        touch_surface:
+          - crates/gateway/src/db.rs
+          - crates/gateway/src/routes.rs
+          - README.md
+        status: done
+        notes: |
+          Completed in serialized wave after T010. Implemented artifact-backed API-doc compatibility while preserving legacy api_docs.kind/filter semantics, reused artifact chunks for immutable documentation versions, added current/history retrieval and partial/stale chunking status, included manifest.chunk_count for restore validation, and documented docs workflow behavior in README. Validation passed: cargo test -p gateway (75 passed; 0 failed) and cargo clippy -p gateway --all-targets -- -D warnings.
+  - id: phase-4
+    name: "Phase 4 - Workspace UI, Agent Context, and Release Readiness"
+    description: "Expose artifacts to humans and agents, publish agent-native docs, and validate rollout."
+    tasks:
+      - id: T012
+        team: frontend
+        title: "Add artifact workspace UI"
+        depends_on: [T007, T009, T010, T011]
+        spec_file: frontend/T012-artifact-workspace-ui.md
+        gateway_task_id: 019e2232-fcd5-7e82-ae0f-fca6ce7ad1f0
+        acceptance_criteria:
+          - "UI exposes project artifact list filtered by kind, status, label, and actor."
+          - "Artifact detail page shows current version, accepted version when different, contribution timeline, comments, and linked tasks/docs/patterns."
+          - "Version history view can show diffs between two artifact versions."
+          - "Review round view shows pass 1, pass 2, synthesis, read-set/provenance, and decision state."
+          - "Spec manifest view shows tasks, dependencies, status, acceptance criteria, validation plans, and generated gateway task links."
+          - "Documentation browser supports search and chunk inspection for current-version and history-aware retrieval modes."
+          - "UI tests or route shape tests verify dense operational layout and control-panel navigation."
+        touch_surface:
+          - crates/gateway/src/routes.rs
+          - crates/gateway/src/main.rs
+        status: done
+        notes: |
+          Completed after T009/T010/T011. Added server-rendered artifact workspace UI: /artifacts index, /projects/{ident}/artifacts filtered workspace, /projects/{ident}/artifacts/{artifact_id} detail view, sidebar navigation, and route shape coverage. Detail pages show version history/diff, spec manifest rows, design review contribution/read-set rows, documentation chunk search/history controls, comments, contributions, and links. Validation passed: cargo test -p gateway control_panel_nav_exposes_artifacts, cargo test -p gateway artifact_workspace_pages_show_operational_sections, cargo test -p gateway (77 tests), cargo clippy -p gateway --all-targets -- -D warnings, and browser smoke on http://127.0.0.1:7914/artifacts with a seeded artifact.
+      - id: T013
+        team: docs
+        title: "Publish agent-native API context for artifact workflows"
+        depends_on: [T007, T009, T010, T011]
+        spec_file: docs/T013-artifact-api-agent-context.md
+        gateway_task_id: 019e2232-fccc-7483-b3d4-cfc363d1988e
+        acceptance_criteria:
+          - "Existing agent-gateway API context is updated or intentionally replaced without creating a duplicate app/context entry."
+          - "`.agent/api/gateway.yaml` or equivalent agent API context document describes artifact, review, spec, and docs workflows."
+          - "Docs export behavior is specified, including `agent-tools docs export`, manifest/source path format, accepted-version selection, and overwrite-vs-propose conflict policy."
+          - "`agent-tools docs validate --file .agent/api/gateway.yaml` or the chosen existing-context file passes."
+          - "`agent-tools docs publish --file .agent/api/gateway.yaml` or the chosen existing-context file has been run or is captured as a release-blocking manual step."
+          - "Published context includes auth expectations, idempotency examples, provenance fields, safety constraints, schemas, and copyable curl examples."
+          - "`agent-tools docs search` and `agent-tools docs chunks` can retrieve artifact workflow context after publish."
+          - "README points agents to gateway API docs before code search for artifact behavior."
+        touch_surface:
+          - README.md
+          - .agent/api/agent-gateway.yaml
+        status: done
+        notes: |
+          Completed after T009/T010/T011. Updated existing .agent/api/agent-gateway.yaml with generic artifact, spec, design-review, and artifact-backed docs workflows; auth/idempotency/provenance contract; route families; copyable examples; schemas; safety guidance; and docs export policy. Updated README to direct agents to the API context before code search. Republished the context as 019e23b8-712a-7130-816b-6cab947c1544 and deleted stale duplicate context rows. Validation passed: agent-tools docs validate --file .agent/api/agent-gateway.yaml, agent-tools docs publish --file .agent/api/agent-gateway.yaml, agent-tools docs search "artifact workflow", agent-tools docs chunks --query "artifact" --app agent-gateway, cargo test -p gateway (79 tests), and cargo clippy -p gateway --all-targets -- -D warnings.
+      - id: T015
+        team: docs
+        title: "Coordinate client and skill migration to artifact IDs"
+        depends_on: [T009, T010, T011, T013]
+        spec_file: docs/T015-client-skill-migration.md
+        gateway_task_id: 019e2232-fcd0-7b41-8dd9-787a9c9c0d08
+        acceptance_criteria:
+          - "Migration plan defines agent-tools CLI commands or delegated tasks for `artifacts`, `reviews`, and `specs` operations."
+          - "Migration plan defines how `/design-review`, `/spec`, and `/implement` stop using scratch-file handoff as canonical state and pass stable artifact/spec/task IDs instead."
+          - "Plan defines dual-read compatibility and fallback behavior while existing scratch-file and task-specification workflows still exist."
+          - "Plan identifies whether required client/skill updates live in this repo, the agent-tools project, local skill directories, or delegated gateway tasks."
+          - "Release checklist blocks scratch-file deprecation until artifact-ID handoff is validated end to end."
+        touch_surface:
+          - docs/artifact-client-skill-migration.md
+          - .agent/api/agent-gateway.yaml
+          - README.md
+        status: done
+        notes: |
+          Completed with docs/artifact-client-skill-migration.md, README updates, and API-context migration guidance. The plan defines artifact/review/spec/docs CLI wrappers, canonical stable-ID handoff for /design-review, /spec, and /implement, dual-read fallback behavior, ownership across this repo, agent-tools, and synced local skills, and release gates that block scratch-file deprecation. Created delegated agent-tools work 019e23b7-6300-7441-9370-ac19b3302d58 targeting 019e23b7-62fd-7540-ac79-a5cb4ac6731a for artifacts/reviews/specs wrappers. Validation passed: docs YAML validation/publish/search/chunks, cargo test -p gateway (79 tests), cargo clippy -p gateway --all-targets -- -D warnings, and git diff --check.
+      - id: T014
+        team: qa
+        title: "Validate rollout, migration, and rollback readiness"
+        depends_on: [T009, T010, T011, T012, T013, T015]
+        spec_file: qa/T014-rollout-migration-rollback-validation.md
+        gateway_task_id: 019e2232-fcd3-76f1-b0fa-f9066490014d
+        acceptance_criteria:
+          - "Validation plan exercises importing or linking existing task/spec/doc state and verifies idempotent artifact links to existing task IDs."
+          - "Dual-read compatibility is tested for legacy task specification and docs behavior during transition."
+          - "End-to-end validation proves agent-tools and `/design-review`, `/spec`, and `/implement` can use stable artifact/spec/task IDs instead of scratch files as canonical handoff."
+          - "Rollback procedure is tested or dry-run documented for disabling artifact endpoints or reverting body schema assumptions."
+          - "T004 section 4.3 restore verification is exercised or dry-run documented, including pointer consistency, audit-path links, workflow runs, idempotency mappings, and chunk regeneration."
+          - "T004 section 9 deprecation gates are checked explicitly before scratch files, legacy docs behavior, legacy skill modes, or feature flags are removed."
+          - "Metrics/logging checks cover artifact writes, diffs, search, chunking, failed chunks, and stale chunks."
+          - "`cargo test -p gateway` passes after the full feature set lands."
+        touch_surface:
+          - docs/artifact-operations-rollout.md
+          - crates/gateway/src/db.rs
+          - crates/gateway/src/routes.rs
+        status: done
+        notes: |
+          Completed final rollout validation notes in docs/artifact-operations-rollout.md section 14. Recorded migration/compatibility evidence for spec import, existing-task linking, idempotent task generation, and API-doc compatibility; documented stable-ID workflow evidence, rollback dry run, restore-check dry run, deprecation gates, metrics/logging checks, hardened-auth UI/API smoke, and validation commands. Validation passed: cargo test -p gateway (79 tests), cargo clippy -p gateway --all-targets -- -D warnings, agent-tools docs validate/publish/search/chunks, git diff --check, and browser smoke on http://127.0.0.1:7915/artifacts.
+  - id: phase-5
+    name: "Phase 5 - Deferred Multi-User Hardening"
+    description: "Track work explicitly deferred from the trusted v1 slice so it is not confused with release readiness."
+    tasks:
+      - id: T017
+        team: backend
+        title: "Implement project-scoped artifact authorization and administer overrides"
+        depends_on: [T007, T012, T025]
+        spec_file: backend/T017-project-scoped-artifact-authorization.md
+        acceptance_criteria:
+          - "Trusted-single-tenant no-op authorization is replaced with project membership and scope checks for artifact reads, writes, comments, links, accepting versions, task generation, and workflow actions."
+          - "`project.administer` or the chosen equivalent scope is required for T004 quota override behavior."
+          - "Authorization failures preserve the T003 response shape, actor/provenance fields, and auditability expectations."
+          - "CLI and UI surfaces expose clear trusted-boundary or authorization-state signals during migration."
+          - "Tests cover authorized access, forbidden access, quota override allowed for administrators, and quota override rejected for non-administrators."
+        touch_surface:
+          - crates/gateway/src/routes.rs
+          - crates/gateway/src/main.rs
+          - README.md
+        gateway_task_id: 019e1de1-1581-79a1-b3e6-f3d8a2d49f72
+        status: done
+        notes: |
+          Completed hardened artifact authorization mode. Added GATEWAY_ARTIFACT_AUTH_ENFORCED, project/scope checks via X-Agent-Project and X-Agent-Scopes for artifact reads and mutations, project.administer enforcement for X-Artifact-Quota-Override, project-scoped provenance boundary reporting, README/API-context documentation, artifact UI authorization-state signals, and route tests for allowed, forbidden, and administrator override paths. Trusted-single-tenant remains the default migration mode; hardened mode is opt-in for rollout. Validation passed: cargo test -p gateway artifact_ (32 tests), cargo test -p gateway (79 tests), cargo clippy -p gateway --all-targets -- -D warnings, and hardened browser/API smoke.

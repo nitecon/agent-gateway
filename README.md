@@ -150,6 +150,15 @@ For a full production setup on Linux (dedicated service user, hardened unit file
 
 All endpoints require `Authorization: Bearer <GATEWAY_API_KEY>`.
 
+Agent-facing workflow context lives in `.agent/api/agent-gateway.yaml`. Before searching code for artifact, review, spec, docs, task, or pattern behavior, agents should run:
+
+```bash
+agent-tools docs search "agent-gateway artifact workflow"
+agent-tools docs chunks --query "spec artifact generate tasks"
+```
+
+The API context is the canonical agent handoff surface for artifact workflows. It covers generic artifacts, design review rounds, spec manifests and task generation, artifact-backed API docs, idempotency/provenance headers, and the proposed `agent-tools docs export` contract.
+
 ### Messaging
 
 | Method | Path | Description |
@@ -203,6 +212,20 @@ Project-scoped registry for agent-native API context. This is designed for
 apps that often do not have OpenAPI/Swagger yet: publish docs-first structured
 context directly, or import generated specs later as one source format.
 
+> **Compatibility note.** API docs are moving onto the shared artifact
+> substrate as a documentation artifact kind (`subkind = "api_context"`).
+> The routes and `agent-tools docs *` commands documented below remain the
+> canonical agent retrieval path and keep their current request/response
+> shape; the underlying storage is becoming artifact + immutable
+> artifact_version with version-anchored chunks, comments, and links.
+> Existing API doc IDs are preserved. See
+> [`docs/artifacts-api-docs-integration.md`](docs/artifacts-api-docs-integration.md)
+> for the full mapping, and
+> [`docs/artifact-operations-rollout.md`](docs/artifact-operations-rollout.md)
+> for the production size limits, quotas, retention, backup/restore,
+> metrics, migration phases, and rollback path that govern this
+> transition.
+
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/v1/projects/:ident/api-docs` | List API context summaries. Supports `q`, `app`, `label`, and `kind` query filters. |
@@ -211,6 +234,32 @@ context directly, or import generated specs later as one source format.
 | `GET` | `/v1/projects/:ident/api-docs/:id` | Fetch one API context document with full JSON content. |
 | `PATCH` | `/v1/projects/:ident/api-docs/:id` | Update API context metadata or content. Nullable fields such as `summary`, `source_ref`, and `version` can be set to `null`. |
 | `DELETE` | `/v1/projects/:ident/api-docs/:id` | Delete one API context document. |
+
+API doc list/get responses keep the legacy `kind` field and `kind` filter
+semantics (`agent_context`, etc.). They also include additive artifact
+compatibility fields: `artifact_id`, `artifact_version_id`, `subkind`,
+`manifest_chunk_count`, `chunking_status`, and `linked_ids`.
+
+`GET /v1/projects/:ident/api-docs/chunks` still returns the legacy JSON array
+by default. Each chunk now also identifies its immutable source with
+`artifact_id`, `artifact_version_id`, `accepted_version_id`, `child_address`,
+`freshness` (`current`, `stale`, or `superseded_history`), and
+`retrieval_scope`. Default retrieval is current-version-only and excludes
+soft-superseded history. Pass `include_history=true` to include historical
+chunks, and pass `envelope=true` to receive `{chunks, chunking_status,
+retrieval_scope, include_history}` for restore/readiness checks. A partial or
+stale chunking state is surfaced explicitly instead of silently succeeding.
+
+Published API context versions store `structured_payload.manifest.chunk_count`
+so restore validation can compare regenerated `artifact_chunks` against the
+accepted immutable version. API context documentation artifacts carry
+`retain:permanent` by default.
+
+Docs can link through the artifact link model to specs (`target_kind:
+"artifact"` for spec artifacts), tasks (`"task"`), patterns (`"pattern"`), and
+repository refs. Source repository refs use `target_kind: "commit"` for commit
+SHAs or `target_kind: "external_url"` for repository paths/URLs until a
+first-class repository-path target kind exists.
 
 The canonical payload is agent context, not OpenAPI. OpenAPI/Swagger should be
 stored as `source_format: "openapi"` or `source_format: "swagger"` when it is
@@ -266,6 +315,63 @@ Example docs-first publish body:
   }
 }
 ```
+
+### Generic artifacts
+
+The artifact substrate exposes immutable-version resources under
+`/v1/projects/:ident/artifacts`. It is guarded by
+`GATEWAY_ARTIFACT_API_ENABLED`; when the flag is false the routes return
+`503 artifact_api_disabled` and legacy task/docs workflows continue to work.
+`GATEWAY_ARTIFACT_BODY_SCHEMA_ENABLED=false` can additionally disable
+structured-payload/body-format writes while preserving markdown writes and
+legacy fallbacks.
+
+All mutating artifact endpoints require `X-Agent-Id`, `X-Agent-System`, and
+`Idempotency-Key`. They return a `provenance` envelope with the resolved actor,
+workflow run id when supplied, idempotency key, generated resource ids, replay
+status, quota warnings, and
+`authorization: {boundary: "trusted-single-tenant", required_scopes: [...]}`.
+Trusted deployments keep this boundary by default. Set
+`GATEWAY_ARTIFACT_AUTH_ENFORCED=true` to require `X-Agent-Project` to match the
+route project and `X-Agent-Scopes` to include every declared scope; hardened
+responses report `authorization.boundary = "project-scoped"`. Clients may use
+exact scopes, comma/space separated scope lists, `<prefix>.*`, or `*`.
+Requests with `X-Artifact-Quota-Override: true` additionally require
+`project.administer`; hard quota limits are never bypassed. Size and quota
+errors use stable codes from
+`docs/artifact-operations-rollout.md`, for example
+`artifact_version_body_too_large` and `quota_version_exceeded`.
+
+Client and skill migration from scratch-file handoff to stable artifact IDs is
+tracked in [`docs/artifact-client-skill-migration.md`](docs/artifact-client-skill-migration.md).
+During migration, scratch files and task specifications are compatibility
+mirrors; accepted artifact versions and manifest item IDs are canonical.
+
+Read responses include `chunking_status` with `status`, current/stale/
+superseded counts, and `failed_addresses`. Diffs are generated from stored full
+version bodies for v1.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/v1/projects/:ident/artifacts` | List artifacts. Supports `kind`, `subkind`, `lifecycle_state`, `label`, `actor_id`, and `q`. |
+| `POST` | `/v1/projects/:ident/artifacts` | Create an artifact container. Body: `kind`, optional `subkind`, `title`, optional `labels`. |
+| `GET` | `/v1/projects/:ident/artifacts/:artifact_id` | Fetch artifact detail with current/accepted versions and chunking freshness. |
+| `GET` | `/v1/projects/:ident/artifacts/:artifact_id/versions` | List immutable versions. |
+| `POST` | `/v1/projects/:ident/artifacts/:artifact_id/versions` | Create an immutable version. Optional `X-Workflow-Run-Id`; `parent_version_id` must reference the same artifact. |
+| `GET` | `/v1/projects/:ident/artifacts/:artifact_id/versions/:version_id` | Fetch one version. |
+| `GET` | `/v1/projects/:ident/artifacts/:artifact_id/versions/:version_id/diff` | Return a unified diff against `base_version_id` or the version parent. |
+| `GET` | `/v1/projects/:ident/artifacts/:artifact_id/comments` | List comments for an artifact. |
+| `POST` | `/v1/projects/:ident/artifacts/:artifact_id/comments` | Add a comment to an artifact, version, or contribution target. |
+| `POST` | `/v1/projects/:ident/artifacts/:artifact_id/comments/:comment_id/resolve` | Resolve a comment. |
+| `POST` | `/v1/projects/:ident/artifacts/:artifact_id/comments/:comment_id/reopen` | Reopen a resolved comment and add a note. |
+| `GET` | `/v1/projects/:ident/artifacts/:artifact_id/contributions` | List contributions. |
+| `POST` | `/v1/projects/:ident/artifacts/:artifact_id/contributions` | Add an immutable contribution. Synthesis/pass-2 contributions require `read_set`. |
+| `GET` | `/v1/projects/:ident/artifacts/links` | List project-visible links. Supports link/source/target filters. |
+| `POST` | `/v1/projects/:ident/artifacts/links` | Create a typed link. Audit-path link types must include required immutable version refs. |
+| `GET` | `/v1/projects/:ident/artifacts/:artifact_id/workflow-runs` | List workflow runs for an artifact. |
+| `POST` | `/v1/projects/:ident/artifacts/:artifact_id/workflow-runs` | Start a workflow run for idempotent multi-step mutations. |
+| `GET` | `/v1/projects/:ident/artifacts/:artifact_id/workflow-runs/:workflow_run_id` | Fetch one workflow run. |
+| `PATCH` | `/v1/projects/:ident/artifacts/:artifact_id/workflow-runs/:workflow_run_id` | Complete a workflow run as `succeeded`, `failed`, or `cancelled`. Failed resumable runs can be retried; cancelled runs are terminal. |
 
 ### Patterns
 
