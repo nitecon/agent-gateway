@@ -357,8 +357,9 @@ the legacy surface and the substrate surface BOTH work; the phase
 
 ### Phase 0 — Pre-migration (no behavior change)
 
-- Deploy T005 schema, T006 repository, T007 generic API behind a feature
-  flag `GATEWAY_ARTIFACT_API_ENABLED` (default `false`).
+- Deploy T005 schema, T006 repository, and T007 generic API. The artifact API
+  is always enabled; rollout control happens through authorization, quotas, and
+  client adoption gates.
 - Backfill `actors` table from the existing agent identities observed in
   the messages, tasks, and api_docs tables. The backfill is idempotent
   on `(actor_type, agent_system, agent_id, host)`.
@@ -371,7 +372,7 @@ gateway-features memory ("artifacts need operations envelope before broad
 rollout") this is the slice that proves the substrate carries production
 load.
 
-- `GATEWAY_ARTIFACT_API_ENABLED=true` in a staging environment.
+- Artifact API routes are available in staging and production environments.
 - `/spec` skill writes accepted spec versions to the substrate; legacy
   `<doc>_spec/` directories are linked (not bulk-imported) via a
   `spec_artifact_imports_directory` link type so the spec artifact
@@ -428,8 +429,7 @@ every agent session.
 - Legacy scratch files (`/tmp/design-review-*`, `<doc>_spec/` raw
   imports, `api_doc_chunks` fallback rows) are removed only after the
   deprecation criteria in §9 are met.
-- Feature flag `GATEWAY_ARTIFACT_API_ENABLED` becomes unconditional; the
-  flag is removed in the next release.
+- Artifact API availability is unconditional.
 
 ### What the migration links rather than imports
 
@@ -460,9 +460,8 @@ The path differs by phase.
 
 - **Trigger.** A blocker is found before any production workload writes
   to the substrate.
-- **Procedure.** Set `GATEWAY_ARTIFACT_API_ENABLED=false`. Substrate
-  tables remain in the database but no new writes land. Legacy surfaces
-  continue unchanged.
+- **Procedure.** Disable artifact-aware writers or revoke their write scopes.
+  Substrate tables remain in the database. Legacy surfaces continue unchanged.
 - **Data treatment.** Substrate rows written during staging are kept for
   forensic review and dropped manually once root cause is found.
 
@@ -471,8 +470,8 @@ The path differs by phase.
 - **Trigger.** Spec artifact behavior is found broken (e.g. T009 manifest
   schema regresses, task generation duplicates rows).
 - **Procedure.**
-  1. Set `GATEWAY_ARTIFACT_API_ENABLED=false` for write paths only.
-     Reads remain enabled so existing spec-artifact references resolve.
+  1. Disable artifact-aware writers or revoke their write scopes.
+     Existing spec-artifact references continue to resolve.
   2. `/spec` skill falls back to its prior `<doc>_spec/` scratch
      directory behavior. The skill code keeps the legacy path
      available behind a `--legacy` flag for one full release cycle to
@@ -579,13 +578,12 @@ Skill `--legacy` flags are removed when:
       affected workflow as blocked.
 - [ ] T015 client migration task is done.
 
-### 9.4 Feature flag removal (Phase 6)
+### 9.4 Legacy rollback flag removal (Phase 6)
 
-`GATEWAY_ARTIFACT_API_ENABLED` and `GATEWAY_API_DOCS_READ_SOURCE` are
-removed when:
+`GATEWAY_API_DOCS_READ_SOURCE` is removed when:
 
 - [ ] All phase deprecation criteria above are met.
-- [ ] One release cycle has passed since both flags were unconditional
+- [ ] One release cycle has passed since API-doc reads were unconditional
       in production.
 
 T014 owns final sign-off on each deprecation. Until sign-off, the
@@ -728,8 +726,8 @@ Recorded during gateway-features_spec T014 on 2026-05-13.
 
 ### 14.3 Rollback dry run
 
-- `GATEWAY_ARTIFACT_API_ENABLED=false` disables artifact API routes with
-  `503 artifact_api_disabled`; legacy task and API-doc workflows remain
+- Artifact API routes remain available during rollback; disable artifact-aware
+  writers or revoke write scopes while legacy task and API-doc workflows remain
   available.
 - `GATEWAY_ARTIFACT_BODY_SCHEMA_ENABLED=false` disables structured body-schema
   writes while preserving markdown writes and legacy fallbacks.

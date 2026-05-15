@@ -62,9 +62,9 @@ Compatibility:
 
 - Existing scratch review markdown may still be written for human inspection,
   but the gateway contribution/version IDs are canonical.
-- If artifact creation fails with `artifact_api_disabled`, the skill may fall
-  back to current scratch behavior and must record that fallback in the task
-  summary.
+- Artifact creation is expected to be available in all deployed gateway
+  environments; failures should be treated as API or authorization errors rather
+  than a disabled-mode fallback.
 
 ### `/spec`
 

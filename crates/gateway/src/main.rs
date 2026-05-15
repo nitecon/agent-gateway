@@ -49,7 +49,6 @@ pub struct AppState {
     pub default_channel: String,
     pub api_key: String,
     pub artifact_operations: db::ArtifactOperationsEnvelope,
-    pub artifact_api_enabled: bool,
     pub artifact_body_schema_enabled: bool,
     pub artifact_auth_enforced: bool,
     /// Set by the background update checker when a newer release is available.
@@ -232,7 +231,6 @@ async fn main() -> Result<()> {
         .context("MESSAGE_RETENTION_DAYS must be a u64")?;
     let artifact_operations =
         db::ArtifactOperationsEnvelope::from_env().context("load artifact operations envelope")?;
-    let artifact_api_enabled = env_flag("GATEWAY_ARTIFACT_API_ENABLED", false)?;
     let artifact_body_schema_enabled = env_flag("GATEWAY_ARTIFACT_BODY_SCHEMA_ENABLED", true)?;
     let artifact_auth_enforced = env_flag("GATEWAY_ARTIFACT_AUTH_ENFORCED", false)?;
 
@@ -351,7 +349,6 @@ async fn main() -> Result<()> {
         default_channel,
         api_key,
         artifact_operations,
-        artifact_api_enabled,
         artifact_body_schema_enabled,
         artifact_auth_enforced,
         update_available,

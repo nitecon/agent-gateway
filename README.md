@@ -319,9 +319,7 @@ Example docs-first publish body:
 ### Generic artifacts
 
 The artifact substrate exposes immutable-version resources under
-`/v1/projects/:ident/artifacts`. It is guarded by
-`GATEWAY_ARTIFACT_API_ENABLED`; when the flag is false the routes return
-`503 artifact_api_disabled` and legacy task/docs workflows continue to work.
+`/v1/projects/:ident/artifacts`. The artifact API is always enabled.
 `GATEWAY_ARTIFACT_BODY_SCHEMA_ENABLED=false` can additionally disable
 structured-payload/body-format writes while preserving markdown writes and
 legacy fallbacks.
