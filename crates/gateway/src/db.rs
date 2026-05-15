@@ -5875,7 +5875,7 @@ fn api_doc_chunk_specs(
         overview.push_str("\nversion: ");
         overview.push_str(version);
     }
-    chunks.push(("overview".to_string(), overview, "overview".to_string()));
+    push_api_doc_chunk_spec(&mut chunks, "overview", overview, "overview");
 
     if let serde_json::Value::Object(map) = content {
         for key in [
@@ -5897,17 +5897,57 @@ fn api_doc_chunk_specs(
                 if rendered.trim().is_empty() {
                     continue;
                 }
-                chunks.push((key.to_string(), rendered, key.to_string()));
+                push_api_doc_chunk_spec(&mut chunks, key, rendered, key);
             }
         }
     } else {
-        chunks.push((
-            "content".to_string(),
-            content.to_string(),
-            "content".to_string(),
-        ));
+        push_api_doc_chunk_spec(&mut chunks, "content", content.to_string(), "content");
     }
     chunks
+}
+
+fn push_api_doc_chunk_spec(
+    chunks: &mut Vec<(String, String, String)>,
+    address: &str,
+    text: String,
+    kind: &str,
+) {
+    let max_bytes = ArtifactOperationsEnvelope::production_defaults()
+        .sizes
+        .limit_for(SizeLimitKind::ChunkText);
+    if text.len() <= max_bytes {
+        chunks.push((address.to_string(), text, kind.to_string()));
+        return;
+    }
+
+    let mut part = 1usize;
+    let mut start = 0usize;
+    while start < text.len() {
+        let mut end = (start + max_bytes).min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            if let Some((offset, ch)) = text[start..].char_indices().next() {
+                end = start + offset + ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        chunks.push((
+            format!("{address}/part-{part:03}"),
+            text[start..end].to_string(),
+            kind.to_string(),
+        ));
+        start = end;
+        part += 1;
+    }
+}
+
+fn api_doc_chunk_base_address(address: &str) -> &str {
+    address
+        .split_once("/part-")
+        .map_or(address, |(base, _)| base)
 }
 
 struct ApiDocArtifactVersionInput<'a> {
@@ -6052,15 +6092,47 @@ fn ensure_api_doc_artifact_version(
             },
         )?;
         if let Some(parent_version_id) = parent_version_id.as_deref() {
-            if let Some(old) =
-                get_artifact_chunk_by_address(conn, parent_version_id, &child_address)?
-            {
-                artifact_chunk_mark_superseded(conn, &old.chunk_id, &result.record.chunk_id)?;
-            }
+            supersede_api_doc_parent_chunks(
+                conn,
+                input.id,
+                parent_version_id,
+                &child_address,
+                &result.record.chunk_id,
+            )?;
         }
     }
 
     Ok(version_id)
+}
+
+fn supersede_api_doc_parent_chunks(
+    conn: &Connection,
+    artifact_id: &str,
+    parent_version_id: &str,
+    child_address: &str,
+    new_chunk_id: &str,
+) -> Result<()> {
+    let base_address = api_doc_chunk_base_address(child_address);
+    let part_prefix = format!("{base_address}/part-%");
+    let sql = "SELECT chunk_id FROM artifact_chunks
+               WHERE artifact_id = ?1
+                 AND artifact_version_id = ?2
+                 AND superseded_by_chunk_id IS NULL
+                 AND (child_address = ?3 OR child_address LIKE ?4)";
+    let old_chunk_ids = {
+        let mut stmt = conn.prepare(sql)?;
+        let ids = stmt
+            .query_map(
+                params![artifact_id, parent_version_id, base_address, part_prefix],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ids
+    };
+    for old_chunk_id in old_chunk_ids {
+        artifact_chunk_mark_superseded(conn, &old_chunk_id, new_chunk_id)?;
+    }
+    Ok(())
 }
 
 fn ensure_existing_api_doc_artifacts(conn: &Connection, project_ident: &str) -> Result<()> {
@@ -7942,6 +8014,61 @@ mod tests {
         assert_eq!(project_stats[0].api_doc_count, 1);
         let dashboard = get_dashboard_data(&conn).unwrap();
         assert_eq!(dashboard.api_doc_count, 1);
+    }
+
+    #[test]
+    fn api_docs_lazy_artifact_materialization_splits_oversized_chunks() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("billing")).unwrap();
+
+        let workflows = format!("{}needle-tail", "x".repeat(9 * 1024));
+        let content = serde_json::json!({
+            "workflows": workflows,
+        });
+        conn.execute(
+            "INSERT INTO api_docs (
+                 id, project_ident, app, title, summary, kind, source_format,
+                 source_ref, version, labels, content_json, author, created_at,
+                 updated_at
+             )
+             VALUES (?1, 'billing', 'billing-api', 'Billing API agent context',
+                     NULL, 'agent_context', 'agent_context', '.agent/api/billing.yaml',
+                     '2026-05-14', ?2, ?3, 'tester', ?4, ?4)",
+            params![
+                "legacy-doc",
+                serde_json::to_string(&vec!["billing"]).unwrap(),
+                serde_json::to_string(&content).unwrap(),
+                now_ms(),
+            ],
+        )
+        .unwrap();
+
+        let chunks =
+            list_api_doc_chunks(&conn, "billing", &ApiDocFilters::default(), false).unwrap();
+        let max_bytes = ArtifactOperationsEnvelope::production_defaults()
+            .sizes
+            .limit_for(SizeLimitKind::ChunkText);
+        assert_eq!(chunks.chunking_status.status, "current");
+        assert_eq!(chunks.chunks.len(), 3);
+        assert!(chunks
+            .chunks
+            .iter()
+            .all(|chunk| chunk.text.len() <= max_bytes));
+        assert!(chunks
+            .chunks
+            .iter()
+            .any(|chunk| chunk.child_address == "workflows/part-001"));
+        assert!(chunks
+            .chunks
+            .iter()
+            .any(|chunk| chunk.child_address == "workflows/part-002"
+                && chunk.text.contains("needle-tail")));
+
+        let doc = get_api_doc(&conn, "billing", "legacy-doc")
+            .unwrap()
+            .unwrap();
+        assert_eq!(doc.manifest_chunk_count, Some(3));
+        assert_eq!(doc.chunking_status, "current");
     }
 
     #[test]

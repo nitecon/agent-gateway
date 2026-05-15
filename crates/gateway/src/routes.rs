@@ -521,17 +521,6 @@ pub struct GenerateSpecTasksResponse {
     replayed: bool,
 }
 
-fn require_artifact_api_enabled(state: &AppState) -> Result<()> {
-    if state.artifact_api_enabled {
-        Ok(())
-    } else {
-        Err(AppError(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "artifact_api_disabled".to_string(),
-        ))
-    }
-}
-
 fn parse_scope_header(headers: &HeaderMap) -> std::collections::BTreeSet<String> {
     headers
         .get("x-agent-scopes")
@@ -604,7 +593,6 @@ fn require_artifact_read(
     headers: &HeaderMap,
     project_ident: &str,
 ) -> Result<ArtifactAuthorizationDecision> {
-    require_artifact_api_enabled(state)?;
     require_artifact_authorization(state, headers, project_ident, vec!["artifact.read"])
 }
 
@@ -944,8 +932,8 @@ fn emit_artifact_metric(name: &str, labels: &[(&str, &str)]) {
 }
 
 /// Common entry validation for every artifact mutation route handler:
-/// feature-gate the artifact API and parse the mandatory mutation envelope
-/// (actor headers + idempotency-key, plus optional workflow-run id).
+/// parse the mandatory mutation envelope (actor headers + idempotency-key,
+/// plus optional workflow-run id).
 /// Returns the parsed [`ArtifactMutationContext`] on success.
 ///
 /// Endpoint-specific request validation (`trim_required`, body-format checks,
@@ -957,7 +945,6 @@ fn begin_artifact_mutation(
     project_ident: &str,
     scopes: Vec<&'static str>,
 ) -> Result<(ArtifactMutationContext, ArtifactAuthorizationDecision)> {
-    require_artifact_api_enabled(state)?;
     let authorization = require_artifact_authorization(state, headers, project_ident, scopes)?;
     require_quota_override_authorization(state, headers, project_ident)?;
     Ok((parse_mutation_context(headers)?, authorization))
@@ -9620,7 +9607,6 @@ mod tests {
             default_channel: "discord".to_string(),
             api_key: "test-key".to_string(),
             artifact_operations,
-            artifact_api_enabled: true,
             artifact_body_schema_enabled: true,
             artifact_auth_enforced: false,
             update_available: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -9800,6 +9786,44 @@ mod tests {
         assert!(detail.0.contains("Comments"));
         assert!(detail.0.contains("Links"));
         assert!(detail.0.contains("Test spec"));
+    }
+
+    #[tokio::test]
+    async fn artifact_workspace_page_survives_lazy_oversized_api_doc_chunking() {
+        let state = test_state();
+        {
+            let conn = state.db.lock().unwrap();
+            let content = serde_json::json!({
+                "workflows": format!("{}needle-tail", "x".repeat(9 * 1024)),
+            });
+            conn.execute(
+                "INSERT INTO api_docs (
+                     id, project_ident, app, title, summary, kind, source_format,
+                     source_ref, version, labels, content_json, author, created_at,
+                     updated_at
+                 )
+                 VALUES (?1, 'demo', 'gateway-smoke', 'Gateway smoke context',
+                         NULL, 'agent_context', 'agent_context', '.agent/api/smoke.yaml',
+                         '2026-05-14', ?2, ?3, 'tester', ?4, ?4)",
+                rusqlite::params![
+                    "legacy-smoke-doc",
+                    serde_json::to_string(&vec!["smoke"]).unwrap(),
+                    serde_json::to_string(&content).unwrap(),
+                    db::now_ms(),
+                ],
+            )
+            .unwrap();
+        }
+
+        let page = artifact_workspace_page(
+            State(state),
+            Path("demo".to_string()),
+            Query(ArtifactWorkspaceQuery::default()),
+        )
+        .await
+        .unwrap();
+        assert!(page.0.contains("Artifact filters"));
+        assert!(page.0.contains("gateway-smoke"));
     }
 
     #[tokio::test]

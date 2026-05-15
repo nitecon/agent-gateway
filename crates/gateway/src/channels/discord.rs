@@ -128,7 +128,6 @@ impl ChannelPlugin for DiscordPlugin {
         let handler = DiscordHandler {
             rooms: std::sync::Arc::new(Mutex::new(rooms_snapshot)),
             tx,
-            guild_id: self.config.guild_id,
             bot_id: OnceLock::new(),
         };
 
@@ -293,7 +292,6 @@ struct DiscordHandler {
     /// Local copy of the room map for this gateway session.
     rooms: std::sync::Arc<Mutex<HashMap<u64, Option<String>>>>,
     tx: mpsc::Sender<PluginEvent>,
-    guild_id: u64,
     bot_id: OnceLock<UserId>,
 }
 
@@ -340,44 +338,6 @@ impl EventHandler for DiscordHandler {
                 }
                 Err(e) => warn!("backfill error for channel {channel_id}: {e}"),
             }
-        }
-
-        // ── Online announcement ───────────────────────────────────────────────
-        let online_msg = "🟢 **agent-gateway** is online.";
-        let known_ids: Vec<u64> = rooms.iter().map(|(id, _)| *id).collect();
-
-        // Post to every registered project channel.
-        for channel_id in &known_ids {
-            let ch = ChannelId::new(*channel_id);
-            if let Err(e) = ch
-                .send_message(&ctx.http, CreateMessage::new().content(online_msg))
-                .await
-            {
-                warn!("online announcement failed for channel {channel_id}: {e}");
-            }
-        }
-
-        // Also post to #general if it exists and isn't already a project room.
-        let guild = GuildId::new(self.guild_id);
-        match guild.channels(&ctx.http).await {
-            Ok(channels) => {
-                if let Some(general) = channels
-                    .values()
-                    .find(|c| c.name == "general" && c.kind == ChannelType::Text)
-                {
-                    let general_id = general.id.get();
-                    if !known_ids.contains(&general_id) {
-                        if let Err(e) = general
-                            .id
-                            .send_message(&ctx.http, CreateMessage::new().content(online_msg))
-                            .await
-                        {
-                            warn!("online announcement failed for #general: {e}");
-                        }
-                    }
-                }
-            }
-            Err(e) => warn!("could not fetch guild channels for online announcement: {e}"),
         }
     }
 
