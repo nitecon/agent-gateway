@@ -242,6 +242,7 @@ async fn main() -> Result<()> {
     info!("SQLite database opened at {db_path}");
 
     // ── Plugin registry ───────────────────────────────────────────────────────
+    #[allow(unused_mut)]
     let mut plugins: HashMap<String, Arc<dyn ChannelPlugin>> = HashMap::new();
 
     #[cfg(feature = "discord")]
@@ -446,6 +447,18 @@ async fn main() -> Result<()> {
                 .delete(routes::delete_api_doc_handler),
         )
         .route(
+            "/v1/projects/{ident}/memories",
+            get(routes::list_memories_handler).post(routes::push_memories_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/memories/pull",
+            post(routes::pull_memories_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/memories/push",
+            post(routes::push_memories_handler),
+        )
+        .route(
             "/v1/projects/{ident}/artifacts",
             get(routes::list_artifacts_handler).post(routes::create_artifact_handler),
         )
@@ -584,6 +597,8 @@ async fn main() -> Result<()> {
         .route("/", get(routes::dashboard))
         .route("/api-docs", get(routes::api_docs_index_page))
         .route("/artifacts", get(routes::artifacts_index_page))
+        .route("/memories", get(routes::memories_index_page))
+        .route("/projects/{ident}/memories", get(routes::memories_page))
         .route("/projects/{ident}/build", get(routes::project_build_page))
         .route(
             "/projects/{ident}/artifacts",

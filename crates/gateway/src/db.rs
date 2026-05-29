@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 
 pub type Db = Arc<Mutex<Connection>>;
@@ -331,8 +332,52 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_api_docs_project_app
             ON api_docs(project_ident, app, updated_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_api_docs_project_updated
-            ON api_docs(project_ident, updated_at DESC);",
+         CREATE INDEX IF NOT EXISTS idx_api_docs_project_updated
+             ON api_docs(project_ident, updated_at DESC);",
+    )?;
+
+    // ── Agent memory gateway: project-scoped durable memories only ───────────
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS gateway_memories (
+            id                 TEXT PRIMARY KEY,
+            project_ident      TEXT NOT NULL REFERENCES projects(ident) ON DELETE CASCADE,
+            server_revision    INTEGER NOT NULL,
+            content            TEXT NOT NULL,
+            memory_type        TEXT NOT NULL,
+            tags               TEXT NOT NULL DEFAULT '[]',
+            content_hash       TEXT NOT NULL,
+            source_agent_id    TEXT,
+            source_hostname    TEXT,
+            source_client      TEXT,
+            source_client_version TEXT,
+            provenance_json    TEXT,
+            client_created_at  INTEGER,
+            client_updated_at  INTEGER,
+            created_at         INTEGER NOT NULL,
+            updated_at         INTEGER NOT NULL,
+            tombstoned_at      INTEGER,
+            UNIQUE(project_ident, server_revision)
+        );
+        CREATE INDEX IF NOT EXISTS idx_gateway_memories_project_revision
+            ON gateway_memories(project_ident, server_revision);
+        CREATE INDEX IF NOT EXISTS idx_gateway_memories_project_updated
+            ON gateway_memories(project_ident, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_gateway_memories_project_hash
+            ON gateway_memories(project_ident, content_hash);
+        CREATE INDEX IF NOT EXISTS idx_gateway_memories_project_type
+            ON gateway_memories(project_ident, memory_type);
+
+        CREATE TABLE IF NOT EXISTS gateway_memory_client_links (
+            project_ident      TEXT NOT NULL REFERENCES projects(ident) ON DELETE CASCADE,
+            client_id          TEXT NOT NULL,
+            local_memory_id    TEXT NOT NULL,
+            gateway_memory_id  TEXT NOT NULL REFERENCES gateway_memories(id) ON DELETE CASCADE,
+            created_at         INTEGER NOT NULL,
+            updated_at         INTEGER NOT NULL,
+            PRIMARY KEY(project_ident, client_id, local_memory_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_gateway_memory_client_links_memory
+            ON gateway_memory_client_links(project_ident, gateway_memory_id);",
     )?;
 
     apply_artifact_substrate_schema(conn)?;
@@ -4761,6 +4806,1076 @@ pub fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+// ── Memory gateway ───────────────────────────────────────────────────────────
+
+pub const MEMORY_BATCH_LIMIT: usize = 500;
+const DEFAULT_MEMORY_PAGE_SIZE: usize = 100;
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryRecord {
+    #[serde(rename = "gateway_memory_id")]
+    pub id: String,
+    pub server_revision: i64,
+    pub project_ident: String,
+    pub content: String,
+    pub memory_type: String,
+    pub tags: Vec<String>,
+    pub content_hash: String,
+    pub source_agent_id: Option<String>,
+    pub source_hostname: Option<String>,
+    pub source_client: Option<String>,
+    pub source_client_version: Option<String>,
+    pub provenance: serde_json::Value,
+    pub client_created_at: Option<i64>,
+    pub client_updated_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub tombstoned_at: Option<i64>,
+    pub tombstone: bool,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct MemoryPushSource {
+    pub agent_id: Option<String>,
+    pub hostname: Option<String>,
+    pub client_id: Option<String>,
+    pub client_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct MemoryPushItem {
+    #[serde(default)]
+    pub local_memory_id: Option<String>,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub gateway_memory_id: Option<String>,
+    #[serde(default)]
+    pub base_gateway_revision: Option<i64>,
+    #[serde(default)]
+    pub project_ident: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default, alias = "type")]
+    pub memory_type: Option<String>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    #[serde(default, alias = "created_at")]
+    pub client_created_at: Option<i64>,
+    #[serde(default, alias = "updated_at")]
+    pub client_updated_at: Option<i64>,
+    #[serde(default)]
+    pub provenance: Option<serde_json::Value>,
+    #[serde(default)]
+    pub tombstone: bool,
+    #[serde(default)]
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MemoryKnownRevision {
+    pub gateway_memory_id: String,
+    pub server_revision: i64,
+    #[serde(default)]
+    pub content_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryConflict {
+    pub gateway_memory_id: String,
+    pub base_gateway_revision: Option<i64>,
+    pub remote_server_revision: i64,
+    pub remote_content_hash: String,
+    pub remote_updated_at: i64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryPushResult {
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_memory_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_memory_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_revision: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conflict: Option<MemoryConflict>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryPushResponse {
+    pub project_ident: String,
+    pub server_revision: i64,
+    pub results: Vec<MemoryPushResult>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryTombstone {
+    pub gateway_memory_id: String,
+    pub server_revision: i64,
+    pub project_ident: String,
+    pub content_hash: String,
+    pub tombstoned_at: i64,
+    pub updated_at: i64,
+    pub source_agent_id: Option<String>,
+    pub source_hostname: Option<String>,
+    pub source_client: Option<String>,
+    pub source_client_version: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryPullResponse {
+    pub project_ident: String,
+    pub server_revision: i64,
+    pub since_revision: i64,
+    pub next_since_revision: i64,
+    pub has_more: bool,
+    pub memories: Vec<MemoryRecord>,
+    pub tombstones: Vec<MemoryTombstone>,
+    pub conflicts: Vec<MemoryConflict>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemorySearchResponse {
+    pub project_ident: String,
+    pub server_revision: i64,
+    pub memories: Vec<MemoryRecord>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MemoryFilters<'a> {
+    pub query: Option<&'a str>,
+    pub memory_type: Option<&'a str>,
+    pub tag: Option<&'a str>,
+    pub since_revision: Option<i64>,
+    pub include_tombstones: bool,
+    pub limit: Option<usize>,
+}
+
+fn clean_optional(value: &Option<String>) -> Option<String> {
+    value.as_deref().map(str::trim).and_then(|v| {
+        if v.is_empty() {
+            None
+        } else {
+            Some(v.to_string())
+        }
+    })
+}
+
+fn clean_memory_tags(tags: Option<&[String]>) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(tags) = tags {
+        for tag in tags {
+            let tag = tag.trim();
+            if !tag.is_empty() && !out.iter().any(|existing| existing == tag) {
+                out.push(tag.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn parse_memory_tags(raw: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
+}
+
+fn parse_memory_provenance(raw: Option<String>) -> serde_json::Value {
+    raw.and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn memory_tags_json(tags: &[String]) -> Result<String> {
+    serde_json::to_string(tags).context("serialize memory tags")
+}
+
+fn memory_content_hash(content: &str) -> String {
+    let digest = Sha256::digest(content.as_bytes());
+    hex::encode(digest)
+}
+
+fn normalize_memory_type(value: &str) -> std::result::Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("memory_type is required".to_string());
+    }
+    let lower = value.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "global" | "preference" | "user_preference" | "working_context"
+    ) {
+        return Err("only project-scoped durable memories may be pushed".to_string());
+    }
+    Ok(lower)
+}
+
+fn validate_memory_scope(
+    item: &MemoryPushItem,
+    project_ident: &str,
+) -> std::result::Result<(), String> {
+    if let Some(scope) = clean_optional(&item.scope) {
+        let scope = scope.to_ascii_lowercase();
+        if scope != "project" {
+            return Err("only project-scoped durable memories may be pushed".to_string());
+        }
+    }
+    if let Some(item_project) = clean_optional(&item.project_ident) {
+        if item_project != project_ident {
+            return Err(format!(
+                "memory project_ident '{}' does not match route project '{}'",
+                item_project, project_ident
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_memory_content_hash(
+    content: &str,
+    supplied_hash: Option<&str>,
+) -> std::result::Result<String, String> {
+    let computed = memory_content_hash(content);
+    if let Some(supplied) = supplied_hash.map(str::trim).filter(|v| !v.is_empty()) {
+        if supplied != computed {
+            return Err("content_hash does not match content".to_string());
+        }
+    }
+    Ok(computed)
+}
+
+fn next_memory_revision(conn: &Connection, project_ident: &str) -> Result<i64> {
+    let current: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(server_revision), 0)
+         FROM gateway_memories
+         WHERE project_ident = ?1",
+        [project_ident],
+        |r| r.get(0),
+    )?;
+    Ok(current + 1)
+}
+
+pub fn memory_project_revision(conn: &Connection, project_ident: &str) -> Result<i64> {
+    let current: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(server_revision), 0)
+         FROM gateway_memories
+         WHERE project_ident = ?1",
+        [project_ident],
+        |r| r.get(0),
+    )?;
+    Ok(current)
+}
+
+fn row_to_memory_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRecord> {
+    let tags: String = row.get(5)?;
+    let provenance: Option<String> = row.get(11)?;
+    let tombstoned_at: Option<i64> = row.get(16)?;
+    Ok(MemoryRecord {
+        id: row.get(0)?,
+        project_ident: row.get(1)?,
+        server_revision: row.get(2)?,
+        content: row.get(3)?,
+        memory_type: row.get(4)?,
+        tags: parse_memory_tags(&tags),
+        content_hash: row.get(6)?,
+        source_agent_id: row.get(7)?,
+        source_hostname: row.get(8)?,
+        source_client: row.get(9)?,
+        source_client_version: row.get(10)?,
+        provenance: parse_memory_provenance(provenance),
+        client_created_at: row.get(12)?,
+        client_updated_at: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
+        tombstoned_at,
+        tombstone: tombstoned_at.is_some(),
+    })
+}
+
+const MEMORY_SELECT_COLS: &str = "id, project_ident, server_revision, content, memory_type, tags, content_hash, source_agent_id, source_hostname, source_client, source_client_version, provenance_json, client_created_at, client_updated_at, created_at, updated_at, tombstoned_at";
+
+fn get_memory_record(
+    conn: &Connection,
+    project_ident: &str,
+    gateway_memory_id: &str,
+) -> Result<Option<MemoryRecord>> {
+    conn.query_row(
+        &format!(
+            "SELECT {MEMORY_SELECT_COLS}
+             FROM gateway_memories
+             WHERE project_ident = ?1 AND id = ?2"
+        ),
+        params![project_ident, gateway_memory_id],
+        row_to_memory_record,
+    )
+    .optional()
+    .context("get gateway memory")
+}
+
+fn find_active_memory_by_hash(
+    conn: &Connection,
+    project_ident: &str,
+    content_hash: &str,
+) -> Result<Option<MemoryRecord>> {
+    conn.query_row(
+        &format!(
+            "SELECT {MEMORY_SELECT_COLS}
+             FROM gateway_memories
+             WHERE project_ident = ?1
+               AND content_hash = ?2
+               AND tombstoned_at IS NULL
+             ORDER BY server_revision ASC
+             LIMIT 1"
+        ),
+        params![project_ident, content_hash],
+        row_to_memory_record,
+    )
+    .optional()
+    .context("find gateway memory by content hash")
+}
+
+fn find_memory_by_client_link(
+    conn: &Connection,
+    project_ident: &str,
+    client_id: &str,
+    local_memory_id: &str,
+) -> Result<Option<MemoryRecord>> {
+    conn.query_row(
+        "SELECT gm.id, gm.project_ident, gm.server_revision, gm.content,
+                gm.memory_type, gm.tags, gm.content_hash, gm.source_agent_id,
+                gm.source_hostname, gm.source_client, gm.source_client_version,
+                gm.provenance_json, gm.client_created_at, gm.client_updated_at,
+                gm.created_at, gm.updated_at, gm.tombstoned_at
+         FROM gateway_memory_client_links l
+         JOIN gateway_memories gm
+           ON gm.project_ident = l.project_ident
+          AND gm.id = l.gateway_memory_id
+         WHERE l.project_ident = ?1
+           AND l.client_id = ?2
+           AND l.local_memory_id = ?3",
+        params![project_ident, client_id, local_memory_id],
+        row_to_memory_record,
+    )
+    .optional()
+    .context("find gateway memory by client link")
+}
+
+fn upsert_memory_client_link(
+    conn: &Connection,
+    project_ident: &str,
+    client_id: Option<&str>,
+    local_memory_id: Option<&str>,
+    gateway_memory_id: &str,
+    now: i64,
+) -> Result<()> {
+    let (Some(client_id), Some(local_memory_id)) = (client_id, local_memory_id) else {
+        return Ok(());
+    };
+    conn.execute(
+        "INSERT INTO gateway_memory_client_links
+             (project_ident, client_id, local_memory_id, gateway_memory_id, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+         ON CONFLICT(project_ident, client_id, local_memory_id) DO UPDATE SET
+             gateway_memory_id = excluded.gateway_memory_id,
+             updated_at = excluded.updated_at",
+        params![
+            project_ident,
+            client_id,
+            local_memory_id,
+            gateway_memory_id,
+            now
+        ],
+    )?;
+    Ok(())
+}
+
+fn memory_result_for_record(
+    action: &str,
+    record: &MemoryRecord,
+    client_id: Option<String>,
+    local_memory_id: Option<String>,
+) -> MemoryPushResult {
+    MemoryPushResult {
+        action: action.to_string(),
+        local_memory_id,
+        client_id,
+        gateway_memory_id: Some(record.id.clone()),
+        server_revision: Some(record.server_revision),
+        content_hash: Some(record.content_hash.clone()),
+        conflict: None,
+        error: None,
+    }
+}
+
+fn rejected_memory_result(
+    error: String,
+    client_id: Option<String>,
+    local_memory_id: Option<String>,
+    gateway_memory_id: Option<String>,
+) -> MemoryPushResult {
+    MemoryPushResult {
+        action: "rejected".to_string(),
+        local_memory_id,
+        client_id,
+        gateway_memory_id,
+        server_revision: None,
+        content_hash: None,
+        conflict: None,
+        error: Some(error),
+    }
+}
+
+fn conflict_memory_result(
+    record: &MemoryRecord,
+    base_gateway_revision: Option<i64>,
+    client_id: Option<String>,
+    local_memory_id: Option<String>,
+) -> MemoryPushResult {
+    MemoryPushResult {
+        action: "conflict".to_string(),
+        local_memory_id,
+        client_id,
+        gateway_memory_id: Some(record.id.clone()),
+        server_revision: Some(record.server_revision),
+        content_hash: Some(record.content_hash.clone()),
+        conflict: Some(MemoryConflict {
+            gateway_memory_id: record.id.clone(),
+            base_gateway_revision,
+            remote_server_revision: record.server_revision,
+            remote_content_hash: record.content_hash.clone(),
+            remote_updated_at: record.updated_at,
+            reason: "remote revision moved since base".to_string(),
+        }),
+        error: None,
+    }
+}
+
+struct MemoryRecordWrite<'a> {
+    item: &'a MemoryPushItem,
+    source: &'a MemoryPushSource,
+    client_id: Option<&'a str>,
+    local_memory_id: Option<&'a str>,
+    content: &'a str,
+    memory_type: &'a str,
+    tags: &'a [String],
+    content_hash: &'a str,
+    now: i64,
+}
+
+fn create_memory_record(
+    conn: &Connection,
+    project_ident: &str,
+    write: &MemoryRecordWrite<'_>,
+) -> Result<MemoryRecord> {
+    let id = new_uuid();
+    let revision = next_memory_revision(conn, project_ident)?;
+    let tags_json = memory_tags_json(write.tags)?;
+    let provenance_json = write
+        .item
+        .provenance
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .context("serialize memory provenance")?;
+    conn.execute(
+        "INSERT INTO gateway_memories
+             (id, project_ident, server_revision, content, memory_type, tags,
+              content_hash, source_agent_id, source_hostname, source_client,
+              source_client_version, provenance_json, client_created_at,
+              client_updated_at, created_at, updated_at, tombstoned_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15, NULL)",
+        params![
+            id.as_str(),
+            project_ident,
+            revision,
+            write.content,
+            write.memory_type,
+            tags_json,
+            write.content_hash,
+            write.source.agent_id.as_deref(),
+            write.source.hostname.as_deref(),
+            write.client_id,
+            write.source.client_version.as_deref(),
+            provenance_json,
+            write.item.client_created_at,
+            write.item.client_updated_at,
+            write.now,
+        ],
+    )?;
+    upsert_memory_client_link(
+        conn,
+        project_ident,
+        write.client_id,
+        write.local_memory_id,
+        &id,
+        write.now,
+    )?;
+    get_memory_record(conn, project_ident, &id)?
+        .ok_or_else(|| anyhow::anyhow!("created gateway memory was not readable"))
+}
+
+fn update_memory_record(
+    conn: &Connection,
+    project_ident: &str,
+    record: &MemoryRecord,
+    write: &MemoryRecordWrite<'_>,
+) -> Result<MemoryRecord> {
+    let revision = next_memory_revision(conn, project_ident)?;
+    let tags_json = memory_tags_json(write.tags)?;
+    let provenance_json = write
+        .item
+        .provenance
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .context("serialize memory provenance")?;
+    conn.execute(
+        "UPDATE gateway_memories
+         SET server_revision = ?3,
+             content = ?4,
+             memory_type = ?5,
+             tags = ?6,
+             content_hash = ?7,
+             source_agent_id = ?8,
+             source_hostname = ?9,
+             source_client = ?10,
+             source_client_version = ?11,
+             provenance_json = ?12,
+             client_created_at = COALESCE(?13, client_created_at),
+             client_updated_at = ?14,
+             updated_at = ?15,
+             tombstoned_at = NULL
+         WHERE project_ident = ?1 AND id = ?2",
+        params![
+            project_ident,
+            record.id.as_str(),
+            revision,
+            write.content,
+            write.memory_type,
+            tags_json,
+            write.content_hash,
+            write.source.agent_id.as_deref(),
+            write.source.hostname.as_deref(),
+            write.client_id,
+            write.source.client_version.as_deref(),
+            provenance_json,
+            write.item.client_created_at,
+            write.item.client_updated_at,
+            write.now,
+        ],
+    )?;
+    upsert_memory_client_link(
+        conn,
+        project_ident,
+        write.client_id,
+        write.local_memory_id,
+        &record.id,
+        write.now,
+    )?;
+    get_memory_record(conn, project_ident, &record.id)?
+        .ok_or_else(|| anyhow::anyhow!("updated gateway memory was not readable"))
+}
+
+fn tombstone_memory_record(
+    conn: &Connection,
+    project_ident: &str,
+    record: &MemoryRecord,
+    source: &MemoryPushSource,
+    client_id: Option<&str>,
+    local_memory_id: Option<&str>,
+    now: i64,
+) -> Result<MemoryRecord> {
+    if record.tombstoned_at.is_some() {
+        upsert_memory_client_link(
+            conn,
+            project_ident,
+            client_id,
+            local_memory_id,
+            &record.id,
+            now,
+        )?;
+        return Ok(record.clone());
+    }
+    let revision = next_memory_revision(conn, project_ident)?;
+    let source_client = client_id.map(str::to_string);
+    conn.execute(
+        "UPDATE gateway_memories
+         SET server_revision = ?3,
+             source_agent_id = ?4,
+             source_hostname = ?5,
+             source_client = ?6,
+             source_client_version = ?7,
+             updated_at = ?8,
+             tombstoned_at = ?8
+         WHERE project_ident = ?1 AND id = ?2",
+        params![
+            project_ident,
+            record.id.as_str(),
+            revision,
+            source.agent_id.as_deref(),
+            source.hostname.as_deref(),
+            source_client.as_deref(),
+            source.client_version.as_deref(),
+            now,
+        ],
+    )?;
+    upsert_memory_client_link(
+        conn,
+        project_ident,
+        client_id,
+        local_memory_id,
+        &record.id,
+        now,
+    )?;
+    get_memory_record(conn, project_ident, &record.id)?
+        .ok_or_else(|| anyhow::anyhow!("tombstoned gateway memory was not readable"))
+}
+
+fn push_one_memory(
+    conn: &Connection,
+    project_ident: &str,
+    source: &MemoryPushSource,
+    item: &MemoryPushItem,
+) -> Result<MemoryPushResult> {
+    let local_memory_id = clean_optional(&item.local_memory_id);
+    let gateway_memory_id = clean_optional(&item.gateway_memory_id);
+    let client_id = clean_optional(&item.client_id).or_else(|| clean_optional(&source.client_id));
+    let tombstone = item.tombstone || item.deleted;
+
+    if let Err(error) = validate_memory_scope(item, project_ident) {
+        return Ok(rejected_memory_result(
+            error,
+            client_id,
+            local_memory_id,
+            gateway_memory_id,
+        ));
+    }
+
+    let existing = if let Some(id) = gateway_memory_id.as_deref() {
+        match get_memory_record(conn, project_ident, id)? {
+            Some(record) => Some(record),
+            None => {
+                return Ok(rejected_memory_result(
+                    "gateway_memory_id was not found for this project".to_string(),
+                    client_id,
+                    local_memory_id,
+                    gateway_memory_id,
+                ))
+            }
+        }
+    } else if let (Some(client_id), Some(local_memory_id)) =
+        (client_id.as_deref(), local_memory_id.as_deref())
+    {
+        find_memory_by_client_link(conn, project_ident, client_id, local_memory_id)?
+    } else {
+        None
+    };
+
+    if tombstone {
+        let Some(record) = existing else {
+            return Ok(rejected_memory_result(
+                "tombstone push requires gateway_memory_id or an existing client link".to_string(),
+                client_id,
+                local_memory_id,
+                gateway_memory_id,
+            ));
+        };
+        if let Some(base) = item.base_gateway_revision {
+            if base != record.server_revision {
+                return Ok(conflict_memory_result(
+                    &record,
+                    Some(base),
+                    client_id,
+                    local_memory_id,
+                ));
+            }
+        }
+        let now = now_ms();
+        let record = tombstone_memory_record(
+            conn,
+            project_ident,
+            &record,
+            source,
+            client_id.as_deref(),
+            local_memory_id.as_deref(),
+            now,
+        )?;
+        let action = if record.tombstoned_at == Some(now) {
+            "tombstoned"
+        } else {
+            "linked"
+        };
+        return Ok(memory_result_for_record(
+            action,
+            &record,
+            client_id,
+            local_memory_id,
+        ));
+    }
+
+    let Some(content) = item.content.as_deref() else {
+        return Ok(rejected_memory_result(
+            "content is required for memory push".to_string(),
+            client_id,
+            local_memory_id,
+            gateway_memory_id,
+        ));
+    };
+    let content_hash = match resolve_memory_content_hash(content, item.content_hash.as_deref()) {
+        Ok(hash) => hash,
+        Err(error) => {
+            return Ok(rejected_memory_result(
+                error,
+                client_id,
+                local_memory_id,
+                gateway_memory_id,
+            ))
+        }
+    };
+
+    if let Some(record) = existing {
+        if let Some(base) = item.base_gateway_revision {
+            if base != record.server_revision {
+                if record.content_hash == content_hash && record.tombstoned_at.is_none() {
+                    let now = now_ms();
+                    upsert_memory_client_link(
+                        conn,
+                        project_ident,
+                        client_id.as_deref(),
+                        local_memory_id.as_deref(),
+                        &record.id,
+                        now,
+                    )?;
+                    return Ok(memory_result_for_record(
+                        "linked",
+                        &record,
+                        client_id,
+                        local_memory_id,
+                    ));
+                }
+                return Ok(conflict_memory_result(
+                    &record,
+                    Some(base),
+                    client_id,
+                    local_memory_id,
+                ));
+            }
+        } else if record.content_hash != content_hash || record.tombstoned_at.is_some() {
+            return Ok(conflict_memory_result(
+                &record,
+                None,
+                client_id,
+                local_memory_id,
+            ));
+        }
+
+        let memory_type = match item
+            .memory_type
+            .as_deref()
+            .map(normalize_memory_type)
+            .transpose()
+        {
+            Ok(value) => value.unwrap_or_else(|| record.memory_type.clone()),
+            Err(error) => {
+                return Ok(rejected_memory_result(
+                    error,
+                    client_id,
+                    local_memory_id,
+                    Some(record.id),
+                ))
+            }
+        };
+        let tags = item
+            .tags
+            .as_ref()
+            .map(|tags| clean_memory_tags(Some(tags)))
+            .unwrap_or_else(|| record.tags.clone());
+        if record.content_hash == content_hash
+            && record.memory_type == memory_type
+            && record.tags == tags
+            && record.tombstoned_at.is_none()
+        {
+            let now = now_ms();
+            upsert_memory_client_link(
+                conn,
+                project_ident,
+                client_id.as_deref(),
+                local_memory_id.as_deref(),
+                &record.id,
+                now,
+            )?;
+            return Ok(memory_result_for_record(
+                "linked",
+                &record,
+                client_id,
+                local_memory_id,
+            ));
+        }
+        let now = now_ms();
+        let write = MemoryRecordWrite {
+            item,
+            source,
+            client_id: client_id.as_deref(),
+            local_memory_id: local_memory_id.as_deref(),
+            content,
+            memory_type: &memory_type,
+            tags: &tags,
+            content_hash: &content_hash,
+            now,
+        };
+        let updated = update_memory_record(conn, project_ident, &record, &write)?;
+        return Ok(memory_result_for_record(
+            "updated",
+            &updated,
+            client_id,
+            local_memory_id,
+        ));
+    }
+
+    if let Some(duplicate) = find_active_memory_by_hash(conn, project_ident, &content_hash)? {
+        let now = now_ms();
+        upsert_memory_client_link(
+            conn,
+            project_ident,
+            client_id.as_deref(),
+            local_memory_id.as_deref(),
+            &duplicate.id,
+            now,
+        )?;
+        return Ok(memory_result_for_record(
+            "linked",
+            &duplicate,
+            client_id,
+            local_memory_id,
+        ));
+    }
+
+    let Some(memory_type) = item.memory_type.as_deref() else {
+        return Ok(rejected_memory_result(
+            "memory_type is required".to_string(),
+            client_id,
+            local_memory_id,
+            gateway_memory_id,
+        ));
+    };
+    let memory_type = match normalize_memory_type(memory_type) {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(rejected_memory_result(
+                error,
+                client_id,
+                local_memory_id,
+                gateway_memory_id,
+            ))
+        }
+    };
+    let tags = clean_memory_tags(item.tags.as_deref());
+    let now = now_ms();
+    let write = MemoryRecordWrite {
+        item,
+        source,
+        client_id: client_id.as_deref(),
+        local_memory_id: local_memory_id.as_deref(),
+        content,
+        memory_type: &memory_type,
+        tags: &tags,
+        content_hash: &content_hash,
+        now,
+    };
+    let created = create_memory_record(conn, project_ident, &write)?;
+    Ok(memory_result_for_record(
+        "created",
+        &created,
+        client_id,
+        local_memory_id,
+    ))
+}
+
+pub fn push_project_memories(
+    conn: &Connection,
+    project_ident: &str,
+    source: &MemoryPushSource,
+    memories: &[MemoryPushItem],
+) -> Result<MemoryPushResponse> {
+    let mut results = Vec::with_capacity(memories.len());
+    for item in memories {
+        results.push(push_one_memory(conn, project_ident, source, item)?);
+    }
+    Ok(MemoryPushResponse {
+        project_ident: project_ident.to_string(),
+        server_revision: memory_project_revision(conn, project_ident)?,
+        results,
+    })
+}
+
+fn normalized_memory_limit(limit: Option<usize>) -> usize {
+    limit
+        .unwrap_or(DEFAULT_MEMORY_PAGE_SIZE)
+        .clamp(1, MEMORY_BATCH_LIMIT)
+}
+
+pub fn list_project_memories(
+    conn: &Connection,
+    project_ident: &str,
+    filters: &MemoryFilters<'_>,
+) -> Result<Vec<MemoryRecord>> {
+    let mut sql =
+        format!("SELECT {MEMORY_SELECT_COLS} FROM gateway_memories WHERE project_ident = ?1");
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(project_ident.to_string())];
+
+    if !filters.include_tombstones {
+        sql.push_str(" AND tombstoned_at IS NULL");
+    }
+    if let Some(since_revision) = filters.since_revision {
+        binds.push(Box::new(since_revision));
+        sql.push_str(&format!(" AND server_revision > ?{}", binds.len()));
+    }
+    if let Some(memory_type) = filters.memory_type.map(str::trim).filter(|v| !v.is_empty()) {
+        binds.push(Box::new(memory_type.to_ascii_lowercase()));
+        sql.push_str(&format!(" AND memory_type = ?{}", binds.len()));
+    }
+    if let Some(tag) = filters.tag.map(str::trim).filter(|v| !v.is_empty()) {
+        let needle = serde_json::to_string(tag).context("serialize tag filter")?;
+        binds.push(Box::new(format!("%{needle}%")));
+        sql.push_str(&format!(" AND tags LIKE ?{}", binds.len()));
+    }
+    if let Some(query) = filters.query.map(str::trim).filter(|v| !v.is_empty()) {
+        binds.push(Box::new(format!("%{query}%")));
+        let ph = binds.len();
+        sql.push_str(&format!(
+            " AND (id LIKE ?{ph}
+                   OR content LIKE ?{ph}
+                   OR memory_type LIKE ?{ph}
+                   OR tags LIKE ?{ph}
+                   OR content_hash LIKE ?{ph}
+                   OR COALESCE(source_agent_id, '') LIKE ?{ph}
+                   OR COALESCE(source_hostname, '') LIKE ?{ph}
+                   OR COALESCE(source_client, '') LIKE ?{ph}
+                   OR COALESCE(provenance_json, '') LIKE ?{ph})"
+        ));
+    }
+
+    binds.push(Box::new(normalized_memory_limit(filters.limit) as i64));
+    sql.push_str(&format!(
+        " ORDER BY updated_at DESC, server_revision DESC LIMIT ?{}",
+        binds.len()
+    ));
+
+    let params_vec: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let records = stmt
+        .query_map(params_vec.as_slice(), row_to_memory_record)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(records)
+}
+
+pub fn search_project_memories(
+    conn: &Connection,
+    project_ident: &str,
+    filters: &MemoryFilters<'_>,
+) -> Result<MemorySearchResponse> {
+    Ok(MemorySearchResponse {
+        project_ident: project_ident.to_string(),
+        server_revision: memory_project_revision(conn, project_ident)?,
+        memories: list_project_memories(conn, project_ident, filters)?,
+    })
+}
+
+pub fn pull_project_memories(
+    conn: &Connection,
+    project_ident: &str,
+    since_revision: Option<i64>,
+    known: &[MemoryKnownRevision],
+    include_tombstones: bool,
+    page_size: Option<usize>,
+) -> Result<MemoryPullResponse> {
+    let since_revision = since_revision.unwrap_or(0).max(0);
+    let limit = normalized_memory_limit(page_size);
+    let mut sql = format!(
+        "SELECT {MEMORY_SELECT_COLS}
+         FROM gateway_memories
+         WHERE project_ident = ?1
+           AND server_revision > ?2"
+    );
+    if !include_tombstones {
+        sql.push_str(" AND tombstoned_at IS NULL");
+    }
+    sql.push_str(" ORDER BY server_revision ASC LIMIT ?3");
+    let fetch_limit = limit as i64 + 1;
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt
+        .query_map(
+            params![project_ident, since_revision, fetch_limit],
+            row_to_memory_record,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let has_more = rows.len() > limit;
+    if has_more {
+        rows.truncate(limit);
+    }
+    let next_since_revision = rows
+        .last()
+        .map(|record| record.server_revision)
+        .unwrap_or(since_revision);
+
+    let mut memories = Vec::new();
+    let mut tombstones = Vec::new();
+    for record in rows {
+        if let Some(tombstoned_at) = record.tombstoned_at {
+            tombstones.push(MemoryTombstone {
+                gateway_memory_id: record.id,
+                server_revision: record.server_revision,
+                project_ident: record.project_ident,
+                content_hash: record.content_hash,
+                tombstoned_at,
+                updated_at: record.updated_at,
+                source_agent_id: record.source_agent_id,
+                source_hostname: record.source_hostname,
+                source_client: record.source_client,
+                source_client_version: record.source_client_version,
+            });
+        } else {
+            memories.push(record);
+        }
+    }
+
+    let mut conflicts = Vec::new();
+    for known in known {
+        if let Some(record) = get_memory_record(conn, project_ident, &known.gateway_memory_id)? {
+            if record.server_revision > known.server_revision {
+                conflicts.push(MemoryConflict {
+                    gateway_memory_id: record.id,
+                    base_gateway_revision: Some(known.server_revision),
+                    remote_server_revision: record.server_revision,
+                    remote_content_hash: record.content_hash,
+                    remote_updated_at: record.updated_at,
+                    reason: "remote revision moved since base".to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(MemoryPullResponse {
+        project_ident: project_ident.to_string(),
+        server_revision: memory_project_revision(conn, project_ident)?,
+        since_revision,
+        next_since_revision,
+        has_more,
+        memories,
+        tombstones,
+        conflicts,
+    })
+}
+
 // ── Dashboard ─────────────────────────────────────────────────────────────────
 
 #[derive(serde::Serialize)]
@@ -4771,6 +5886,7 @@ pub struct ProjectStats {
     pub total_messages: i64,
     pub unread_count: i64,
     pub api_doc_count: i64,
+    pub memory_count: i64,
     pub repo_provider: Option<String>,
     pub repo_namespace: Option<String>,
     pub repo_name: Option<String>,
@@ -4793,6 +5909,7 @@ pub struct DashboardData {
     pub user_messages: i64,
     pub skill_count: i64,
     pub api_doc_count: i64,
+    pub memory_count: i64,
     pub projects: Vec<ProjectStats>,
 }
 
@@ -4812,6 +5929,9 @@ pub fn list_project_stats(conn: &Connection) -> Result<Vec<ProjectStats>> {
                    AND m2.source = 'user'),
                 (SELECT COUNT(*) FROM api_docs d
                  WHERE d.project_ident = p.ident),
+                (SELECT COUNT(*) FROM gateway_memories gm
+                 WHERE gm.project_ident = p.ident
+                   AND gm.tombstoned_at IS NULL),
                 p.repo_provider, p.repo_namespace, p.repo_name, p.repo_full_name
          FROM projects p
          LEFT JOIN messages m ON m.project_ident = p.ident
@@ -4827,10 +5947,11 @@ pub fn list_project_stats(conn: &Connection) -> Result<Vec<ProjectStats>> {
                 total_messages: r.get(3)?,
                 unread_count: r.get(4)?,
                 api_doc_count: r.get(5)?,
-                repo_provider: r.get(6)?,
-                repo_namespace: r.get(7)?,
-                repo_name: r.get(8)?,
-                repo_full_name: r.get(9)?,
+                memory_count: r.get(6)?,
+                repo_provider: r.get(7)?,
+                repo_namespace: r.get(8)?,
+                repo_name: r.get(9)?,
+                repo_full_name: r.get(10)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -4880,6 +6001,11 @@ pub fn get_dashboard_data(conn: &Connection) -> Result<DashboardData> {
     )?;
     let skill_count: i64 = conn.query_row("SELECT COUNT(*) FROM skills", [], |r| r.get(0))?;
     let api_doc_count: i64 = conn.query_row("SELECT COUNT(*) FROM api_docs", [], |r| r.get(0))?;
+    let memory_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM gateway_memories WHERE tombstoned_at IS NULL",
+        [],
+        |r| r.get(0),
+    )?;
 
     let projects = list_project_stats(conn)?;
 
@@ -4890,6 +6016,7 @@ pub fn get_dashboard_data(conn: &Connection) -> Result<DashboardData> {
         user_messages,
         skill_count,
         api_doc_count,
+        memory_count,
         projects,
     })
 }
@@ -8014,6 +9141,163 @@ mod tests {
         assert_eq!(project_stats[0].api_doc_count, 1);
         let dashboard = get_dashboard_data(&conn).unwrap();
         assert_eq!(dashboard.api_doc_count, 1);
+    }
+
+    #[test]
+    fn memory_gateway_push_pull_search_conflict_and_tombstone() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("proj")).unwrap();
+        let source = MemoryPushSource {
+            agent_id: Some("agent-a".to_string()),
+            hostname: Some("host-a".to_string()),
+            client_id: Some("client-a".to_string()),
+            client_version: Some("1.0.0".to_string()),
+        };
+
+        let created = push_project_memories(
+            &conn,
+            "proj",
+            &source,
+            &[MemoryPushItem {
+                local_memory_id: Some("local-1".to_string()),
+                content: Some("alpha memory body".to_string()),
+                memory_type: Some("project".to_string()),
+                tags: Some(vec!["sync".to_string(), "alpha".to_string()]),
+                ..MemoryPushItem::default()
+            }],
+        )
+        .unwrap();
+        assert_eq!(created.server_revision, 1);
+        assert_eq!(created.results[0].action, "created");
+        let memory_id = created.results[0].gateway_memory_id.clone().unwrap();
+
+        let linked = push_project_memories(
+            &conn,
+            "proj",
+            &source,
+            &[MemoryPushItem {
+                local_memory_id: Some("local-1".to_string()),
+                content: Some("alpha memory body".to_string()),
+                memory_type: Some("project".to_string()),
+                tags: Some(vec!["sync".to_string(), "alpha".to_string()]),
+                ..MemoryPushItem::default()
+            }],
+        )
+        .unwrap();
+        assert_eq!(linked.results[0].action, "linked");
+        assert_eq!(linked.server_revision, 1);
+
+        let search = search_project_memories(
+            &conn,
+            "proj",
+            &MemoryFilters {
+                query: Some("alpha"),
+                memory_type: Some("project"),
+                tag: Some("sync"),
+                ..MemoryFilters::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(search.memories.len(), 1);
+        assert_eq!(search.memories[0].id, memory_id);
+        assert_eq!(list_project_stats(&conn).unwrap()[0].memory_count, 1);
+        assert_eq!(get_dashboard_data(&conn).unwrap().memory_count, 1);
+
+        let updated = push_project_memories(
+            &conn,
+            "proj",
+            &source,
+            &[MemoryPushItem {
+                gateway_memory_id: Some(memory_id.clone()),
+                base_gateway_revision: Some(1),
+                content: Some("alpha memory body updated".to_string()),
+                memory_type: Some("project".to_string()),
+                tags: Some(vec!["sync".to_string(), "alpha".to_string()]),
+                ..MemoryPushItem::default()
+            }],
+        )
+        .unwrap();
+        assert_eq!(updated.results[0].action, "updated");
+        assert_eq!(updated.results[0].server_revision, Some(2));
+
+        let conflict = push_project_memories(
+            &conn,
+            "proj",
+            &source,
+            &[MemoryPushItem {
+                gateway_memory_id: Some(memory_id.clone()),
+                base_gateway_revision: Some(1),
+                content: Some("local edit from old base".to_string()),
+                memory_type: Some("project".to_string()),
+                ..MemoryPushItem::default()
+            }],
+        )
+        .unwrap();
+        assert_eq!(conflict.results[0].action, "conflict");
+        assert_eq!(
+            conflict.results[0]
+                .conflict
+                .as_ref()
+                .unwrap()
+                .remote_server_revision,
+            2
+        );
+
+        let pulled = pull_project_memories(
+            &conn,
+            "proj",
+            Some(1),
+            &[MemoryKnownRevision {
+                gateway_memory_id: memory_id.clone(),
+                server_revision: 1,
+                content_hash: None,
+            }],
+            false,
+            Some(100),
+        )
+        .unwrap();
+        assert_eq!(pulled.memories.len(), 1);
+        assert_eq!(pulled.memories[0].server_revision, 2);
+        assert_eq!(pulled.conflicts.len(), 1);
+
+        let tombstoned = push_project_memories(
+            &conn,
+            "proj",
+            &source,
+            &[MemoryPushItem {
+                gateway_memory_id: Some(memory_id.clone()),
+                base_gateway_revision: Some(2),
+                tombstone: true,
+                ..MemoryPushItem::default()
+            }],
+        )
+        .unwrap();
+        assert_eq!(tombstoned.results[0].action, "tombstoned");
+        assert_eq!(tombstoned.server_revision, 3);
+        assert!(
+            search_project_memories(&conn, "proj", &MemoryFilters::default())
+                .unwrap()
+                .memories
+                .is_empty()
+        );
+        let with_tombstone =
+            pull_project_memories(&conn, "proj", Some(2), &[], true, Some(100)).unwrap();
+        assert_eq!(with_tombstone.tombstones.len(), 1);
+        assert_eq!(with_tombstone.tombstones[0].gateway_memory_id, memory_id);
+
+        let rejected = push_project_memories(
+            &conn,
+            "proj",
+            &source,
+            &[MemoryPushItem {
+                scope: Some("global".to_string()),
+                content: Some("never sync global prefs".to_string()),
+                memory_type: Some("project".to_string()),
+                ..MemoryPushItem::default()
+            }],
+        )
+        .unwrap();
+        assert_eq!(rejected.results[0].action, "rejected");
     }
 
     #[test]

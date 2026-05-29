@@ -4187,6 +4187,174 @@ pub async fn get_project_eventic_status(
     }))
 }
 
+// ── Agent memory gateway ─────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct ListMemoriesQuery {
+    pub q: Option<String>,
+    #[serde(rename = "type", alias = "memory_type")]
+    pub memory_type: Option<String>,
+    pub tag: Option<String>,
+    pub since_revision: Option<i64>,
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub include_tombstones: bool,
+}
+
+#[derive(Deserialize)]
+pub struct PullMemoriesRequest {
+    pub since_revision: Option<i64>,
+    #[serde(default)]
+    pub known: Vec<db::MemoryKnownRevision>,
+    pub page_size: Option<usize>,
+    #[serde(default = "default_true")]
+    pub include_tombstones: bool,
+}
+
+#[derive(Deserialize)]
+pub struct PushMemoriesRequest {
+    #[serde(default)]
+    pub memories: Vec<db::MemoryPushItem>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn optional_header(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn memory_push_source(headers: &HeaderMap) -> db::MemoryPushSource {
+    db::MemoryPushSource {
+        agent_id: optional_header(headers, "x-agent-id"),
+        hostname: optional_header(headers, "x-agent-hostname"),
+        client_id: optional_header(headers, "x-memory-client-id")
+            .or_else(|| optional_header(headers, "x-agent-id")),
+        client_version: optional_header(headers, "x-memory-client-version"),
+    }
+}
+
+pub async fn list_memories_handler(
+    State(state): State<AppState>,
+    Path(ident): Path<String>,
+    Query(q): Query<ListMemoriesQuery>,
+) -> Result<Json<db::MemorySearchResponse>> {
+    let db = state.db.clone();
+    let (project_exists, response) = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        if db::get_project(&conn, &ident)?.is_none() {
+            return Ok::<_, anyhow::Error>((false, None));
+        }
+        let filters = db::MemoryFilters {
+            query: q.q.as_deref(),
+            memory_type: q.memory_type.as_deref(),
+            tag: q.tag.as_deref(),
+            since_revision: q.since_revision,
+            include_tombstones: q.include_tombstones,
+            limit: q.limit,
+        };
+        Ok((
+            true,
+            Some(db::search_project_memories(&conn, &ident, &filters)?),
+        ))
+    })
+    .await??;
+    if !project_exists {
+        return Err(AppError(
+            StatusCode::NOT_FOUND,
+            "project not found".to_string(),
+        ));
+    }
+    Ok(Json(
+        response.expect("memory search response exists for project"),
+    ))
+}
+
+pub async fn pull_memories_handler(
+    State(state): State<AppState>,
+    Path(ident): Path<String>,
+    Json(req): Json<PullMemoriesRequest>,
+) -> Result<Json<db::MemoryPullResponse>> {
+    let db = state.db.clone();
+    let (project_exists, response) = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        if db::get_project(&conn, &ident)?.is_none() {
+            return Ok::<_, anyhow::Error>((false, None));
+        }
+        Ok((
+            true,
+            Some(db::pull_project_memories(
+                &conn,
+                &ident,
+                req.since_revision,
+                &req.known,
+                req.include_tombstones,
+                req.page_size,
+            )?),
+        ))
+    })
+    .await??;
+    if !project_exists {
+        return Err(AppError(
+            StatusCode::NOT_FOUND,
+            "project not found".to_string(),
+        ));
+    }
+    Ok(Json(
+        response.expect("memory pull response exists for project"),
+    ))
+}
+
+pub async fn push_memories_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(ident): Path<String>,
+    Json(req): Json<PushMemoriesRequest>,
+) -> Result<Json<db::MemoryPushResponse>> {
+    if req.memories.len() > db::MEMORY_BATCH_LIMIT {
+        return Err(AppError(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "memory push batch exceeds {} records",
+                db::MEMORY_BATCH_LIMIT
+            ),
+        ));
+    }
+    let source = memory_push_source(&headers);
+    let db = state.db.clone();
+    let (project_exists, response) = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        if db::get_project(&conn, &ident)?.is_none() {
+            return Ok::<_, anyhow::Error>((false, None));
+        }
+        Ok((
+            true,
+            Some(db::push_project_memories(
+                &conn,
+                &ident,
+                &source,
+                &req.memories,
+            )?),
+        ))
+    })
+    .await??;
+    if !project_exists {
+        return Err(AppError(
+            StatusCode::NOT_FOUND,
+            "project not found".to_string(),
+        ));
+    }
+    Ok(Json(
+        response.expect("memory push response exists for project"),
+    ))
+}
+
 // ── Agent API docs ───────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -5654,7 +5822,7 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
     };
 
     let rows = if data.project_count == 0 {
-        r#"<tr><td colspan="8" class="nd-text-muted nd-text-center">No projects registered yet</td></tr>"#.to_string()
+        r#"<tr><td colspan="9" class="nd-text-muted nd-text-center">No projects registered yet</td></tr>"#.to_string()
     } else {
         data.projects
             .iter()
@@ -5691,8 +5859,20 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
                     r#"<a class="nd-btn-secondary nd-btn-sm" href="/projects/{}/tasks">Tasks</a>"#,
                     he(&p.ident)
                 );
+                let memories_cell = if p.memory_count > 0 {
+                    format!(
+                        r#"<a class="nd-btn-secondary nd-btn-sm" href="/projects/{}/memories">{} memories</a>"#,
+                        he(&p.ident),
+                        p.memory_count
+                    )
+                } else {
+                    format!(
+                        r#"<a class="nd-btn-ghost nd-btn-sm" href="/projects/{}/memories">No memories</a>"#,
+                        he(&p.ident)
+                    )
+                };
                 format!(
-                    "<tr><td>{}</td><td>{}</td><td class=\"nd-text-muted\">{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    "<tr><td>{}</td><td>{}</td><td class=\"nd-text-muted\">{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                     he(&p.ident),
                     he(&p.channel_name),
                     he(&p.room_id),
@@ -5700,6 +5880,7 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
                     unread_cell,
                     build_cell,
                     docs_cell,
+                    memories_cell,
                     tasks_cell,
                 )
             })
@@ -5718,13 +5899,14 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
     <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{user}</div><div class="nd-text-xs nd-text-muted">User</div></div></div></div>
     <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{skills}</div><div class="nd-text-xs nd-text-muted">Skills</div></div></div></div>
     <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{api_docs}</div><div class="nd-text-xs nd-text-muted">API docs</div></div></div></div>
+    <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{memories}</div><div class="nd-text-xs nd-text-muted">Memories</div></div></div></div>
   </section>
 
   <section class="nd-card">
     <div class="nd-card-header"><strong>Projects</strong></div>
     <div class="nd-card-body nd-p-0">
       <table class="nd-table nd-table-hover">
-        <thead><tr><th>Project</th><th>Channel</th><th>Room ID</th><th>Messages</th><th>Unread</th><th>Build</th><th>Docs</th><th>Tasks</th></tr></thead>
+        <thead><tr><th>Project</th><th>Channel</th><th>Room ID</th><th>Messages</th><th>Unread</th><th>Build</th><th>Docs</th><th>Memories</th><th>Tasks</th></tr></thead>
         <tbody>{rows}</tbody>
       </table>
     </div>
@@ -5737,6 +5919,7 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
         user = data.user_messages,
         skills = data.skill_count,
         api_docs = data.api_doc_count,
+        memories = data.memory_count,
         rows = rows,
     );
 
@@ -5814,6 +5997,269 @@ pub async fn api_docs_index_page(State(state): State<AppState>) -> Result<Html<S
         "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
         head = control_panel_head("agent-gateway - API docs", &theme, ""),
         open = control_panel_open("API Docs", "api-docs"),
+        content = content,
+        close = control_panel_close(&state.api_key),
+    );
+    Ok(Html(html))
+}
+
+pub async fn memories_index_page(State(state): State<AppState>) -> Result<Html<String>> {
+    let db = state.db.clone();
+    let (projects, theme) = spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = db.lock().unwrap();
+        Ok((db::list_project_stats(&conn)?, db::get_theme(&conn)?))
+    })
+    .await??;
+
+    let rows = if projects.is_empty() {
+        r#"<tr><td colspan="5" class="nd-text-muted nd-text-center">No projects registered yet.</td></tr>"#.to_string()
+    } else {
+        projects
+            .iter()
+            .map(|project| {
+                let memories_cell = if project.memory_count > 0 {
+                    format!(
+                        r#"<a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/memories">{count} memories</a>"#,
+                        ident = he(&project.ident),
+                        count = project.memory_count,
+                    )
+                } else {
+                    format!(
+                        r#"<a class="nd-btn-ghost nd-btn-sm" href="/projects/{ident}/memories">Open</a>"#,
+                        ident = he(&project.ident),
+                    )
+                };
+                let repo = project.repo_full_name.as_deref().unwrap_or("");
+                format!(
+                    r#"<tr>
+  <td><strong>{ident}</strong><div class="nd-text-xs nd-text-muted">{repo}</div></td>
+  <td>{memories}</td>
+  <td>{docs}</td>
+  <td>{messages}</td>
+  <td><a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/tasks">Tasks</a></td>
+</tr>"#,
+                    ident = he(&project.ident),
+                    repo = he(repo),
+                    memories = memories_cell,
+                    docs = project.api_doc_count,
+                    messages = project.total_messages,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let content = format!(
+        r#"  <section class="nd-card">
+    <div class="nd-card-header"><strong>Memories by Project</strong></div>
+    <div class="nd-card-body nd-p-0">
+      <table class="nd-table nd-table-hover">
+        <thead><tr><th>Project</th><th>Memories</th><th>API docs</th><th>Messages</th><th>Tasks</th></tr></thead>
+        <tbody>{rows}</tbody>
+      </table>
+    </div>
+  </section>"#,
+        rows = rows,
+    );
+
+    let html = format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
+        head = control_panel_head("agent-gateway - Memories", &theme, ""),
+        open = control_panel_open("Memories", "memories"),
+        content = content,
+        close = control_panel_close(&state.api_key),
+    );
+    Ok(Html(html))
+}
+
+fn memory_type_options(selected: Option<&str>) -> String {
+    [
+        ("", "Any type"),
+        ("project", "project"),
+        ("reference", "reference"),
+        ("feedback", "feedback"),
+        ("user", "user"),
+    ]
+    .iter()
+    .map(|(value, label)| {
+        let selected_attr = if selected.map(|s| s == *value).unwrap_or(value.is_empty()) {
+            " selected"
+        } else {
+            ""
+        };
+        format!(
+            r#"<option value="{value}"{selected_attr}>{label}</option>"#,
+            value = he(value),
+            selected_attr = selected_attr,
+            label = he(label),
+        )
+    })
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
+pub async fn memories_page(
+    State(state): State<AppState>,
+    Path(ident): Path<String>,
+    Query(query): Query<ListMemoriesQuery>,
+) -> Result<Html<String>> {
+    let db = state.db.clone();
+    let ident_for_lookup = ident.clone();
+    let q = query.q.clone();
+    let memory_type = query.memory_type.clone();
+    let tag = query.tag.clone();
+    let since_revision = query.since_revision;
+    let limit = query.limit;
+    let include_tombstones = query.include_tombstones;
+    let (project, response, theme) = spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = db.lock().unwrap();
+        let project = db::get_project(&conn, &ident_for_lookup)?;
+        let filters = db::MemoryFilters {
+            query: q.as_deref(),
+            memory_type: memory_type.as_deref(),
+            tag: tag.as_deref(),
+            since_revision,
+            include_tombstones,
+            limit,
+        };
+        let response = db::search_project_memories(&conn, &ident_for_lookup, &filters)?;
+        let theme = db::get_theme(&conn)?;
+        Ok((project, response, theme))
+    })
+    .await??;
+
+    let project = project.ok_or_else(|| {
+        AppError(
+            StatusCode::NOT_FOUND,
+            format!("project '{}' not found", ident),
+        )
+    })?;
+
+    let ident_attr = he(&project.ident);
+    let rows = if response.memories.is_empty() {
+        r#"<tr><td colspan="8" class="nd-text-muted nd-text-center">No memories match these filters.</td></tr>"#.to_string()
+    } else {
+        response
+            .memories
+            .iter()
+            .map(|memory| {
+                let tags = if memory.tags.is_empty() {
+                    String::new()
+                } else {
+                    memory
+                        .tags
+                        .iter()
+                        .map(|tag| {
+                            format!(r#"<span class="nd-badge nd-badge-sm">{}</span>"#, he(tag))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                let status = if memory.tombstone {
+                    r#"<span class="nd-badge nd-badge-sm nd-text-danger">tombstone</span>"#
+                        .to_string()
+                } else {
+                    r#"<span class="nd-badge nd-badge-sm">active</span>"#.to_string()
+                };
+                let source = memory
+                    .source_client
+                    .as_deref()
+                    .or(memory.source_agent_id.as_deref())
+                    .unwrap_or("");
+                format!(
+                    r#"<tr>
+  <td><code>{id}</code><div class="nd-text-xs nd-text-muted">rev {revision}</div></td>
+  <td>{status}</td>
+  <td>{memory_type}</td>
+  <td>{tags}</td>
+  <td>{content}</td>
+  <td><code>{hash}</code></td>
+  <td>{source}</td>
+  <td>{updated}</td>
+</tr>"#,
+                    id = he(&memory.id),
+                    revision = memory.server_revision,
+                    status = status,
+                    memory_type = he(&memory.memory_type),
+                    tags = tags,
+                    content = he(&truncate_text(&memory.content, 220)),
+                    hash = he(&truncate_text(&memory.content_hash, 12)),
+                    source = he(source),
+                    updated = memory.updated_at,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let checked = if query.include_tombstones {
+        " checked"
+    } else {
+        ""
+    };
+    let q_value = he(query.q.as_deref().unwrap_or(""));
+    let tag_value = he(query.tag.as_deref().unwrap_or(""));
+    let since_value = query
+        .since_revision
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+    let limit_value = query.limit.map(|v| v.to_string()).unwrap_or_default();
+    let type_options = memory_type_options(query.memory_type.as_deref());
+    let content = format!(
+        r#"  <div class="nd-flex nd-gap-md nd-mb-md">
+    <a class="nd-btn-secondary nd-btn-sm" href="/memories">All projects</a>
+    <a class="nd-btn-secondary nd-btn-sm" href="/">Dashboard</a>
+    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/tasks">Tasks</a>
+    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/api-docs">API docs</a>
+  </div>
+
+  <section class="nd-card">
+    <div class="nd-card-header"><strong>Memory search</strong></div>
+    <div class="nd-card-body">
+      <form class="nd-grid nd-gap-sm" method="get" action="/projects/{ident}/memories">
+        <input class="nd-input" name="q" placeholder="Search content, ids, tags, provenance" value="{q}">
+        <select class="nd-input" name="type" aria-label="Memory type">{type_options}</select>
+        <input class="nd-input" name="tag" placeholder="tag" value="{tag}">
+        <input class="nd-input" name="since_revision" placeholder="since revision" value="{since}">
+        <input class="nd-input" name="limit" placeholder="limit" value="{limit}">
+        <label class="nd-flex nd-gap-sm nd-items-center nd-text-sm"><input type="checkbox" name="include_tombstones" value="true"{checked}> Include tombstones</label>
+        <button class="nd-btn-primary" type="submit">Search</button>
+      </form>
+    </div>
+  </section>
+
+  <section class="nd-card nd-mt-lg">
+    <div class="nd-card-header"><strong>Project Memories</strong><span class="nd-text-muted nd-text-sm"> revision {server_revision}</span></div>
+    <div class="nd-card-body nd-p-0">
+      <table class="nd-table nd-table-hover">
+        <thead><tr><th>ID</th><th>Status</th><th>Type</th><th>Tags</th><th>Content</th><th>Hash</th><th>Source</th><th>Updated</th></tr></thead>
+        <tbody>{rows}</tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="nd-card nd-mt-lg">
+    <div class="nd-card-header"><strong>Agent endpoints</strong></div>
+    <div class="nd-card-body">
+      <p class="nd-text-muted nd-text-sm"><code>POST /v1/projects/{ident}/memories/push</code> · <code>POST /v1/projects/{ident}/memories/pull</code> · <code>GET /v1/projects/{ident}/memories</code></p>
+    </div>
+  </section>"#,
+        ident = ident_attr,
+        q = q_value,
+        type_options = type_options,
+        tag = tag_value,
+        since = he(&since_value),
+        limit = he(&limit_value),
+        checked = checked,
+        server_revision = response.server_revision,
+        rows = rows,
+    );
+
+    let page_title = format!("Memories - {}", project.ident);
+    let html = format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
+        head = control_panel_head("agent-gateway - Memories", &theme, ""),
+        open = control_panel_open(&page_title, "memories"),
         content = content,
         close = control_panel_close(&state.api_key),
     );
@@ -9008,6 +9454,7 @@ fn control_panel_open(page_title: &str, active: &str) -> String {
       <li><a href="/"{dashboard}>Dashboard</a></li>
       <li><a href="/api-docs"{api_docs}>API Docs</a></li>
       <li><a href="/artifacts"{artifacts}>Artifacts</a></li>
+      <li><a href="/memories"{memories}>Memories</a></li>
       <li><a href="/tasks"{tasks}>Tasks</a></li>
       <li><a href="/patterns"{patterns}>Patterns</a></li>
       <li><a href="/skills"{skills}>Skills</a></li>
@@ -9030,6 +9477,7 @@ fn control_panel_open(page_title: &str, active: &str) -> String {
         dashboard = cls("dashboard"),
         api_docs = cls("api-docs"),
         artifacts = cls("artifacts"),
+        memories = cls("memories"),
         tasks = cls("tasks"),
         patterns = cls("patterns"),
         skills = cls("skills"),
@@ -9579,6 +10027,13 @@ mod tests {
         let html = control_panel_open("Artifacts", "artifacts");
 
         assert!(html.contains(r#"<li><a href="/artifacts" class="nd-active">Artifacts</a></li>"#));
+    }
+
+    #[test]
+    fn control_panel_nav_exposes_memories() {
+        let html = control_panel_open("Memories", "memories");
+
+        assert!(html.contains(r#"<li><a href="/memories" class="nd-active">Memories</a></li>"#));
     }
 
     fn test_state_with_operations(artifact_operations: db::ArtifactOperationsEnvelope) -> AppState {

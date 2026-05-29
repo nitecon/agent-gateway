@@ -1,24 +1,26 @@
 app: agent-gateway
 title: Agent Gateway API context
-summary: Agent coordination gateway for project-scoped comms, task boards, API context docs, patterns, skills, and build status.
+summary: Agent coordination gateway for project-scoped comms, task boards, project memory sync, API context docs, patterns, skills, and build status.
 kind: agent_context
 source_format: agent_context
 source_ref: .agent/api/agent-gateway.yaml
-version: v1.6.0
+version: v1.7.0
 labels:
   - gateway
   - agents
   - api-docs
   - artifacts
   - tasks
+  - memories
+  - memory-gateway
   - comms
   - patterns
   - eventic
 content:
   purpose: |
-    agent-gateway is the server-side coordination layer for AI agents. It stores project registration, messages, per-agent unread state, project task boards, global patterns, skills/commands/agents, Eventic build status configuration, and agent-native API docs.
+    agent-gateway is the server-side coordination layer for AI agents. It stores project registration, messages, per-agent unread state, project task boards, project-scoped durable memory sync state, global patterns, skills/commands/agents, Eventic build status configuration, and agent-native API docs.
 
-    Agents should use agent-gateway when they need durable cross-session coordination, cross-project delegated work, user-visible project communication, reusable organization guidance, RAG-ready API context for owned apps, or stable artifact IDs for design reviews, specs, documentation, comments, links, and implementation handoff.
+    Agents should use agent-gateway when they need durable cross-session coordination, cross-project delegated work, user-visible project communication, project memory synchronization, reusable organization guidance, RAG-ready API context for owned apps, or stable artifact IDs for design reviews, specs, documentation, comments, links, and implementation handoff.
   auth:
     type: bearer
     header: "Authorization: Bearer <GATEWAY_API_KEY>"
@@ -42,6 +44,8 @@ content:
       guidance: For design-review, spec, and documentation workflows, retrieve the artifact/version/manifest-item context by stable gateway IDs before searching source files. Scratch files remain compatibility state during migration, not the canonical handoff surface.
     - name: Migrate client and skill handoff to artifacts
       guidance: "`/design-review`, `/spec`, and `/implement` should pass project_ident, artifact_id, artifact_version_id, workflow_run_id, contribution_id, manifest_item_id, and generated task_id values between agents. Source-adjacent scratch files and task Specification text remain dual-read fallbacks until `docs/artifact-client-skill-migration.md` release gates pass."
+    - name: Keep memory sync project-scoped
+      guidance: Memory gateway APIs only accept durable project memories. Do not push global/user-preference memories or WorkingContext state through `/v1/projects/:ident/memories`; those remain local memory CLI responsibility.
   relationships:
     - app: agent-tools
       relationship: Primary CLI client for agents. It wraps gateway comms, tasks, patterns, API docs, and setup flows.
@@ -74,6 +78,14 @@ content:
         - Validate locally with agent-tools docs validate --file PATH.
         - Publish with agent-tools docs publish --file PATH or POST /v1/projects/:ident/api-docs.
         - Retrieve RAG chunks with GET /v1/projects/:ident/api-docs/chunks.
+    - name: Sync project memories
+      steps:
+        - Push local project-scoped durable memories with POST /v1/projects/:ident/memories/push or POST /v1/projects/:ident/memories.
+        - Include local_memory_id or client_id for idempotent linking, content, memory_type, tags, content_hash when known, timestamps, optional gateway_memory_id, optional base_gateway_revision, and provenance metadata.
+        - Treat push responses per item: created, updated, linked, tombstoned, conflict, or rejected.
+        - Pull remote changes with POST /v1/projects/:ident/memories/pull using since_revision and known gateway_memory_id/server_revision pairs.
+        - Use GET /v1/projects/:ident/memories with q, type, tag, since_revision, limit, and include_tombstones filters for dashboard/search retrieval.
+        - Resolve conflicts client-side when base_gateway_revision has moved; the gateway returns remote revision, hash, and updated_at metadata.
     - name: Work with artifact-backed specs
       steps:
         - Import or create a spec with POST /v1/projects/:ident/specs, preserving source_doc, manifest, per-task spec bodies, touch surfaces, acceptance criteria, validation plans, and stable manifest_item_id values.
@@ -214,6 +226,47 @@ content:
     - method: DELETE
       path: /v1/projects/:ident/api-docs/:id
       intent: Delete one API context document.
+    - method: GET
+      path: /v1/projects/:ident/memories
+      intent: Search project-scoped durable memories for dashboard and client retrieval.
+      query:
+        q: Search memory id, content, type, tags, content hash, source metadata, and provenance.
+        type: Exact memory_type filter, such as project, reference, feedback, or user.
+        tag: Exact tag filter.
+        since_revision: Only return memories with a newer server_revision.
+        limit: Maximum records to return, clamped to the gateway batch limit.
+        include_tombstones: Include tombstoned memory records when true.
+      response: "{ project_ident, server_revision, memories[] }"
+    - method: POST
+      path: /v1/projects/:ident/memories
+      intent: Compatibility alias for memory push.
+      notes:
+        - Same request and response shape as POST /v1/projects/:ident/memories/push.
+    - method: POST
+      path: /v1/projects/:ident/memories/push
+      intent: Push an array of local project memories and receive canonical gateway ids and revisions.
+      headers:
+        X-Agent-Id: Optional source agent identity.
+        X-Agent-Hostname: Optional source hostname.
+        X-Memory-Client-Id: Optional stable memory client identity. Defaults to X-Agent-Id when omitted.
+        X-Memory-Client-Version: Optional source client version.
+      request:
+        memories: Array of memory structs. Each item may include local_memory_id, client_id, gateway_memory_id, base_gateway_revision, project_ident, scope, content, memory_type, tags, content_hash, client_created_at, client_updated_at, provenance, tombstone, or deleted.
+      response: "{ project_ident, server_revision, results[] } where each result has action, gateway_memory_id, server_revision, content_hash, optional conflict, and optional error."
+      notes:
+        - Only project-scoped durable memories are accepted. scope=global, user preferences, and WorkingContext-style memory types are rejected.
+        - Exact content_hash duplicates link to the existing active memory instead of creating a new row.
+        - Updates use compare-and-swap semantics when base_gateway_revision is supplied; stale bases return action=conflict.
+        - Tombstones preserve content metadata and advance server_revision for pull clients.
+    - method: POST
+      path: /v1/projects/:ident/memories/pull
+      intent: Pull newer remote project memory changes and tombstones since a known revision.
+      request:
+        since_revision: Optional last seen server_revision. Defaults to 0.
+        known: Optional array of gateway_memory_id, server_revision, and content_hash values for conflict detection.
+        page_size: Optional batch size, clamped to the gateway batch limit.
+        include_tombstones: Include deletion/tombstone rows in the response. Defaults to true.
+      response: "{ project_ident, server_revision, since_revision, next_since_revision, has_more, memories[], tombstones[], conflicts[] }"
     - method: GET
       path: /v1/projects/:ident/artifacts
       intent: List durable artifacts by kind, lifecycle state, label, actor, or search query.
