@@ -206,6 +206,43 @@ All messaging endpoints accept an optional `X-Agent-Id` header. When provided, e
 | `GET` | `/v1/skills/:name/content` | Fetch markdown content for a command/agent. |
 | `DELETE` | `/v1/skills/:name` | Delete a skill. |
 
+### Tasks
+
+Per-project kanban task board. Tasks move through three statuses — `todo`,
+`in_progress`, and `done` — and back. Identity is resolved from the
+`X-Agent-Id` header (falling back to `"user"` when absent or `_default`) and
+can be overridden per request with an explicit `reporter`/`author` field.
+
+Two background reconciliations run on every list and detail read:
+
+- **Stale reclaim (1h).** An `in_progress` task with no `updated_at` activity
+  for more than 1 hour is flipped back to `todo`, its owner is cleared, and a
+  system comment is appended so the next agent verifies prior progress.
+- **Done fade (7d).** `done` tasks are hidden from list results once their
+  `done_at` is older than 7 days. Pass `include_stale=true` to include them.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/v1/projects/:ident/tasks` | List task summaries. `status` is a comma-separated filter (`todo,in_progress`); defaults to `todo,in_progress` when omitted. `include_stale=true` includes faded `done` tasks. Returns `[{id, title, status, rank, labels, owner_agent_id, hostname, reporter, comment_count, created_at, updated_at, kind, delegated_to_project_ident, delegated_to_task_id}]`. |
+| `POST` | `/v1/projects/:ident/tasks` | Create a task. Body: `title` (required), optional `description`, `specification` (alias `details`), `labels`, `hostname`, `reporter`. Returns the created task flattened with `specification` and a `hint` field. |
+| `GET` | `/v1/projects/:ident/tasks/:id` | Fetch one task with its `comments[]` and a derived `actions[]` array (see below). |
+| `PATCH` | `/v1/projects/:ident/tasks/:id` | Update a task. Body fields: `status`, `rank`, `title`, `labels`, plus nullable `owner_agent_id`, `description`, `specification` (alias `details`), `hostname`. For the nullable fields, JSON `null` clears the column, a string sets it, and an absent key leaves it unchanged. |
+| `POST` | `/v1/projects/:ident/tasks/:id/comments` | Add a comment. Body: `content` (required), optional `author`, and `author_type` (`agent` or `user`; defaults from whether `X-Agent-Id` is present). |
+
+#### Status transitions and `actions[]`
+
+The task detail response includes a server-derived `actions[]` array alongside
+`comments[]`. Each entry is `{verb, style, target_status}` where `style` is
+`primary` or `secondary`. The available transitions per current status are:
+
+| Current status | Actions (`verb` → `target_status`) |
+|----------------|-------------------------------------|
+| `todo` | `Claim` (primary) → `in_progress`; `Done` (primary) → `done` |
+| `in_progress` | `Release` (secondary) → `todo`; `Done` (primary) → `done` |
+| `done` | `Reopen` (secondary) → `todo` |
+
+To perform a transition, `PATCH` the task with the chosen `target_status`.
+
 ### Agent API docs
 
 Project-scoped registry for agent-native API context. This is designed for
