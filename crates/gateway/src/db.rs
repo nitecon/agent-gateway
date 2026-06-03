@@ -1,11 +1,745 @@
 #![allow(dead_code)]
 
-use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use anyhow::{bail, Context, Result};
+use rusqlite::{
+    params,
+    types::{ToSqlOutput, Value as SqliteValue},
+    Connection, OptionalExtension, ToSql,
+};
 use sha2::{Digest, Sha256};
-use std::sync::{Arc, Mutex};
+use std::{
+    fmt,
+    sync::{Arc, LockResult, Mutex, MutexGuard},
+};
 
-pub type Db = Arc<Mutex<Connection>>;
+pub const DEFAULT_SQLITE_DATABASE_PATH: &str = "/opt/agentic/gateway/agent-gateway.db";
+
+const SQLITE_URL_SCHEMES: &[&str] = &["sqlite", "file"];
+const POSTGRES_URL_SCHEMES: &[&str] = &["postgres", "postgresql"];
+const MARIADB_URL_SCHEMES: &[&str] = &["mariadb", "mysql"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseBackend {
+    Sqlite,
+    Postgres,
+    MariaDb,
+}
+
+impl DatabaseBackend {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "sqlite" => Ok(Self::Sqlite),
+            "postgres" | "postgresql" => Ok(Self::Postgres),
+            "mariadb" | "mysql" => Ok(Self::MariaDb),
+            other => bail!(
+                "unsupported DATABASE_BACKEND '{other}' (expected sqlite, postgres, or mariadb)"
+            ),
+        }
+    }
+
+    pub fn infer_from_url(url: &str) -> Option<Self> {
+        let (scheme, _) = url.split_once(':')?;
+        match scheme.to_ascii_lowercase().as_str() {
+            "sqlite" | "file" => Some(Self::Sqlite),
+            "postgres" | "postgresql" => Some(Self::Postgres),
+            "mariadb" | "mysql" => Some(Self::MariaDb),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sqlite => "sqlite",
+            Self::Postgres => "postgres",
+            Self::MariaDb => "mariadb",
+        }
+    }
+
+    pub fn migration_target(self) -> DatabaseMigrationTarget {
+        match self {
+            Self::Sqlite => DatabaseMigrationTarget {
+                backend: self,
+                dialect: "sqlite",
+                default_port: None,
+                url_schemes: SQLITE_URL_SCHEMES,
+            },
+            Self::Postgres => DatabaseMigrationTarget {
+                backend: self,
+                dialect: "postgres",
+                default_port: Some(5432),
+                url_schemes: POSTGRES_URL_SCHEMES,
+            },
+            Self::MariaDb => DatabaseMigrationTarget {
+                backend: self,
+                dialect: "mariadb",
+                default_port: Some(3306),
+                url_schemes: MARIADB_URL_SCHEMES,
+            },
+        }
+    }
+}
+
+impl fmt::Display for DatabaseBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatabaseMigrationTarget {
+    pub backend: DatabaseBackend,
+    pub dialect: &'static str,
+    pub default_port: Option<u16>,
+    pub url_schemes: &'static [&'static str],
+}
+
+pub const DATABASE_MIGRATION_TARGETS: [DatabaseMigrationTarget; 3] = [
+    DatabaseMigrationTarget {
+        backend: DatabaseBackend::Sqlite,
+        dialect: "sqlite",
+        default_port: None,
+        url_schemes: SQLITE_URL_SCHEMES,
+    },
+    DatabaseMigrationTarget {
+        backend: DatabaseBackend::Postgres,
+        dialect: "postgres",
+        default_port: Some(5432),
+        url_schemes: POSTGRES_URL_SCHEMES,
+    },
+    DatabaseMigrationTarget {
+        backend: DatabaseBackend::MariaDb,
+        dialect: "mariadb",
+        default_port: Some(3306),
+        url_schemes: MARIADB_URL_SCHEMES,
+    },
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseConfig {
+    backend: DatabaseBackend,
+    sqlite_path: Option<String>,
+    url: Option<String>,
+}
+
+impl DatabaseConfig {
+    pub fn sqlite(path: impl Into<String>) -> Self {
+        Self {
+            backend: DatabaseBackend::Sqlite,
+            sqlite_path: Some(path.into()),
+            url: None,
+        }
+    }
+
+    pub fn from_env() -> Result<Self> {
+        Self::from_env_with(|key| std::env::var(key).ok())
+    }
+
+    pub fn from_env_with<F>(mut get: F) -> Result<Self>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let backend_raw = clean_env_value(get("DATABASE_BACKEND"));
+        let database_url = clean_env_value(get("DATABASE_URL"));
+        let database_path = clean_env_value(get("DATABASE_PATH"));
+
+        let backend = match backend_raw {
+            Some(raw) => DatabaseBackend::parse(&raw)?,
+            None => database_url
+                .as_deref()
+                .and_then(DatabaseBackend::infer_from_url)
+                .unwrap_or(DatabaseBackend::Sqlite),
+        };
+
+        match backend {
+            DatabaseBackend::Sqlite => {
+                let sqlite_path = match (database_path, database_url) {
+                    (Some(path), _) => path,
+                    (None, Some(url)) => sqlite_path_from_url(&url)?,
+                    (None, None) => DEFAULT_SQLITE_DATABASE_PATH.to_string(),
+                };
+                Ok(Self::sqlite(sqlite_path))
+            }
+            DatabaseBackend::Postgres | DatabaseBackend::MariaDb => {
+                let url = database_url
+                    .with_context(|| format!("DATABASE_URL is required for {backend}"))?;
+                if let Some(inferred) = DatabaseBackend::infer_from_url(&url) {
+                    if inferred != backend {
+                        bail!(
+                            "DATABASE_BACKEND={backend} does not match DATABASE_URL target {inferred}"
+                        );
+                    }
+                }
+                Ok(Self {
+                    backend,
+                    sqlite_path: None,
+                    url: Some(url),
+                })
+            }
+        }
+    }
+
+    pub fn backend(&self) -> DatabaseBackend {
+        self.backend
+    }
+
+    pub fn sqlite_path(&self) -> Option<&str> {
+        self.sqlite_path.as_deref()
+    }
+
+    pub fn url(&self) -> Option<&str> {
+        self.url.as_deref()
+    }
+
+    pub fn location(&self) -> &str {
+        self.sqlite_path()
+            .or_else(|| self.url())
+            .unwrap_or("<unconfigured>")
+    }
+
+    pub fn display_location(&self) -> String {
+        match self.backend {
+            DatabaseBackend::Sqlite => self.location().to_string(),
+            DatabaseBackend::Postgres | DatabaseBackend::MariaDb => self
+                .url()
+                .map(redact_database_url)
+                .unwrap_or_else(|| "<unconfigured>".to_string()),
+        }
+    }
+
+    pub fn migration_target(&self) -> DatabaseMigrationTarget {
+        self.backend.migration_target()
+    }
+}
+
+fn clean_env_value(value: Option<String>) -> Option<String> {
+    value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn sqlite_path_from_url(url: &str) -> Result<String> {
+    if url == "sqlite::memory:" {
+        return Ok(":memory:".to_string());
+    }
+    if let Some(path) = url.strip_prefix("sqlite:") {
+        let path = path.strip_prefix("//").unwrap_or(path);
+        if path.is_empty() {
+            bail!("sqlite DATABASE_URL must include a path");
+        }
+        return Ok(path.to_string());
+    }
+    if let Some(path) = url.strip_prefix("file:") {
+        if path.is_empty() {
+            bail!("file DATABASE_URL must include a path");
+        }
+        return Ok(path.to_string());
+    }
+    bail!("DATABASE_URL must use sqlite:// or file: when DATABASE_BACKEND=sqlite")
+}
+
+fn redact_database_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let Some((_, host_and_path)) = rest.rsplit_once('@') else {
+        return url.to_string();
+    };
+    format!("{scheme}://<credentials-redacted>@{host_and_path}")
+}
+
+pub trait DatabaseAdapter: fmt::Debug + Send + Sync {
+    fn backend(&self) -> DatabaseBackend;
+
+    fn migration_target(&self) -> DatabaseMigrationTarget {
+        self.backend().migration_target()
+    }
+
+    fn connect(&self) -> Result<Db>;
+}
+
+#[derive(Debug, Clone)]
+pub struct SqliteAdapter {
+    path: String,
+}
+
+impl SqliteAdapter {
+    pub fn new(path: impl Into<String>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+impl DatabaseAdapter for SqliteAdapter {
+    fn backend(&self) -> DatabaseBackend {
+        DatabaseBackend::Sqlite
+    }
+
+    fn connect(&self) -> Result<Db> {
+        open_sqlite(self.path())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DeferredDatabaseAdapter {
+    config: DatabaseConfig,
+}
+
+impl DatabaseAdapter for DeferredDatabaseAdapter {
+    fn backend(&self) -> DatabaseBackend {
+        self.config.backend()
+    }
+
+    fn connect(&self) -> Result<Db> {
+        let backend = self.backend();
+        bail!(
+            "{backend} database adapter is not implemented yet; use DATABASE_BACKEND=sqlite until the {backend} adapter lands"
+        )
+    }
+}
+
+pub fn adapter_for(config: &DatabaseConfig) -> Box<dyn DatabaseAdapter> {
+    match config.backend() {
+        DatabaseBackend::Sqlite => {
+            let path = config
+                .sqlite_path()
+                .unwrap_or(DEFAULT_SQLITE_DATABASE_PATH)
+                .to_string();
+            Box::new(SqliteAdapter::new(path))
+        }
+        DatabaseBackend::Postgres | DatabaseBackend::MariaDb => Box::new(DeferredDatabaseAdapter {
+            config: config.clone(),
+        }),
+    }
+}
+
+#[derive(Clone)]
+pub struct Db {
+    backend: DatabaseBackend,
+    connection: Arc<Mutex<Connection>>,
+}
+
+impl fmt::Debug for Db {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Db")
+            .field("backend", &self.backend)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Db {
+    fn sqlite(connection: Connection) -> Self {
+        Self {
+            backend: DatabaseBackend::Sqlite,
+            connection: Arc::new(Mutex::new(connection)),
+        }
+    }
+
+    pub fn backend(&self) -> DatabaseBackend {
+        self.backend
+    }
+
+    pub fn migration_target(&self) -> DatabaseMigrationTarget {
+        self.backend.migration_target()
+    }
+
+    pub fn lock(&self) -> LockResult<MutexGuard<'_, Connection>> {
+        self.connection.lock()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DbValue {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+impl DbValue {
+    pub fn null() -> Self {
+        Self::Null
+    }
+
+    pub fn json(value: &serde_json::Value) -> Result<Self> {
+        Ok(Self::Text(
+            serde_json::to_string(value).context("serialize json db value")?,
+        ))
+    }
+}
+
+impl ToSql for DbValue {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        let value = match self {
+            Self::Null => SqliteValue::Null,
+            Self::Integer(value) => SqliteValue::Integer(*value),
+            Self::Real(value) => SqliteValue::Real(*value),
+            Self::Text(value) => SqliteValue::Text(value.clone()),
+            Self::Blob(value) => SqliteValue::Blob(value.clone()),
+        };
+        Ok(ToSqlOutput::Owned(value))
+    }
+}
+
+impl From<&str> for DbValue {
+    fn from(value: &str) -> Self {
+        Self::Text(value.to_string())
+    }
+}
+
+impl From<String> for DbValue {
+    fn from(value: String) -> Self {
+        Self::Text(value)
+    }
+}
+
+impl From<&String> for DbValue {
+    fn from(value: &String) -> Self {
+        Self::Text(value.clone())
+    }
+}
+
+impl From<Option<&str>> for DbValue {
+    fn from(value: Option<&str>) -> Self {
+        value.map_or(Self::Null, Self::from)
+    }
+}
+
+impl From<Option<String>> for DbValue {
+    fn from(value: Option<String>) -> Self {
+        value.map_or(Self::Null, Self::Text)
+    }
+}
+
+impl From<Option<&String>> for DbValue {
+    fn from(value: Option<&String>) -> Self {
+        value.map_or(Self::Null, Self::from)
+    }
+}
+
+impl From<i64> for DbValue {
+    fn from(value: i64) -> Self {
+        Self::Integer(value)
+    }
+}
+
+impl From<i32> for DbValue {
+    fn from(value: i32) -> Self {
+        Self::Integer(value as i64)
+    }
+}
+
+impl From<usize> for DbValue {
+    fn from(value: usize) -> Self {
+        Self::Integer(value as i64)
+    }
+}
+
+impl From<Option<i64>> for DbValue {
+    fn from(value: Option<i64>) -> Self {
+        value.map_or(Self::Null, Self::Integer)
+    }
+}
+
+impl From<Option<i32>> for DbValue {
+    fn from(value: Option<i32>) -> Self {
+        value.map_or(Self::Null, Self::from)
+    }
+}
+
+impl From<bool> for DbValue {
+    fn from(value: bool) -> Self {
+        Self::Integer(value as i64)
+    }
+}
+
+impl From<Option<bool>> for DbValue {
+    fn from(value: Option<bool>) -> Self {
+        value.map_or(Self::Null, Self::from)
+    }
+}
+
+impl From<Vec<u8>> for DbValue {
+    fn from(value: Vec<u8>) -> Self {
+        Self::Blob(value)
+    }
+}
+
+impl From<&[u8]> for DbValue {
+    fn from(value: &[u8]) -> Self {
+        Self::Blob(value.to_vec())
+    }
+}
+
+impl From<Option<&[u8]>> for DbValue {
+    fn from(value: Option<&[u8]>) -> Self {
+        value.map_or(Self::Null, Self::from)
+    }
+}
+
+impl From<Option<Vec<u8>>> for DbValue {
+    fn from(value: Option<Vec<u8>>) -> Self {
+        value.map_or(Self::Null, Self::Blob)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrudOperator {
+    Eq,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CrudColumn<'a> {
+    name: &'a str,
+    value: DbValue,
+}
+
+impl<'a> CrudColumn<'a> {
+    pub fn new(name: &'a str, value: impl Into<DbValue>) -> Self {
+        Self {
+            name,
+            value: value.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CrudFilter<'a> {
+    name: &'a str,
+    operator: CrudOperator,
+    value: DbValue,
+}
+
+impl<'a> CrudFilter<'a> {
+    pub fn eq(name: &'a str, value: impl Into<DbValue>) -> Self {
+        Self {
+            name,
+            operator: CrudOperator::Eq,
+            value: value.into(),
+        }
+    }
+}
+
+pub fn crud_col(name: &str, value: impl Into<DbValue>) -> CrudColumn<'_> {
+    CrudColumn::new(name, value)
+}
+
+pub fn crud_eq(name: &str, value: impl Into<DbValue>) -> CrudFilter<'_> {
+    CrudFilter::eq(name, value)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DatabaseCrud<'conn> {
+    backend: DatabaseBackend,
+    conn: &'conn Connection,
+}
+
+pub fn crud(conn: &Connection) -> DatabaseCrud<'_> {
+    DatabaseCrud {
+        backend: DatabaseBackend::Sqlite,
+        conn,
+    }
+}
+
+impl<'conn> DatabaseCrud<'conn> {
+    pub fn backend(&self) -> DatabaseBackend {
+        self.backend
+    }
+
+    pub fn insert(&self, table: &str, columns: &[CrudColumn<'_>]) -> Result<usize> {
+        ensure_crud_columns(columns, "insert")?;
+        validate_identifier(table)?;
+        let names = column_names(columns)?;
+        let placeholders = placeholders(1, columns.len());
+        let sql = format!(
+            "INSERT INTO {table} ({}) VALUES ({})",
+            names.join(", "),
+            placeholders.join(", ")
+        );
+        self.execute(&sql, column_values(columns))
+    }
+
+    pub fn insert_do_nothing(
+        &self,
+        table: &str,
+        columns: &[CrudColumn<'_>],
+        conflict_columns: &[&str],
+    ) -> Result<usize> {
+        ensure_crud_columns(columns, "insert")?;
+        validate_identifier(table)?;
+        let names = column_names(columns)?;
+        let placeholders = placeholders(1, columns.len());
+        let conflict = conflict_target(conflict_columns)?;
+        let sql = format!(
+            "INSERT INTO {table} ({}) VALUES ({}) ON CONFLICT({conflict}) DO NOTHING",
+            names.join(", "),
+            placeholders.join(", ")
+        );
+        self.execute(&sql, column_values(columns))
+    }
+
+    pub fn upsert(
+        &self,
+        table: &str,
+        columns: &[CrudColumn<'_>],
+        conflict_columns: &[&str],
+        update_columns: &[&str],
+    ) -> Result<usize> {
+        ensure_crud_columns(columns, "upsert")?;
+        validate_identifier(table)?;
+        let names = column_names(columns)?;
+        let placeholders = placeholders(1, columns.len());
+        let conflict = conflict_target(conflict_columns)?;
+        let update = if update_columns.is_empty() {
+            "DO NOTHING".to_string()
+        } else {
+            for column in update_columns {
+                validate_identifier(column)?;
+            }
+            format!(
+                "DO UPDATE SET {}",
+                update_columns
+                    .iter()
+                    .map(|column| format!("{column} = excluded.{column}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let sql = format!(
+            "INSERT INTO {table} ({}) VALUES ({}) ON CONFLICT({conflict}) {update}",
+            names.join(", "),
+            placeholders.join(", ")
+        );
+        self.execute(&sql, column_values(columns))
+    }
+
+    pub fn update(
+        &self,
+        table: &str,
+        assignments: &[CrudColumn<'_>],
+        filters: &[CrudFilter<'_>],
+    ) -> Result<usize> {
+        ensure_crud_columns(assignments, "update")?;
+        ensure_crud_filters(filters, "update")?;
+        validate_identifier(table)?;
+        let mut values = column_values(assignments);
+        values.extend(filters.iter().map(|filter| &filter.value));
+        let assignments_sql = assignments
+            .iter()
+            .enumerate()
+            .map(|(idx, column)| {
+                validate_identifier(column.name)?;
+                Ok(format!("{} = ?{}", column.name, idx + 1))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let where_sql = filters_sql(filters, assignments.len() + 1)?;
+        let sql = format!(
+            "UPDATE {table} SET {} WHERE {}",
+            assignments_sql.join(", "),
+            where_sql.join(" AND ")
+        );
+        self.execute(&sql, values)
+    }
+
+    pub fn delete(&self, table: &str, filters: &[CrudFilter<'_>]) -> Result<usize> {
+        ensure_crud_filters(filters, "delete")?;
+        validate_identifier(table)?;
+        let where_sql = filters_sql(filters, 1)?;
+        let values = filters.iter().map(|filter| &filter.value).collect();
+        let sql = format!("DELETE FROM {table} WHERE {}", where_sql.join(" AND "));
+        self.execute(&sql, values)
+    }
+
+    fn execute(&self, sql: &str, values: Vec<&DbValue>) -> Result<usize> {
+        match self.backend {
+            DatabaseBackend::Sqlite => {
+                let params_vec: Vec<&dyn ToSql> = values
+                    .into_iter()
+                    .map(|value| value as &dyn ToSql)
+                    .collect();
+                Ok(self.conn.execute(sql, params_vec.as_slice())?)
+            }
+            DatabaseBackend::Postgres | DatabaseBackend::MariaDb => {
+                bail!("{} CRUD backend is not implemented yet", self.backend)
+            }
+        }
+    }
+}
+
+fn ensure_crud_columns(columns: &[CrudColumn<'_>], operation: &str) -> Result<()> {
+    if columns.is_empty() {
+        bail!("{operation} requires at least one column");
+    }
+    Ok(())
+}
+
+fn ensure_crud_filters(filters: &[CrudFilter<'_>], operation: &str) -> Result<()> {
+    if filters.is_empty() {
+        bail!("{operation} requires at least one filter");
+    }
+    Ok(())
+}
+
+fn column_names(columns: &[CrudColumn<'_>]) -> Result<Vec<String>> {
+    columns
+        .iter()
+        .map(|column| {
+            validate_identifier(column.name)?;
+            Ok(column.name.to_string())
+        })
+        .collect()
+}
+
+fn column_values<'a>(columns: &'a [CrudColumn<'_>]) -> Vec<&'a DbValue> {
+    columns.iter().map(|column| &column.value).collect()
+}
+
+fn placeholders(start: usize, count: usize) -> Vec<String> {
+    (start..start + count)
+        .map(|idx| format!("?{idx}"))
+        .collect()
+}
+
+fn conflict_target(columns: &[&str]) -> Result<String> {
+    if columns.is_empty() {
+        bail!("conflict target requires at least one column");
+    }
+    for column in columns {
+        validate_identifier(column)?;
+    }
+    Ok(columns.join(", "))
+}
+
+fn filters_sql(filters: &[CrudFilter<'_>], first_placeholder: usize) -> Result<Vec<String>> {
+    filters
+        .iter()
+        .enumerate()
+        .map(|(idx, filter)| {
+            validate_identifier(filter.name)?;
+            let placeholder = first_placeholder + idx;
+            match filter.operator {
+                CrudOperator::Eq => Ok(format!("{} = ?{placeholder}", filter.name)),
+            }
+        })
+        .collect()
+}
+
+fn validate_identifier(identifier: &str) -> Result<()> {
+    let mut chars = identifier.chars();
+    let Some(first) = chars.next() else {
+        bail!("empty SQL identifier");
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        bail!("invalid SQL identifier '{identifier}'");
+    }
+    if chars.any(|ch| !(ch == '_' || ch.is_ascii_alphanumeric())) {
+        bail!("invalid SQL identifier '{identifier}'");
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Project {
@@ -51,13 +785,21 @@ pub struct Message {
 }
 
 pub fn open(path: &str) -> Result<Db> {
+    SqliteAdapter::new(path).connect()
+}
+
+pub fn open_config(config: &DatabaseConfig) -> Result<Db> {
+    adapter_for(config).connect()
+}
+
+fn open_sqlite(path: &str) -> Result<Db> {
     let conn = Connection::open(path).context("open sqlite database")?;
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA foreign_keys=ON;",
     )?;
     apply_schema(&conn)?;
-    Ok(Arc::new(Mutex::new(conn)))
+    Ok(Db::sqlite(conn))
 }
 
 fn apply_schema(conn: &Connection) -> Result<()> {
@@ -1892,17 +2634,18 @@ pub fn purge_archived_version_body(
     // a second statement clears `structured_payload` against the now-
     // purged row. Both statements run on the same connection — callers
     // SHOULD wrap this in a transaction when batching.
-    conn.execute(
-        "UPDATE artifact_versions
-         SET body = NULL, body_purged_at = ?2
-         WHERE artifact_version_id = ?1",
-        params![artifact_version_id, now_ms_value],
+    crud(conn).update(
+        "artifact_versions",
+        &[
+            crud_col("body", DbValue::null()),
+            crud_col("body_purged_at", now_ms_value),
+        ],
+        &[crud_eq("artifact_version_id", artifact_version_id)],
     )?;
-    conn.execute(
-        "UPDATE artifact_versions
-         SET structured_payload = NULL
-         WHERE artifact_version_id = ?1 AND structured_payload IS NOT NULL",
-        params![artifact_version_id],
+    crud(conn).update(
+        "artifact_versions",
+        &[crud_col("structured_payload", DbValue::null())],
+        &[crud_eq("artifact_version_id", artifact_version_id)],
     )?;
     Ok(PurgeOutcome::Purged)
 }
@@ -2447,35 +3190,32 @@ fn artifact_actor_upsert(
         )
         .optional()?;
     if let Some(id) = existing {
-        conn.execute(
-            "UPDATE artifact_actors SET display_name = ?1, agent_system_label = ?2,
-                 runtime_metadata = ?3, updated_at = ?4 WHERE actor_id = ?5",
-            params![
-                identity.display_name,
-                identity.agent_system_label,
-                runtime,
-                now,
-                id,
+        crud(conn).update(
+            "artifact_actors",
+            &[
+                crud_col("display_name", identity.display_name),
+                crud_col("agent_system_label", identity.agent_system_label),
+                crud_col("runtime_metadata", runtime),
+                crud_col("updated_at", now),
             ],
+            &[crud_eq("actor_id", id.as_str())],
         )?;
         return Ok(id);
     }
     let id = new_uuid();
-    conn.execute(
-        "INSERT INTO artifact_actors
-         (actor_id, actor_type, agent_system, agent_system_label, agent_id, host,
-          display_name, runtime_metadata, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
-        params![
-            id,
-            identity.actor_type,
-            identity.agent_system,
-            identity.agent_system_label,
-            identity.agent_id,
-            identity.host,
-            identity.display_name,
-            runtime,
-            now,
+    crud(conn).insert(
+        "artifact_actors",
+        &[
+            crud_col("actor_id", id.as_str()),
+            crud_col("actor_type", identity.actor_type),
+            crud_col("agent_system", identity.agent_system),
+            crud_col("agent_system_label", identity.agent_system_label),
+            crud_col("agent_id", identity.agent_id),
+            crud_col("host", identity.host),
+            crud_col("display_name", identity.display_name),
+            crud_col("runtime_metadata", runtime),
+            crud_col("created_at", now),
+            crud_col("updated_at", now),
         ],
     )?;
     Ok(id)
@@ -2485,24 +3225,28 @@ fn artifact_actor_upsert(
 fn artifact_insert(conn: &Connection, input: &ArtifactInsert<'_>) -> Result<String> {
     let id = new_uuid();
     let now = now_ms();
-    conn.execute(
-        "INSERT INTO artifacts
-         (artifact_id, project_ident, kind, subkind, title, labels,
-          lifecycle_state, review_state, implementation_state,
-          current_version_id, accepted_version_id, created_by_actor_id,
-          created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'draft', 'none',
-                 CASE WHEN ?3 = 'spec' THEN 'not_started' ELSE 'not_applicable' END,
-                 NULL, NULL, ?7, ?8, ?8)",
-        params![
-            id,
-            input.project_ident,
-            input.kind,
-            input.subkind,
-            input.title,
-            serialize_string_array(input.labels),
-            input.created_by_actor_id,
-            now,
+    let implementation_state = if input.kind == "spec" {
+        "not_started"
+    } else {
+        "not_applicable"
+    };
+    crud(conn).insert(
+        "artifacts",
+        &[
+            crud_col("artifact_id", id.as_str()),
+            crud_col("project_ident", input.project_ident),
+            crud_col("kind", input.kind),
+            crud_col("subkind", input.subkind),
+            crud_col("title", input.title),
+            crud_col("labels", serialize_string_array(input.labels)),
+            crud_col("lifecycle_state", "draft"),
+            crud_col("review_state", "none"),
+            crud_col("implementation_state", implementation_state),
+            crud_col("current_version_id", DbValue::null()),
+            crud_col("accepted_version_id", DbValue::null()),
+            crud_col("created_by_actor_id", input.created_by_actor_id),
+            crud_col("created_at", now),
+            crud_col("updated_at", now),
         ],
     )?;
     Ok(id)
@@ -2512,27 +3256,26 @@ fn artifact_insert(conn: &Connection, input: &ArtifactInsert<'_>) -> Result<Stri
 fn artifact_version_insert(conn: &Connection, input: &ArtifactVersionInsert<'_>) -> Result<String> {
     let id = new_uuid();
     let payload = serialize_json_or_null(&input.structured_payload);
-    conn.execute(
-        "INSERT INTO artifact_versions
-         (artifact_version_id, artifact_id, version_label, parent_version_id,
-          body_format, body, structured_payload, source_format,
-          created_by_actor_id, created_via_workflow_run_id, version_state,
-          idempotency_key, body_purged_at, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?13)",
-        params![
-            id,
-            input.artifact_id,
-            input.version_label,
-            input.parent_version_id,
-            input.body_format,
-            input.body,
-            payload,
-            input.source_format,
-            input.created_by_actor_id,
-            input.created_via_workflow_run_id,
-            input.version_state,
-            input.idempotency_key,
-            now_ms(),
+    crud(conn).insert(
+        "artifact_versions",
+        &[
+            crud_col("artifact_version_id", id.as_str()),
+            crud_col("artifact_id", input.artifact_id),
+            crud_col("version_label", input.version_label),
+            crud_col("parent_version_id", input.parent_version_id),
+            crud_col("body_format", input.body_format),
+            crud_col("body", input.body),
+            crud_col("structured_payload", payload),
+            crud_col("source_format", input.source_format),
+            crud_col("created_by_actor_id", input.created_by_actor_id),
+            crud_col(
+                "created_via_workflow_run_id",
+                input.created_via_workflow_run_id,
+            ),
+            crud_col("version_state", input.version_state),
+            crud_col("idempotency_key", input.idempotency_key),
+            crud_col("body_purged_at", DbValue::null()),
+            crud_col("created_at", now_ms()),
         ],
     )?;
     Ok(id)
@@ -2560,13 +3303,18 @@ fn artifact_set_pointers(
         }
     }
 
-    conn.execute(
-        "UPDATE artifacts
-         SET current_version_id = COALESCE(?2, current_version_id),
-             accepted_version_id = COALESCE(?3, accepted_version_id),
-             updated_at = ?4
-         WHERE artifact_id = ?1",
-        params![artifact_id, current, accepted, now_ms()],
+    let mut assignments = Vec::new();
+    if let Some(current) = current {
+        assignments.push(crud_col("current_version_id", current));
+    }
+    if let Some(accepted) = accepted {
+        assignments.push(crud_col("accepted_version_id", accepted));
+    }
+    assignments.push(crud_col("updated_at", now_ms()));
+    crud(conn).update(
+        "artifacts",
+        &assignments,
+        &[crud_eq("artifact_id", artifact_id)],
     )?;
     Ok(())
 }
@@ -2574,29 +3322,27 @@ fn artifact_set_pointers(
 #[allow(dead_code)]
 fn artifact_link_insert(conn: &Connection, input: &ArtifactLinkInsert<'_>) -> Result<String> {
     let id = new_uuid();
-    conn.execute(
-        "INSERT INTO artifact_links
-         (link_id, link_type, source_kind, source_id, source_version_id, source_child_address,
-          target_kind, target_id, target_version_id, target_child_address,
-          created_by_actor_id, created_via_workflow_run_id, idempotency_key,
-          supersedes_link_id, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-        params![
-            id,
-            input.link_type,
-            input.source_kind,
-            input.source_id,
-            input.source_version_id,
-            input.source_child_address,
-            input.target_kind,
-            input.target_id,
-            input.target_version_id,
-            input.target_child_address,
-            input.created_by_actor_id,
-            input.created_via_workflow_run_id,
-            input.idempotency_key,
-            input.supersedes_link_id,
-            now_ms(),
+    crud(conn).insert(
+        "artifact_links",
+        &[
+            crud_col("link_id", id.as_str()),
+            crud_col("link_type", input.link_type),
+            crud_col("source_kind", input.source_kind),
+            crud_col("source_id", input.source_id),
+            crud_col("source_version_id", input.source_version_id),
+            crud_col("source_child_address", input.source_child_address),
+            crud_col("target_kind", input.target_kind),
+            crud_col("target_id", input.target_id),
+            crud_col("target_version_id", input.target_version_id),
+            crud_col("target_child_address", input.target_child_address),
+            crud_col("created_by_actor_id", input.created_by_actor_id),
+            crud_col(
+                "created_via_workflow_run_id",
+                input.created_via_workflow_run_id,
+            ),
+            crud_col("idempotency_key", input.idempotency_key),
+            crud_col("supersedes_link_id", input.supersedes_link_id),
+            crud_col("created_at", now_ms()),
         ],
     )?;
     Ok(id)
@@ -2607,29 +3353,32 @@ fn workflow_run_insert(conn: &Connection, input: &WorkflowRunInsert<'_>) -> Resu
     let id = new_uuid();
     let participants = serialize_string_array(input.participant_actor_ids);
     let read_set = serialize_json_or_null(&input.read_set);
-    conn.execute(
-        "INSERT INTO workflow_runs
-         (workflow_run_id, artifact_id, workflow_kind, phase, round_id,
-          coordinator_actor_id, participant_actor_ids, source_artifact_version_id,
-          read_set, idempotency_key, is_resumable, state,
-          generated_contribution_ids, generated_version_ids, generated_task_ids,
-          generated_link_ids, generated_chunk_ids, failure_reason,
-          started_at, ended_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'started',
-                 NULL, NULL, NULL, NULL, NULL, NULL, ?12, NULL)",
-        params![
-            id,
-            input.artifact_id,
-            input.workflow_kind,
-            input.phase,
-            input.round_id,
-            input.coordinator_actor_id,
-            participants,
-            input.source_artifact_version_id,
-            read_set,
-            input.idempotency_key,
-            input.is_resumable as i64,
-            now_ms(),
+    crud(conn).insert(
+        "workflow_runs",
+        &[
+            crud_col("workflow_run_id", id.as_str()),
+            crud_col("artifact_id", input.artifact_id),
+            crud_col("workflow_kind", input.workflow_kind),
+            crud_col("phase", input.phase),
+            crud_col("round_id", input.round_id),
+            crud_col("coordinator_actor_id", input.coordinator_actor_id),
+            crud_col("participant_actor_ids", participants),
+            crud_col(
+                "source_artifact_version_id",
+                input.source_artifact_version_id,
+            ),
+            crud_col("read_set", read_set),
+            crud_col("idempotency_key", input.idempotency_key),
+            crud_col("is_resumable", input.is_resumable),
+            crud_col("state", "started"),
+            crud_col("generated_contribution_ids", DbValue::null()),
+            crud_col("generated_version_ids", DbValue::null()),
+            crud_col("generated_task_ids", DbValue::null()),
+            crud_col("generated_link_ids", DbValue::null()),
+            crud_col("generated_chunk_ids", DbValue::null()),
+            crud_col("failure_reason", DbValue::null()),
+            crud_col("started_at", now_ms()),
+            crud_col("ended_at", DbValue::null()),
         ],
     )?;
     Ok(id)
@@ -2642,11 +3391,19 @@ fn workflow_run_set_state(
     new_state: &str,
     failure_reason: Option<&str>,
 ) -> Result<()> {
-    conn.execute(
-        "UPDATE workflow_runs
-         SET state = ?2, failure_reason = ?3, ended_at = CASE WHEN ?2 = 'started' THEN NULL ELSE ?4 END
-         WHERE workflow_run_id = ?1",
-        params![run_id, new_state, failure_reason, now_ms()],
+    let ended_at = if new_state == "started" {
+        None
+    } else {
+        Some(now_ms())
+    };
+    crud(conn).update(
+        "workflow_runs",
+        &[
+            crud_col("state", new_state),
+            crud_col("failure_reason", failure_reason),
+            crud_col("ended_at", ended_at),
+        ],
+        &[crud_eq("workflow_run_id", run_id)],
     )?;
     Ok(())
 }
@@ -2655,25 +3412,22 @@ fn workflow_run_set_state(
 fn artifact_chunk_insert(conn: &Connection, input: &ArtifactChunkInsert<'_>) -> Result<String> {
     let id = new_uuid();
     let metadata = serialize_json_or_null(&input.metadata);
-    conn.execute(
-        "INSERT INTO artifact_chunks
-         (chunk_id, artifact_id, artifact_version_id, child_address, text,
-          embedding_model, embedding_vector, app, label, kind, metadata_json,
-          superseded_by_chunk_id, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12)",
-        params![
-            id,
-            input.artifact_id,
-            input.artifact_version_id,
-            input.child_address,
-            input.text,
-            input.embedding_model,
-            input.embedding_vector,
-            input.app,
-            input.label,
-            input.kind,
-            metadata,
-            now_ms(),
+    crud(conn).insert(
+        "artifact_chunks",
+        &[
+            crud_col("chunk_id", id.as_str()),
+            crud_col("artifact_id", input.artifact_id),
+            crud_col("artifact_version_id", input.artifact_version_id),
+            crud_col("child_address", input.child_address),
+            crud_col("text", input.text),
+            crud_col("embedding_model", input.embedding_model),
+            crud_col("embedding_vector", input.embedding_vector),
+            crud_col("app", input.app),
+            crud_col("label", input.label),
+            crud_col("kind", input.kind),
+            crud_col("metadata_json", metadata),
+            crud_col("superseded_by_chunk_id", DbValue::null()),
+            crud_col("created_at", now_ms()),
         ],
     )?;
     Ok(id)
@@ -2685,9 +3439,10 @@ fn artifact_chunk_mark_superseded(
     old_chunk_id: &str,
     new_chunk_id: &str,
 ) -> Result<()> {
-    conn.execute(
-        "UPDATE artifact_chunks SET superseded_by_chunk_id = ?2 WHERE chunk_id = ?1",
-        params![old_chunk_id, new_chunk_id],
+    crud(conn).update(
+        "artifact_chunks",
+        &[crud_col("superseded_by_chunk_id", new_chunk_id)],
+        &[crud_eq("chunk_id", old_chunk_id)],
     )?;
     Ok(())
 }
@@ -2696,25 +3451,25 @@ fn artifact_chunk_mark_superseded(
 fn artifact_comment_insert(conn: &Connection, input: &ArtifactCommentInsert<'_>) -> Result<String> {
     let id = new_uuid();
     let now = now_ms();
-    conn.execute(
-        "INSERT INTO artifact_comments
-         (comment_id, artifact_id, target_kind, target_id, child_address,
-          parent_comment_id, actor_id, body, state, resolved_by_actor_id,
-          resolved_by_workflow_run_id, resolved_at, resolution_note,
-          idempotency_key, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'open', NULL, NULL, NULL, NULL,
-                 ?9, ?10, ?10)",
-        params![
-            id,
-            input.artifact_id,
-            input.target_kind,
-            input.target_id,
-            input.child_address,
-            input.parent_comment_id,
-            input.actor_id,
-            input.body,
-            input.idempotency_key,
-            now,
+    crud(conn).insert(
+        "artifact_comments",
+        &[
+            crud_col("comment_id", id.as_str()),
+            crud_col("artifact_id", input.artifact_id),
+            crud_col("target_kind", input.target_kind),
+            crud_col("target_id", input.target_id),
+            crud_col("child_address", input.child_address),
+            crud_col("parent_comment_id", input.parent_comment_id),
+            crud_col("actor_id", input.actor_id),
+            crud_col("body", input.body),
+            crud_col("state", "open"),
+            crud_col("resolved_by_actor_id", DbValue::null()),
+            crud_col("resolved_by_workflow_run_id", DbValue::null()),
+            crud_col("resolved_at", DbValue::null()),
+            crud_col("resolution_note", DbValue::null()),
+            crud_col("idempotency_key", input.idempotency_key),
+            crud_col("created_at", now),
+            crud_col("updated_at", now),
         ],
     )?;
     Ok(id)
@@ -2727,27 +3482,23 @@ fn artifact_contribution_insert(
 ) -> Result<String> {
     let id = new_uuid();
     let read_set = serialize_json_or_null(&input.read_set);
-    conn.execute(
-        "INSERT INTO artifact_contributions
-         (contribution_id, artifact_id, target_kind, target_id, contribution_kind,
-          phase, role, actor_id, workflow_run_id, read_set, body_format, body,
-          idempotency_key, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-        params![
-            id,
-            input.artifact_id,
-            input.target_kind,
-            input.target_id,
-            input.contribution_kind,
-            input.phase,
-            input.role,
-            input.actor_id,
-            input.workflow_run_id,
-            read_set,
-            input.body_format,
-            input.body,
-            input.idempotency_key,
-            now_ms(),
+    crud(conn).insert(
+        "artifact_contributions",
+        &[
+            crud_col("contribution_id", id.as_str()),
+            crud_col("artifact_id", input.artifact_id),
+            crud_col("target_kind", input.target_kind),
+            crud_col("target_id", input.target_id),
+            crud_col("contribution_kind", input.contribution_kind),
+            crud_col("phase", input.phase),
+            crud_col("role", input.role),
+            crud_col("actor_id", input.actor_id),
+            crud_col("workflow_run_id", input.workflow_run_id),
+            crud_col("read_set", read_set),
+            crud_col("body_format", input.body_format),
+            crud_col("body", input.body),
+            crud_col("idempotency_key", input.idempotency_key),
+            crud_col("created_at", now_ms()),
         ],
     )?;
     Ok(id)
@@ -3335,40 +4086,32 @@ pub fn update_artifact(
         check_labels(labels, envelope)?;
     }
 
-    let mut sets: Vec<String> = Vec::new();
-    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    let mut push = |col: &str, val: Box<dyn rusqlite::ToSql>| {
-        binds.push(val);
-        sets.push(format!("{col} = ?{}", binds.len()));
-    };
+    let mut assignments: Vec<CrudColumn<'_>> = Vec::new();
     if let Some(title) = update.title {
-        push("title", Box::new(title.to_string()));
+        assignments.push(crud_col("title", title));
     }
     if let Some(labels) = update.labels {
-        push("labels", Box::new(serialize_string_array(labels)));
+        assignments.push(crud_col("labels", serialize_string_array(labels)));
     }
     if let Some(state) = update.lifecycle_state {
-        push("lifecycle_state", Box::new(state.to_string()));
+        assignments.push(crud_col("lifecycle_state", state));
     }
     if let Some(state) = update.review_state {
-        push("review_state", Box::new(state.to_string()));
+        assignments.push(crud_col("review_state", state));
     }
     if let Some(state) = update.implementation_state {
-        push("implementation_state", Box::new(state.to_string()));
+        assignments.push(crud_col("implementation_state", state));
     }
-    push("updated_at", Box::new(now_ms()));
-    drop(push);
+    assignments.push(crud_col("updated_at", now_ms()));
 
-    binds.push(Box::new(project_ident.to_string()));
-    let project_ph = binds.len();
-    binds.push(Box::new(artifact_id.to_string()));
-    let artifact_ph = binds.len();
-    let sql = format!(
-        "UPDATE artifacts SET {} WHERE project_ident = ?{project_ph} AND artifact_id = ?{artifact_ph}",
-        sets.join(", ")
-    );
-    let params_vec: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
-    let changed = conn.execute(&sql, params_vec.as_slice())?;
+    let changed = crud(conn).update(
+        "artifacts",
+        &assignments,
+        &[
+            crud_eq("project_ident", project_ident),
+            crud_eq("artifact_id", artifact_id),
+        ],
+    )?;
     if changed == 0 {
         return Ok(None);
     }
@@ -3661,10 +4404,13 @@ pub fn accept_artifact_version(
     ) {
         anyhow::bail!("version cannot be accepted from current state");
     }
-    conn.execute(
-        "UPDATE artifact_versions SET version_state = 'accepted'
-         WHERE artifact_id = ?1 AND artifact_version_id = ?2",
-        params![artifact_id, artifact_version_id],
+    crud(conn).update(
+        "artifact_versions",
+        &[crud_col("version_state", "accepted")],
+        &[
+            crud_eq("artifact_id", artifact_id),
+            crud_eq("artifact_version_id", artifact_version_id),
+        ],
     )?;
     artifact_set_pointers(
         conn,
@@ -3955,22 +4701,21 @@ pub fn resolve_artifact_comment(
     if existing.state == "resolved" {
         return Ok(Some(existing));
     }
-    conn.execute(
-        "UPDATE artifact_comments
-         SET state = 'resolved',
-             resolved_by_actor_id = ?3,
-             resolved_by_workflow_run_id = ?4,
-             resolved_at = ?5,
-             resolution_note = ?6,
-             updated_at = ?5
-         WHERE artifact_id = ?1 AND comment_id = ?2 AND state = 'open'",
-        params![
-            artifact_id,
-            comment_id,
-            actor_id,
-            workflow_run_id,
-            now_ms(),
-            resolution_note,
+    let now = now_ms();
+    crud(conn).update(
+        "artifact_comments",
+        &[
+            crud_col("state", "resolved"),
+            crud_col("resolved_by_actor_id", actor_id),
+            crud_col("resolved_by_workflow_run_id", workflow_run_id),
+            crud_col("resolved_at", now),
+            crud_col("resolution_note", resolution_note),
+            crud_col("updated_at", now),
+        ],
+        &[
+            crud_eq("artifact_id", artifact_id),
+            crud_eq("comment_id", comment_id),
+            crud_eq("state", "open"),
         ],
     )?;
     get_artifact_comment(conn, artifact_id, comment_id)
@@ -3995,16 +4740,20 @@ pub fn reopen_artifact_comment(
     if existing.state != "resolved" {
         return Ok(Some(existing));
     }
-    conn.execute(
-        "UPDATE artifact_comments
-         SET state = 'open',
-             resolved_by_actor_id = NULL,
-             resolved_by_workflow_run_id = NULL,
-             resolved_at = NULL,
-             resolution_note = NULL,
-             updated_at = ?3
-         WHERE artifact_id = ?1 AND comment_id = ?2",
-        params![artifact_id, comment_id, now_ms()],
+    crud(conn).update(
+        "artifact_comments",
+        &[
+            crud_col("state", "open"),
+            crud_col("resolved_by_actor_id", DbValue::null()),
+            crud_col("resolved_by_workflow_run_id", DbValue::null()),
+            crud_col("resolved_at", DbValue::null()),
+            crud_col("resolution_note", DbValue::null()),
+            crud_col("updated_at", now_ms()),
+        ],
+        &[
+            crud_eq("artifact_id", artifact_id),
+            crud_eq("comment_id", comment_id),
+        ],
     )?;
     let _ = add_artifact_comment(
         conn,
@@ -4324,57 +5073,48 @@ pub fn update_workflow_run(
         anyhow::bail!("failed workflow runs require failure_reason");
     }
 
-    let mut sets: Vec<String> = Vec::new();
-    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    let mut push = |col: &str, val: Box<dyn rusqlite::ToSql>| {
-        binds.push(val);
-        sets.push(format!("{col} = ?{}", binds.len()));
-    };
+    let mut assignments: Vec<CrudColumn<'_>> = Vec::new();
     if let Some(state) = update.state {
-        push("state", Box::new(state.to_string()));
+        assignments.push(crud_col("state", state));
     }
     if let Some(reason) = update.failure_reason {
-        push("failure_reason", Box::new(reason.map(str::to_string)));
+        assignments.push(crud_col("failure_reason", reason));
     }
     if let Some(ids) = update.generated_contribution_ids {
-        push(
+        assignments.push(crud_col(
             "generated_contribution_ids",
-            Box::new(serialize_string_array(ids)),
-        );
+            serialize_string_array(ids),
+        ));
     }
     if let Some(ids) = update.generated_version_ids {
-        push(
+        assignments.push(crud_col(
             "generated_version_ids",
-            Box::new(serialize_string_array(ids)),
-        );
+            serialize_string_array(ids),
+        ));
     }
     if let Some(ids) = update.generated_task_ids {
-        push("generated_task_ids", Box::new(serialize_string_array(ids)));
+        assignments.push(crud_col("generated_task_ids", serialize_string_array(ids)));
     }
     if let Some(ids) = update.generated_link_ids {
-        push("generated_link_ids", Box::new(serialize_string_array(ids)));
+        assignments.push(crud_col("generated_link_ids", serialize_string_array(ids)));
     }
     if let Some(ids) = update.generated_chunk_ids {
-        push("generated_chunk_ids", Box::new(serialize_string_array(ids)));
+        assignments.push(crud_col("generated_chunk_ids", serialize_string_array(ids)));
     }
     if let Some(ended_at) = update.ended_at {
-        push("ended_at", Box::new(ended_at));
+        assignments.push(crud_col("ended_at", ended_at));
     } else if matches!(update.state, Some("succeeded" | "failed" | "cancelled")) {
-        push("ended_at", Box::new(Some(now_ms())));
+        assignments.push(crud_col("ended_at", Some(now_ms())));
     }
-    drop(push);
 
-    if sets.is_empty() {
+    if assignments.is_empty() {
         return Ok(Some(current));
     }
-    binds.push(Box::new(workflow_run_id.to_string()));
-    let id_ph = binds.len();
-    let sql = format!(
-        "UPDATE workflow_runs SET {} WHERE workflow_run_id = ?{id_ph}",
-        sets.join(", ")
-    );
-    let params_vec: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
-    conn.execute(&sql, params_vec.as_slice())?;
+    crud(conn).update(
+        "workflow_runs",
+        &assignments,
+        &[crud_eq("workflow_run_id", workflow_run_id)],
+    )?;
     get_workflow_run(conn, workflow_run_id)
 }
 
@@ -4494,10 +5234,11 @@ pub fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>> {
 }
 
 pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
-    conn.execute(
-        "INSERT INTO settings (key, value) VALUES (?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![key, value],
+    crud(conn).upsert(
+        "settings",
+        &[crud_col("key", key), crud_col("value", value)],
+        &["key"],
+        &["value"],
     )?;
     Ok(())
 }
@@ -4541,30 +5282,29 @@ pub fn get_project_by_room(
 }
 
 pub fn insert_project(conn: &Connection, p: &Project) -> Result<()> {
-    conn.execute(
-        "INSERT INTO projects (
-            ident, channel_name, room_id, last_msg_id, created_at,
-            repo_provider, repo_namespace, repo_name, repo_full_name
-         )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-         ON CONFLICT(ident) DO NOTHING",
-        params![
-            p.ident,
-            p.channel_name,
-            p.room_id,
-            p.last_msg_id,
-            p.created_at,
-            p.repo_provider,
-            p.repo_namespace,
-            p.repo_name,
-            p.repo_full_name
+    crud(conn).insert_do_nothing(
+        "projects",
+        &[
+            crud_col("ident", p.ident.as_str()),
+            crud_col("channel_name", p.channel_name.as_str()),
+            crud_col("room_id", p.room_id.as_str()),
+            crud_col("last_msg_id", p.last_msg_id.as_deref()),
+            crud_col("created_at", p.created_at),
+            crud_col("repo_provider", p.repo_provider.as_deref()),
+            crud_col("repo_namespace", p.repo_namespace.as_deref()),
+            crud_col("repo_name", p.repo_name.as_deref()),
+            crud_col("repo_full_name", p.repo_full_name.as_deref()),
         ],
+        &["ident"],
     )?;
-    conn.execute(
-        "INSERT INTO cursors (project_ident, last_read_id, updated_at)
-         VALUES (?1, 0, ?2)
-         ON CONFLICT(project_ident) DO NOTHING",
-        params![p.ident, p.created_at],
+    crud(conn).insert_do_nothing(
+        "cursors",
+        &[
+            crud_col("project_ident", p.ident.as_str()),
+            crud_col("last_read_id", 0_i64),
+            crud_col("updated_at", p.created_at),
+        ],
+        &["project_ident"],
     )?;
     Ok(())
 }
@@ -4582,9 +5322,10 @@ pub fn all_projects(conn: &Connection) -> Result<Vec<Project>> {
 }
 
 pub fn update_last_msg_id(conn: &Connection, ident: &str, msg_id: &str) -> Result<()> {
-    conn.execute(
-        "UPDATE projects SET last_msg_id = ?1 WHERE ident = ?2",
-        params![msg_id, ident],
+    crud(conn).update(
+        "projects",
+        &[crud_col("last_msg_id", msg_id)],
+        &[crud_eq("ident", ident)],
     )?;
     Ok(())
 }
@@ -4618,14 +5359,15 @@ pub fn update_project_repo_mapping(
         _ => None,
     };
 
-    conn.execute(
-        "UPDATE projects
-         SET repo_provider = ?1,
-             repo_namespace = ?2,
-             repo_name = ?3,
-             repo_full_name = ?4
-         WHERE ident = ?5",
-        params![provider, namespace, repo_name, repo_full_name, ident],
+    crud(conn).update(
+        "projects",
+        &[
+            crud_col("repo_provider", provider),
+            crud_col("repo_namespace", namespace),
+            crud_col("repo_name", repo_name),
+            crud_col("repo_full_name", repo_full_name),
+        ],
+        &[crud_eq("ident", ident)],
     )?;
     get_project(conn, ident)
 }
@@ -4641,15 +5383,24 @@ pub fn bulk_fill_missing_repo_mappings(
         return Ok(0);
     }
 
-    let changed = conn.execute(
-        "UPDATE projects
-         SET repo_provider = ?1,
-             repo_namespace = ?2,
-             repo_name = ident,
-             repo_full_name = ?2 || '/' || ident
-         WHERE COALESCE(repo_full_name, '') = ''",
-        params![provider, namespace],
-    )?;
+    let projects = all_projects(conn)?;
+    let mut changed = 0;
+    for project in projects
+        .iter()
+        .filter(|project| project.repo_full_name.as_deref().unwrap_or("").is_empty())
+    {
+        let repo_full_name = format!("{namespace}/{}", project.ident);
+        changed += crud(conn).update(
+            "projects",
+            &[
+                crud_col("repo_provider", provider),
+                crud_col("repo_namespace", namespace),
+                crud_col("repo_name", project.ident.as_str()),
+                crud_col("repo_full_name", repo_full_name),
+            ],
+            &[crud_eq("ident", project.ident.as_str())],
+        )?;
+    }
     Ok(changed)
 }
 
@@ -4661,23 +5412,22 @@ pub fn insert_message(conn: &Connection, m: &Message) -> Result<i64> {
     } else {
         None
     };
-    conn.execute(
-        "INSERT INTO messages (project_ident, source, external_message_id, content, sent_at, confirmed_at, parent_message_id, agent_id, message_type, subject, hostname, event_at, deliver_to_agents)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-        params![
-            m.project_ident,
-            m.source,
-            m.external_message_id,
-            m.content,
-            m.sent_at,
-            confirmed_at,
-            m.parent_message_id,
-            m.agent_id,
-            m.message_type,
-            m.subject,
-            m.hostname,
-            m.event_at,
-            m.deliver_to_agents,
+    crud(conn).insert(
+        "messages",
+        &[
+            crud_col("project_ident", m.project_ident.as_str()),
+            crud_col("source", m.source.as_str()),
+            crud_col("external_message_id", m.external_message_id.as_deref()),
+            crud_col("content", m.content.as_str()),
+            crud_col("sent_at", m.sent_at),
+            crud_col("confirmed_at", confirmed_at),
+            crud_col("parent_message_id", m.parent_message_id),
+            crud_col("agent_id", m.agent_id.as_deref()),
+            crud_col("message_type", m.message_type.as_str()),
+            crud_col("subject", m.subject.as_deref()),
+            crud_col("hostname", m.hostname.as_deref()),
+            crud_col("event_at", m.event_at),
+            crud_col("deliver_to_agents", m.deliver_to_agents),
         ],
     )?;
     let msg_id = conn.last_insert_rowid();
@@ -4685,10 +5435,15 @@ pub fn insert_message(conn: &Connection, m: &Message) -> Result<i64> {
     // Auto-confirm for the sending agent so it doesn't appear in their unread queue.
     if m.source == "agent" {
         if let Some(ref aid) = m.agent_id {
-            conn.execute(
-                "INSERT OR IGNORE INTO agent_confirmations (agent_id, project_ident, message_id, confirmed_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![aid, m.project_ident, msg_id, now_ms()],
+            crud(conn).insert_do_nothing(
+                "agent_confirmations",
+                &[
+                    crud_col("agent_id", aid.as_str()),
+                    crud_col("project_ident", m.project_ident.as_str()),
+                    crud_col("message_id", msg_id),
+                    crud_col("confirmed_at", now_ms()),
+                ],
+                &["agent_id", "project_ident", "message_id"],
             )?;
         }
     }
@@ -4698,10 +5453,14 @@ pub fn insert_message(conn: &Connection, m: &Message) -> Result<i64> {
 
 /// Lazily register an agent for a project.
 pub fn upsert_agent(conn: &Connection, project_ident: &str, agent_id: &str) -> Result<()> {
-    conn.execute(
-        "INSERT OR IGNORE INTO agents (project_ident, agent_id, registered_at)
-         VALUES (?1, ?2, ?3)",
-        params![project_ident, agent_id, now_ms()],
+    crud(conn).insert_do_nothing(
+        "agents",
+        &[
+            crud_col("project_ident", project_ident),
+            crud_col("agent_id", agent_id),
+            crud_col("registered_at", now_ms()),
+        ],
+        &["project_ident", "agent_id"],
     )?;
     Ok(())
 }
@@ -4741,10 +5500,15 @@ pub fn confirm_message_for_agent(
     agent_id: &str,
     msg_id: i64,
 ) -> Result<bool> {
-    let n = conn.execute(
-        "INSERT OR IGNORE INTO agent_confirmations (agent_id, project_ident, message_id, confirmed_at)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![agent_id, project_ident, msg_id, now_ms()],
+    let n = crud(conn).insert_do_nothing(
+        "agent_confirmations",
+        &[
+            crud_col("agent_id", agent_id),
+            crud_col("project_ident", project_ident),
+            crud_col("message_id", msg_id),
+            crud_col("confirmed_at", now_ms()),
+        ],
+        &["agent_id", "project_ident", "message_id"],
     )?;
     Ok(n > 0)
 }
@@ -4790,13 +5554,22 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
 
 pub fn purge_old_messages(conn: &Connection, cutoff_ms: i64) -> Result<usize> {
     // agent_confirmations cleaned up via ON DELETE CASCADE on messages(id).
-    let n = conn.execute(
-        "DELETE FROM messages
-         WHERE sent_at < ?1
-           AND confirmed_at IS NOT NULL",
-        params![cutoff_ms],
-    )?;
-    Ok(n)
+    let ids = {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM messages
+             WHERE sent_at < ?1
+               AND confirmed_at IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map(params![cutoff_ms], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    let mut deleted = 0;
+    for id in ids {
+        deleted += crud(conn).delete("messages", &[crud_eq("id", id)])?;
+    }
+    Ok(deleted)
 }
 
 pub fn now_ms() -> i64 {
@@ -5180,20 +5953,18 @@ fn upsert_memory_client_link(
     let (Some(client_id), Some(local_memory_id)) = (client_id, local_memory_id) else {
         return Ok(());
     };
-    conn.execute(
-        "INSERT INTO gateway_memory_client_links
-             (project_ident, client_id, local_memory_id, gateway_memory_id, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?5)
-         ON CONFLICT(project_ident, client_id, local_memory_id) DO UPDATE SET
-             gateway_memory_id = excluded.gateway_memory_id,
-             updated_at = excluded.updated_at",
-        params![
-            project_ident,
-            client_id,
-            local_memory_id,
-            gateway_memory_id,
-            now
+    crud(conn).upsert(
+        "gateway_memory_client_links",
+        &[
+            crud_col("project_ident", project_ident),
+            crud_col("client_id", client_id),
+            crud_col("local_memory_id", local_memory_id),
+            crud_col("gateway_memory_id", gateway_memory_id),
+            crud_col("created_at", now),
+            crud_col("updated_at", now),
         ],
+        &["project_ident", "client_id", "local_memory_id"],
+        &["gateway_memory_id", "updated_at"],
     )?;
     Ok(())
 }
@@ -5286,29 +6057,29 @@ fn create_memory_record(
         .map(serde_json::to_string)
         .transpose()
         .context("serialize memory provenance")?;
-    conn.execute(
-        "INSERT INTO gateway_memories
-             (id, project_ident, server_revision, content, memory_type, tags,
-              content_hash, source_agent_id, source_hostname, source_client,
-              source_client_version, provenance_json, client_created_at,
-              client_updated_at, created_at, updated_at, tombstoned_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15, NULL)",
-        params![
-            id.as_str(),
-            project_ident,
-            revision,
-            write.content,
-            write.memory_type,
-            tags_json,
-            write.content_hash,
-            write.source.agent_id.as_deref(),
-            write.source.hostname.as_deref(),
-            write.client_id,
-            write.source.client_version.as_deref(),
-            provenance_json,
-            write.item.client_created_at,
-            write.item.client_updated_at,
-            write.now,
+    crud(conn).insert(
+        "gateway_memories",
+        &[
+            crud_col("id", id.as_str()),
+            crud_col("project_ident", project_ident),
+            crud_col("server_revision", revision),
+            crud_col("content", write.content),
+            crud_col("memory_type", write.memory_type),
+            crud_col("tags", tags_json),
+            crud_col("content_hash", write.content_hash),
+            crud_col("source_agent_id", write.source.agent_id.as_deref()),
+            crud_col("source_hostname", write.source.hostname.as_deref()),
+            crud_col("source_client", write.client_id),
+            crud_col(
+                "source_client_version",
+                write.source.client_version.as_deref(),
+            ),
+            crud_col("provenance_json", provenance_json),
+            crud_col("client_created_at", write.item.client_created_at),
+            crud_col("client_updated_at", write.item.client_updated_at),
+            crud_col("created_at", write.now),
+            crud_col("updated_at", write.now),
+            crud_col("tombstoned_at", DbValue::null()),
         ],
     )?;
     upsert_memory_client_link(
@@ -5338,39 +6109,33 @@ fn update_memory_record(
         .map(serde_json::to_string)
         .transpose()
         .context("serialize memory provenance")?;
-    conn.execute(
-        "UPDATE gateway_memories
-         SET server_revision = ?3,
-             content = ?4,
-             memory_type = ?5,
-             tags = ?6,
-             content_hash = ?7,
-             source_agent_id = ?8,
-             source_hostname = ?9,
-             source_client = ?10,
-             source_client_version = ?11,
-             provenance_json = ?12,
-             client_created_at = COALESCE(?13, client_created_at),
-             client_updated_at = ?14,
-             updated_at = ?15,
-             tombstoned_at = NULL
-         WHERE project_ident = ?1 AND id = ?2",
-        params![
-            project_ident,
-            record.id.as_str(),
-            revision,
-            write.content,
-            write.memory_type,
-            tags_json,
-            write.content_hash,
-            write.source.agent_id.as_deref(),
-            write.source.hostname.as_deref(),
-            write.client_id,
-            write.source.client_version.as_deref(),
-            provenance_json,
-            write.item.client_created_at,
-            write.item.client_updated_at,
-            write.now,
+    crud(conn).update(
+        "gateway_memories",
+        &[
+            crud_col("server_revision", revision),
+            crud_col("content", write.content),
+            crud_col("memory_type", write.memory_type),
+            crud_col("tags", tags_json),
+            crud_col("content_hash", write.content_hash),
+            crud_col("source_agent_id", write.source.agent_id.as_deref()),
+            crud_col("source_hostname", write.source.hostname.as_deref()),
+            crud_col("source_client", write.client_id),
+            crud_col(
+                "source_client_version",
+                write.source.client_version.as_deref(),
+            ),
+            crud_col("provenance_json", provenance_json),
+            crud_col(
+                "client_created_at",
+                write.item.client_created_at.or(record.client_created_at),
+            ),
+            crud_col("client_updated_at", write.item.client_updated_at),
+            crud_col("updated_at", write.now),
+            crud_col("tombstoned_at", DbValue::null()),
+        ],
+        &[
+            crud_eq("project_ident", project_ident),
+            crud_eq("id", record.id.as_str()),
         ],
     )?;
     upsert_memory_client_link(
@@ -5407,25 +6172,20 @@ fn tombstone_memory_record(
     }
     let revision = next_memory_revision(conn, project_ident)?;
     let source_client = client_id.map(str::to_string);
-    conn.execute(
-        "UPDATE gateway_memories
-         SET server_revision = ?3,
-             source_agent_id = ?4,
-             source_hostname = ?5,
-             source_client = ?6,
-             source_client_version = ?7,
-             updated_at = ?8,
-             tombstoned_at = ?8
-         WHERE project_ident = ?1 AND id = ?2",
-        params![
-            project_ident,
-            record.id.as_str(),
-            revision,
-            source.agent_id.as_deref(),
-            source.hostname.as_deref(),
-            source_client.as_deref(),
-            source.client_version.as_deref(),
-            now,
+    crud(conn).update(
+        "gateway_memories",
+        &[
+            crud_col("server_revision", revision),
+            crud_col("source_agent_id", source.agent_id.as_deref()),
+            crud_col("source_hostname", source.hostname.as_deref()),
+            crud_col("source_client", source_client.as_deref()),
+            crud_col("source_client_version", source.client_version.as_deref()),
+            crud_col("updated_at", now),
+            crud_col("tombstoned_at", now),
+        ],
+        &[
+            crud_eq("project_ident", project_ident),
+            crud_eq("id", record.id.as_str()),
         ],
     )?;
     upsert_memory_client_link(
@@ -6045,24 +6805,25 @@ pub struct SkillMeta {
 }
 
 pub fn upsert_skill(conn: &Connection, r: &SkillRecord) -> Result<()> {
-    conn.execute(
-        "INSERT INTO skills (name, kind, zip_data, content, size, checksum, uploaded_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-         ON CONFLICT(name) DO UPDATE SET
-             kind = excluded.kind,
-             zip_data = excluded.zip_data,
-             content = excluded.content,
-             size = excluded.size,
-             checksum = excluded.checksum,
-             uploaded_at = excluded.uploaded_at",
-        params![
-            r.name,
-            r.kind,
-            r.zip_data,
-            r.content,
-            r.size,
-            r.checksum,
-            r.uploaded_at
+    crud(conn).upsert(
+        "skills",
+        &[
+            crud_col("name", r.name.as_str()),
+            crud_col("kind", r.kind.as_str()),
+            crud_col("zip_data", r.zip_data.as_slice()),
+            crud_col("content", r.content.as_deref()),
+            crud_col("size", r.size),
+            crud_col("checksum", r.checksum.as_str()),
+            crud_col("uploaded_at", r.uploaded_at),
+        ],
+        &["name"],
+        &[
+            "kind",
+            "zip_data",
+            "content",
+            "size",
+            "checksum",
+            "uploaded_at",
         ],
     )?;
     Ok(())
@@ -6128,7 +6889,7 @@ pub fn list_skills(conn: &Connection, kind: Option<&str>) -> Result<Vec<SkillMet
 }
 
 pub fn delete_skill(conn: &Connection, name: &str) -> Result<bool> {
-    let n = conn.execute("DELETE FROM skills WHERE name = ?1", params![name])?;
+    let n = crud(conn).delete("skills", &[crud_eq("name", name)])?;
     Ok(n > 0)
 }
 
@@ -6411,22 +7172,21 @@ pub fn insert_pattern(
         .unwrap_or_else(|| slugify_pattern_title(title));
     let labels_json = serialize_string_array(labels);
 
-    conn.execute(
-        "INSERT INTO patterns (
-             id, title, slug, summary, body, labels, version, state, superseded_by, author, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
-        params![
-            id,
-            title,
-            slug,
-            summary,
-            body,
-            labels_json,
-            version,
-            state,
-            superseded_by,
-            author,
-            now,
+    crud(conn).insert(
+        "patterns",
+        &[
+            crud_col("id", id.as_str()),
+            crud_col("title", title),
+            crud_col("slug", slug.as_str()),
+            crud_col("summary", summary),
+            crud_col("body", body),
+            crud_col("labels", labels_json),
+            crud_col("version", version),
+            crud_col("state", state),
+            crud_col("superseded_by", superseded_by),
+            crud_col("author", author),
+            crud_col("created_at", now),
+            crud_col("updated_at", now),
         ],
     )?;
 
@@ -6559,58 +7319,30 @@ pub fn update_pattern(
     };
 
     let now = now_ms();
-    let mut sets: Vec<String> = Vec::new();
-    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    let push = |col: &str,
-                val: Box<dyn rusqlite::ToSql>,
-                sets: &mut Vec<String>,
-                binds: &mut Vec<Box<dyn rusqlite::ToSql>>| {
-        binds.push(val);
-        sets.push(format!("{col} = ?{}", binds.len()));
-    };
+    let mut assignments: Vec<CrudColumn<'_>> = Vec::new();
 
     if let Some(title) = upd.title {
-        push("title", Box::new(title.to_string()), &mut sets, &mut binds);
+        assignments.push(crud_col("title", title));
     }
     if let Some(slug) = upd.slug {
-        push("slug", Box::new(slug.to_string()), &mut sets, &mut binds);
+        assignments.push(crud_col("slug", slug));
     }
     if let Some(summary) = upd.summary {
-        push(
-            "summary",
-            Box::new(summary.map(str::to_string)),
-            &mut sets,
-            &mut binds,
-        );
+        assignments.push(crud_col("summary", summary));
     }
     if let Some(body) = upd.body {
-        push("body", Box::new(body.to_string()), &mut sets, &mut binds);
+        assignments.push(crud_col("body", body));
     }
     if let Some(labels) = upd.labels {
-        push(
-            "labels",
-            Box::new(serialize_string_array(labels)),
-            &mut sets,
-            &mut binds,
-        );
+        assignments.push(crud_col("labels", serialize_string_array(labels)));
     }
     if let Some(version) = upd.version {
         validate_pattern_version(version)?;
-        push(
-            "version",
-            Box::new(version.to_string()),
-            &mut sets,
-            &mut binds,
-        );
+        assignments.push(crud_col("version", version));
     }
     if let Some(state) = upd.state {
         validate_pattern_state(state.trim())?;
-        push(
-            "state",
-            Box::new(state.trim().to_string()),
-            &mut sets,
-            &mut binds,
-        );
+        assignments.push(crud_col("state", state.trim()));
     }
     let next_version = upd.version.unwrap_or(&current.version);
     let next_superseded_by = match upd.superseded_by {
@@ -6629,42 +7361,30 @@ pub fn update_pattern(
         anyhow::bail!("superseded_by can only be set when version is superseded");
     }
     if next_version != "superseded" && next_superseded_by.is_some() {
-        push(
-            "superseded_by",
-            Box::new(None::<String>),
-            &mut sets,
-            &mut binds,
-        );
+        assignments.push(crud_col("superseded_by", DbValue::null()));
     } else if let Some(superseded_by) = upd.superseded_by {
         let superseded_by = superseded_by
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
-        push(
-            "superseded_by",
-            Box::new(superseded_by),
-            &mut sets,
-            &mut binds,
-        );
+        assignments.push(crud_col("superseded_by", superseded_by));
     }
-    push("updated_at", Box::new(now), &mut sets, &mut binds);
+    assignments.push(crud_col("updated_at", now));
 
-    binds.push(Box::new(current.id.clone()));
-    let id_ph = binds.len();
-    let sql = format!(
-        "UPDATE patterns SET {} WHERE id = ?{id_ph}",
-        sets.join(", ")
-    );
-    let params_vec: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
-    conn.execute(&sql, params_vec.as_slice())?;
+    crud(conn).update(
+        "patterns",
+        &assignments,
+        &[crud_eq("id", current.id.as_str())],
+    )?;
     get_pattern(conn, &current.id)
 }
 
 pub fn delete_pattern(conn: &Connection, id_or_slug: &str) -> Result<bool> {
-    let n = conn.execute(
-        "DELETE FROM patterns WHERE id = ?1 OR slug = ?1",
-        params![id_or_slug],
-    )?;
+    let existing = match get_pattern(conn, id_or_slug)? {
+        Some(pattern) => pattern,
+        None => return Ok(false),
+    };
+    let n = crud(conn).delete("patterns", &[crud_eq("id", existing.id.as_str())])?;
     Ok(n > 0)
 }
 
@@ -7108,38 +7828,36 @@ fn ensure_api_doc_artifact_version(
         )
         .optional()?;
     if existing_artifact.is_none() {
-        conn.execute(
-            "INSERT INTO artifacts
-             (artifact_id, project_ident, kind, subkind, title, labels,
-              lifecycle_state, review_state, implementation_state,
-              current_version_id, accepted_version_id, created_by_actor_id,
-              created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 'none', 'not_applicable',
-                     NULL, NULL, ?7, ?8, ?8)",
-            params![
-                input.id,
-                input.project_ident,
-                API_DOC_ARTIFACT_KIND,
-                API_DOC_SUBKIND,
-                input.title,
-                labels_json,
-                actor_id,
-                input.created_at,
+        crud(conn).insert(
+            "artifacts",
+            &[
+                crud_col("artifact_id", input.id),
+                crud_col("project_ident", input.project_ident),
+                crud_col("kind", API_DOC_ARTIFACT_KIND),
+                crud_col("subkind", API_DOC_SUBKIND),
+                crud_col("title", input.title),
+                crud_col("labels", labels_json.as_deref()),
+                crud_col("lifecycle_state", "active"),
+                crud_col("review_state", "none"),
+                crud_col("implementation_state", "not_applicable"),
+                crud_col("current_version_id", DbValue::null()),
+                crud_col("accepted_version_id", DbValue::null()),
+                crud_col("created_by_actor_id", actor_id.as_str()),
+                crud_col("created_at", input.created_at),
+                crud_col("updated_at", input.created_at),
             ],
         )?;
     } else {
-        conn.execute(
-            "UPDATE artifacts
-             SET title = ?2, labels = ?3, subkind = ?4, lifecycle_state = 'active',
-                 updated_at = ?5
-             WHERE artifact_id = ?1",
-            params![
-                input.id,
-                input.title,
-                labels_json,
-                API_DOC_SUBKIND,
-                now_ms()
+        crud(conn).update(
+            "artifacts",
+            &[
+                crud_col("title", input.title),
+                crud_col("labels", labels_json.as_deref()),
+                crud_col("subkind", API_DOC_SUBKIND),
+                crud_col("lifecycle_state", "active"),
+                crud_col("updated_at", now_ms()),
             ],
+            &[crud_eq("artifact_id", input.id)],
         )?;
     }
 
@@ -7339,25 +8057,23 @@ pub fn insert_api_doc(
     let now = now_ms();
     let labels_json = serialize_string_array(doc.labels);
     let content_json = serde_json::to_string(doc.content)?;
-    conn.execute(
-        "INSERT INTO api_docs (
-             id, project_ident, app, title, summary, kind, source_format, source_ref,
-             version, labels, content_json, author, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
-        params![
-            id,
-            project_ident,
-            doc.app,
-            doc.title,
-            doc.summary,
-            doc.kind,
-            doc.source_format,
-            doc.source_ref,
-            doc.version,
-            labels_json,
-            content_json,
-            doc.author,
-            now,
+    crud(conn).insert(
+        "api_docs",
+        &[
+            crud_col("id", id.as_str()),
+            crud_col("project_ident", project_ident),
+            crud_col("app", doc.app),
+            crud_col("title", doc.title),
+            crud_col("summary", doc.summary),
+            crud_col("kind", doc.kind),
+            crud_col("source_format", doc.source_format),
+            crud_col("source_ref", doc.source_ref),
+            crud_col("version", doc.version),
+            crud_col("labels", labels_json),
+            crud_col("content_json", content_json),
+            crud_col("author", doc.author),
+            crud_col("created_at", now),
+            crud_col("updated_at", now),
         ],
     )?;
     ensure_api_doc_artifact_version(
@@ -7468,89 +8184,45 @@ pub fn update_api_doc(
     };
 
     let now = now_ms();
-    let mut sets: Vec<String> = Vec::new();
-    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    let push = |col: &str,
-                val: Box<dyn rusqlite::ToSql>,
-                sets: &mut Vec<String>,
-                binds: &mut Vec<Box<dyn rusqlite::ToSql>>| {
-        binds.push(val);
-        sets.push(format!("{col} = ?{}", binds.len()));
-    };
+    let mut assignments: Vec<CrudColumn<'_>> = Vec::new();
 
     if let Some(app) = upd.app {
-        push("app", Box::new(app.to_string()), &mut sets, &mut binds);
+        assignments.push(crud_col("app", app));
     }
     if let Some(title) = upd.title {
-        push("title", Box::new(title.to_string()), &mut sets, &mut binds);
+        assignments.push(crud_col("title", title));
     }
     if let Some(summary) = upd.summary {
-        push(
-            "summary",
-            Box::new(summary.map(str::to_string)),
-            &mut sets,
-            &mut binds,
-        );
+        assignments.push(crud_col("summary", summary));
     }
     if let Some(kind) = upd.kind {
-        push("kind", Box::new(kind.to_string()), &mut sets, &mut binds);
+        assignments.push(crud_col("kind", kind));
     }
     if let Some(source_format) = upd.source_format {
-        push(
-            "source_format",
-            Box::new(source_format.to_string()),
-            &mut sets,
-            &mut binds,
-        );
+        assignments.push(crud_col("source_format", source_format));
     }
     if let Some(source_ref) = upd.source_ref {
-        push(
-            "source_ref",
-            Box::new(source_ref.map(str::to_string)),
-            &mut sets,
-            &mut binds,
-        );
+        assignments.push(crud_col("source_ref", source_ref));
     }
     if let Some(version) = upd.version {
-        push(
-            "version",
-            Box::new(version.map(str::to_string)),
-            &mut sets,
-            &mut binds,
-        );
+        assignments.push(crud_col("version", version));
     }
     if let Some(labels) = upd.labels {
-        push(
-            "labels",
-            Box::new(serialize_string_array(labels)),
-            &mut sets,
-            &mut binds,
-        );
+        assignments.push(crud_col("labels", serialize_string_array(labels)));
     }
     if let Some(content) = upd.content {
-        push(
-            "content_json",
-            Box::new(serde_json::to_string(content)?),
-            &mut sets,
-            &mut binds,
-        );
+        assignments.push(crud_col("content_json", serde_json::to_string(content)?));
     }
 
-    if sets.is_empty() {
+    if assignments.is_empty() {
         return get_api_doc(conn, project_ident, id);
     }
-    push("updated_at", Box::new(now), &mut sets, &mut binds);
-    binds.push(Box::new(project_ident.to_string()));
-    let project_ph = binds.len();
-    binds.push(Box::new(id.to_string()));
-    let id_ph = binds.len();
-
-    let sql = format!(
-        "UPDATE api_docs SET {} WHERE project_ident = ?{project_ph} AND id = ?{id_ph}",
-        sets.join(", ")
-    );
-    let params_vec: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
-    conn.execute(&sql, params_vec.as_slice())?;
+    assignments.push(crud_col("updated_at", now));
+    crud(conn).update(
+        "api_docs",
+        &assignments,
+        &[crud_eq("project_ident", project_ident), crud_eq("id", id)],
+    )?;
     let updated = get_api_doc(conn, project_ident, id)?
         .ok_or_else(|| anyhow::anyhow!("updated api doc not found"))?;
     ensure_api_doc_artifact_version(
@@ -7575,15 +8247,21 @@ pub fn update_api_doc(
 }
 
 pub fn delete_api_doc(conn: &Connection, project_ident: &str, id: &str) -> Result<bool> {
-    let n = conn.execute(
-        "DELETE FROM api_docs WHERE project_ident = ?1 AND id = ?2",
-        params![project_ident, id],
+    let n = crud(conn).delete(
+        "api_docs",
+        &[crud_eq("project_ident", project_ident), crud_eq("id", id)],
     )?;
     if n > 0 {
-        conn.execute(
-            "UPDATE artifacts SET lifecycle_state = 'archived', updated_at = ?3
-             WHERE project_ident = ?1 AND artifact_id = ?2",
-            params![project_ident, id, now_ms()],
+        crud(conn).update(
+            "artifacts",
+            &[
+                crud_col("lifecycle_state", "archived"),
+                crud_col("updated_at", now_ms()),
+            ],
+            &[
+                crud_eq("project_ident", project_ident),
+                crud_eq("artifact_id", id),
+            ],
         )?;
     }
     Ok(n > 0)
@@ -7804,14 +8482,21 @@ pub fn insert_pattern_comment(
     let id = new_uuid();
     let now = now_ms();
     let tx = conn.unchecked_transaction()?;
-    tx.execute(
-        "INSERT INTO pattern_comments (id, pattern_id, author, author_type, content, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![id, pattern.id, author, author_type, content, now],
+    crud(&tx).insert(
+        "pattern_comments",
+        &[
+            crud_col("id", id.as_str()),
+            crud_col("pattern_id", pattern.id.as_str()),
+            crud_col("author", author),
+            crud_col("author_type", author_type),
+            crud_col("content", content),
+            crud_col("created_at", now),
+        ],
     )?;
-    tx.execute(
-        "UPDATE patterns SET updated_at = ?1 WHERE id = ?2",
-        params![now, pattern.id],
+    crud(&tx).update(
+        "patterns",
+        &[crud_col("updated_at", now)],
+        &[crud_eq("id", pattern.id.as_str())],
     )?;
     tx.commit()?;
 
@@ -7887,19 +8572,27 @@ pub fn reclaim_stale_tasks(conn: &Connection, project_ident: &str) -> Result<usi
                         verify prior progress before continuing.";
 
     for task_id in &stale_ids {
-        tx.execute(
-            "INSERT INTO task_comments (id, task_id, author, author_type, content, created_at)
-             VALUES (?1, ?2, 'system', 'system', ?3, ?4)",
-            params![new_uuid(), task_id, comment_body, now],
+        let comment_id = new_uuid();
+        crud(&tx).insert(
+            "task_comments",
+            &[
+                crud_col("id", comment_id.as_str()),
+                crud_col("task_id", task_id.as_str()),
+                crud_col("author", "system"),
+                crud_col("author_type", "system"),
+                crud_col("content", comment_body),
+                crud_col("created_at", now),
+            ],
         )?;
-        tx.execute(
-            "UPDATE tasks
-             SET status = 'todo',
-                 owner_agent_id = NULL,
-                 started_at = NULL,
-                 updated_at = ?1
-             WHERE id = ?2",
-            params![now, task_id],
+        crud(&tx).update(
+            "tasks",
+            &[
+                crud_col("status", "todo"),
+                crud_col("owner_agent_id", DbValue::null()),
+                crud_col("started_at", DbValue::null()),
+                crud_col("updated_at", now),
+            ],
+            &[crud_eq("id", task_id.as_str())],
         )?;
     }
 
@@ -7931,24 +8624,27 @@ pub fn insert_task(
         |r| r.get(0),
     )?;
 
-    conn.execute(
-        "INSERT INTO tasks (
-             id, project_ident, title, description, details, status, rank,
-             labels, hostname, owner_agent_id, reporter,
-             created_at, updated_at, started_at, done_at, kind,
-             delegated_to_project_ident, delegated_to_task_id
-         ) VALUES (?1, ?2, ?3, ?4, ?5, 'todo', ?6, ?7, ?8, NULL, ?9, ?10, ?10, NULL, NULL, 'normal', NULL, NULL)",
-        params![
-            id,
-            project_ident,
-            title,
-            description,
-            details,
-            rank,
-            labels_json,
-            hostname,
-            reporter,
-            now,
+    crud(conn).insert(
+        "tasks",
+        &[
+            crud_col("id", id.as_str()),
+            crud_col("project_ident", project_ident),
+            crud_col("title", title),
+            crud_col("description", description),
+            crud_col("details", details),
+            crud_col("status", "todo"),
+            crud_col("rank", rank),
+            crud_col("labels", labels_json),
+            crud_col("hostname", hostname),
+            crud_col("owner_agent_id", DbValue::null()),
+            crud_col("reporter", reporter),
+            crud_col("created_at", now),
+            crud_col("updated_at", now),
+            crud_col("started_at", DbValue::null()),
+            crud_col("done_at", DbValue::null()),
+            crud_col("kind", "normal"),
+            crud_col("delegated_to_project_ident", DbValue::null()),
+            crud_col("delegated_to_task_id", DbValue::null()),
         ],
     )?;
 
@@ -7985,17 +8681,16 @@ pub fn insert_delegated_task(conn: &Connection, task: &DelegatedTaskInsert<'_>) 
         task.hostname,
         task.reporter,
     )?;
-    conn.execute(
-        "UPDATE tasks
-         SET kind = 'delegated',
-             delegated_to_project_ident = ?1,
-             delegated_to_task_id = ?2
-         WHERE id = ?3 AND project_ident = ?4",
-        params![
-            task.target_project_ident,
-            task.target_task_id,
-            inserted.id,
-            task.project_ident
+    crud(conn).update(
+        "tasks",
+        &[
+            crud_col("kind", "delegated"),
+            crud_col("delegated_to_project_ident", task.target_project_ident),
+            crud_col("delegated_to_task_id", task.target_task_id),
+        ],
+        &[
+            crud_eq("id", inserted.id.as_str()),
+            crud_eq("project_ident", task.project_ident),
         ],
     )?;
     inserted.kind = "delegated".to_string();
@@ -8256,96 +8951,55 @@ pub fn update_task(
     }
 
     // Build dynamic UPDATE.
-    let mut sets: Vec<String> = Vec::new();
-    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-
-    let push = |col: &str,
-                val: Box<dyn rusqlite::ToSql>,
-                sets: &mut Vec<String>,
-                binds: &mut Vec<Box<dyn rusqlite::ToSql>>| {
-        binds.push(val);
-        sets.push(format!("{col} = ?{}", binds.len()));
-    };
+    let mut assignments: Vec<CrudColumn<'_>> = Vec::new();
 
     if let Some(title) = upd.title {
-        push("title", Box::new(title.to_string()), &mut sets, &mut binds);
+        assignments.push(crud_col("title", title));
     }
     if let Some(desc) = upd.description {
-        push(
-            "description",
-            Box::new(desc.map(str::to_string)),
-            &mut sets,
-            &mut binds,
-        );
+        assignments.push(crud_col("description", desc));
     }
     if let Some(det) = upd.details {
-        push(
-            "details",
-            Box::new(det.map(str::to_string)),
-            &mut sets,
-            &mut binds,
-        );
+        assignments.push(crud_col("details", det));
     }
     if let Some(labels) = upd.labels {
-        push(
-            "labels",
-            Box::new(serialize_string_array(labels)),
-            &mut sets,
-            &mut binds,
-        );
+        assignments.push(crud_col("labels", serialize_string_array(labels)));
     }
     if let Some(host) = upd.hostname {
-        push(
-            "hostname",
-            Box::new(host.map(str::to_string)),
-            &mut sets,
-            &mut binds,
-        );
+        assignments.push(crud_col("hostname", host));
     }
     if upd.status.is_some() {
-        push(
-            "status",
-            Box::new(new_status.clone()),
-            &mut sets,
-            &mut binds,
-        );
+        assignments.push(crud_col("status", new_status.clone()));
     }
     if let Some(rank) = upd.rank {
-        push("rank", Box::new(rank), &mut sets, &mut binds);
+        assignments.push(crud_col("rank", rank));
     }
     if let Some(owner_val) = owner {
-        push("owner_agent_id", Box::new(owner_val), &mut sets, &mut binds);
+        assignments.push(crud_col("owner_agent_id", owner_val));
     }
     if let Some(started) = started_at {
-        push("started_at", Box::new(started), &mut sets, &mut binds);
+        assignments.push(crud_col("started_at", started));
     }
     if let Some(done) = done_at {
-        push("done_at", Box::new(done), &mut sets, &mut binds);
+        assignments.push(crud_col("done_at", done));
     }
 
     // Always bump updated_at.
-    push("updated_at", Box::new(now), &mut sets, &mut binds);
+    assignments.push(crud_col("updated_at", now));
 
-    if sets.is_empty() {
+    if assignments.is_empty() {
         // Nothing to update — just return the current row.
         return Ok(Some(current));
     }
 
-    // WHERE bindings come last.
-    binds.push(Box::new(task_id.to_string()));
-    let id_ph = binds.len();
-    binds.push(Box::new(project_ident.to_string()));
-    let proj_ph = binds.len();
-
-    let sql = format!(
-        "UPDATE tasks SET {} WHERE id = ?{} AND project_ident = ?{}",
-        sets.join(", "),
-        id_ph,
-        proj_ph,
-    );
-
-    let params_vec: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
-    let n = conn.execute(&sql, params_vec.as_slice())?;
+    let n = crud(conn).update(
+        "tasks",
+        &assignments,
+        &[
+            crud_eq("id", task_id),
+            crud_eq("project_ident", project_ident),
+        ],
+    )?;
     if n == 0 {
         return Ok(None);
     }
@@ -8375,14 +9029,21 @@ pub fn insert_comment(
     let now = now_ms();
 
     let tx = conn.unchecked_transaction()?;
-    tx.execute(
-        "INSERT INTO task_comments (id, task_id, author, author_type, content, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![id, task_id, author, author_type, content, now],
+    crud(&tx).insert(
+        "task_comments",
+        &[
+            crud_col("id", id.as_str()),
+            crud_col("task_id", task_id),
+            crud_col("author", author),
+            crud_col("author_type", author_type),
+            crud_col("content", content),
+            crud_col("created_at", now),
+        ],
     )?;
-    tx.execute(
-        "UPDATE tasks SET updated_at = ?1 WHERE id = ?2",
-        params![now, task_id],
+    crud(&tx).update(
+        "tasks",
+        &[crud_col("updated_at", now)],
+        &[crud_eq("id", task_id)],
     )?;
     tx.commit()?;
 
@@ -8422,21 +9083,19 @@ pub fn insert_task_delegation(
 ) -> Result<TaskDelegation> {
     let id = new_uuid();
     let now = now_ms();
-    conn.execute(
-        "INSERT INTO task_delegations (
-            id, source_project_ident, source_task_id, target_project_ident,
-            target_task_id, requester_agent_id, requester_hostname, created_at,
-            completed_at, completion_message_id
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL)",
-        params![
-            id,
-            source_project_ident,
-            source_task_id,
-            target_project_ident,
-            target_task_id,
-            requester_agent_id,
-            requester_hostname,
-            now,
+    crud(conn).insert(
+        "task_delegations",
+        &[
+            crud_col("id", id.as_str()),
+            crud_col("source_project_ident", source_project_ident),
+            crud_col("source_task_id", source_task_id),
+            crud_col("target_project_ident", target_project_ident),
+            crud_col("target_task_id", target_task_id),
+            crud_col("requester_agent_id", requester_agent_id),
+            crud_col("requester_hostname", requester_hostname),
+            crud_col("created_at", now),
+            crud_col("completed_at", DbValue::null()),
+            crud_col("completion_message_id", DbValue::null()),
         ],
     )?;
     Ok(TaskDelegation {
@@ -8496,12 +9155,26 @@ pub fn mark_delegation_complete(
     delegation_id: &str,
     completion_message_id: i64,
 ) -> Result<()> {
-    conn.execute(
-        "UPDATE task_delegations
-         SET completed_at = COALESCE(completed_at, ?1),
-             completion_message_id = COALESCE(completion_message_id, ?2)
-         WHERE id = ?3",
-        params![now_ms(), completion_message_id, delegation_id],
+    let current: Option<(Option<i64>, Option<i64>)> = conn
+        .query_row(
+            "SELECT completed_at, completion_message_id FROM task_delegations WHERE id = ?1",
+            params![delegation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((completed_at, existing_message_id)) = current else {
+        return Ok(());
+    };
+    crud(conn).update(
+        "task_delegations",
+        &[
+            crud_col("completed_at", completed_at.or_else(|| Some(now_ms()))),
+            crud_col(
+                "completion_message_id",
+                existing_message_id.or(Some(completion_message_id)),
+            ),
+        ],
+        &[crud_eq("id", delegation_id)],
     )?;
     Ok(())
 }
@@ -8509,9 +9182,12 @@ pub fn mark_delegation_complete(
 /// Delete a task (and its comments via ON DELETE CASCADE) scoped to a project.
 /// Returns true if a row was removed.
 pub fn delete_task(conn: &Connection, project_ident: &str, task_id: &str) -> Result<bool> {
-    let n = conn.execute(
-        "DELETE FROM tasks WHERE id = ?1 AND project_ident = ?2",
-        params![task_id, project_ident],
+    let n = crud(conn).delete(
+        "tasks",
+        &[
+            crud_eq("id", task_id),
+            crud_eq("project_ident", project_ident),
+        ],
     )?;
     Ok(n > 0)
 }
@@ -8623,24 +9299,19 @@ pub fn reorder_tasks_in_column(
             }
         }
 
-        tx.execute(
-            "UPDATE tasks
-             SET status = ?1,
-                 rank = ?2,
-                 started_at = ?3,
-                 done_at = ?4,
-                 owner_agent_id = ?5,
-                 updated_at = ?6
-             WHERE id = ?7 AND project_ident = ?8",
-            params![
-                target_status,
-                idx as i64,
-                new_started_at,
-                new_done_at,
-                new_owner,
-                now,
-                task_id,
-                project_ident,
+        crud(&tx).update(
+            "tasks",
+            &[
+                crud_col("status", target_status),
+                crud_col("rank", idx as i64),
+                crud_col("started_at", new_started_at),
+                crud_col("done_at", new_done_at),
+                crud_col("owner_agent_id", new_owner),
+                crud_col("updated_at", now),
+            ],
+            &[
+                crud_eq("id", task_id.as_str()),
+                crud_eq("project_ident", project_ident),
             ],
         )?;
     }
@@ -8653,11 +9324,163 @@ pub fn reorder_tasks_in_column(
 mod tests {
     use super::*;
 
+    fn env_lookup<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl FnMut(&str) -> Option<String> + 'a {
+        move |key| {
+            pairs
+                .iter()
+                .find(|(candidate, _)| *candidate == key)
+                .map(|(_, value)| value.to_string())
+        }
+    }
+
     fn test_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         apply_schema(&conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn database_config_defaults_to_sqlite_path() {
+        let config = DatabaseConfig::from_env_with(env_lookup(&[])).unwrap();
+
+        assert_eq!(config.backend(), DatabaseBackend::Sqlite);
+        assert_eq!(config.sqlite_path(), Some(DEFAULT_SQLITE_DATABASE_PATH));
+        assert_eq!(config.migration_target().dialect, "sqlite");
+    }
+
+    #[test]
+    fn database_config_keeps_legacy_database_path() {
+        let config =
+            DatabaseConfig::from_env_with(env_lookup(&[("DATABASE_PATH", "/tmp/gateway.db")]))
+                .unwrap();
+
+        assert_eq!(config.backend(), DatabaseBackend::Sqlite);
+        assert_eq!(config.sqlite_path(), Some("/tmp/gateway.db"));
+        assert_eq!(config.url(), None);
+    }
+
+    #[test]
+    fn database_config_accepts_sqlite_database_urls() {
+        let file_config = DatabaseConfig::from_env_with(env_lookup(&[(
+            "DATABASE_URL",
+            "sqlite:///tmp/gateway.db",
+        )]))
+        .unwrap();
+        let memory_config =
+            DatabaseConfig::from_env_with(env_lookup(&[("DATABASE_URL", "sqlite::memory:")]))
+                .unwrap();
+
+        assert_eq!(file_config.sqlite_path(), Some("/tmp/gateway.db"));
+        assert_eq!(memory_config.sqlite_path(), Some(":memory:"));
+    }
+
+    #[test]
+    fn database_config_infers_backend_from_database_url() {
+        let pg = DatabaseConfig::from_env_with(env_lookup(&[(
+            "DATABASE_URL",
+            "postgres://gateway:secret@localhost/gateway",
+        )]))
+        .unwrap();
+        let maria = DatabaseConfig::from_env_with(env_lookup(&[(
+            "DATABASE_URL",
+            "mysql://gateway:secret@localhost/gateway",
+        )]))
+        .unwrap();
+
+        assert_eq!(pg.backend(), DatabaseBackend::Postgres);
+        assert_eq!(pg.migration_target().default_port, Some(5432));
+        assert_eq!(maria.backend(), DatabaseBackend::MariaDb);
+        assert_eq!(maria.migration_target().default_port, Some(3306));
+    }
+
+    #[test]
+    fn database_config_display_location_redacts_remote_credentials() {
+        let pg = DatabaseConfig::from_env_with(env_lookup(&[(
+            "DATABASE_URL",
+            "postgres://gateway:secret@localhost/gateway",
+        )]))
+        .unwrap();
+
+        assert_eq!(
+            pg.display_location(),
+            "postgres://<credentials-redacted>@localhost/gateway"
+        );
+    }
+
+    #[test]
+    fn database_config_rejects_mismatched_backend_and_url() {
+        let err = DatabaseConfig::from_env_with(env_lookup(&[
+            ("DATABASE_BACKEND", "postgres"),
+            ("DATABASE_URL", "mysql://gateway:secret@localhost/gateway"),
+        ]))
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("does not match DATABASE_URL target"));
+    }
+
+    #[test]
+    fn database_adapter_frame_opens_sqlite_and_defers_remote_backends() {
+        let sqlite = open_config(&DatabaseConfig::sqlite(":memory:")).unwrap();
+        assert_eq!(sqlite.backend(), DatabaseBackend::Sqlite);
+
+        let pg = DatabaseConfig::from_env_with(env_lookup(&[
+            ("DATABASE_BACKEND", "postgres"),
+            (
+                "DATABASE_URL",
+                "postgres://gateway:secret@localhost/gateway",
+            ),
+        ]))
+        .unwrap();
+        let err = open_config(&pg).unwrap_err();
+        assert!(format!("{err:#}").contains("adapter is not implemented yet"));
+    }
+
+    #[test]
+    fn database_crud_primitives_cover_insert_upsert_update_delete() {
+        let conn = test_conn();
+
+        crud(&conn)
+            .insert(
+                "settings",
+                &[crud_col("key", "crud-smoke"), crud_col("value", "first")],
+            )
+            .unwrap();
+        assert_eq!(
+            get_setting(&conn, "crud-smoke").unwrap().as_deref(),
+            Some("first")
+        );
+
+        crud(&conn)
+            .upsert(
+                "settings",
+                &[crud_col("key", "crud-smoke"), crud_col("value", "second")],
+                &["key"],
+                &["value"],
+            )
+            .unwrap();
+        assert_eq!(
+            get_setting(&conn, "crud-smoke").unwrap().as_deref(),
+            Some("second")
+        );
+
+        crud(&conn)
+            .update(
+                "settings",
+                &[crud_col("value", "third")],
+                &[crud_eq("key", "crud-smoke")],
+            )
+            .unwrap();
+        assert_eq!(
+            get_setting(&conn, "crud-smoke").unwrap().as_deref(),
+            Some("third")
+        );
+
+        let deleted = crud(&conn)
+            .delete("settings", &[crud_eq("key", "crud-smoke")])
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(get_setting(&conn, "crud-smoke").unwrap(), None);
     }
 
     fn test_project(ident: &str) -> Project {

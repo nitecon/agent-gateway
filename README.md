@@ -112,7 +112,10 @@ DISCORD_CATEGORY_ID=                  # optional -- leave blank for top-level ch
 GATEWAY_API_KEY=choose-a-long-random-secret
 GATEWAY_HOST=0.0.0.0
 GATEWAY_PORT=7913
+DATABASE_BACKEND=sqlite
 DATABASE_PATH=/opt/agentic/gateway/agent-gateway.db
+# DATABASE_URL=postgres://gateway:secret@localhost/gateway
+# DATABASE_URL=mysql://gateway:secret@localhost/gateway
 MESSAGE_RETENTION_DAYS=30
 RUST_LOG=info
 ```
