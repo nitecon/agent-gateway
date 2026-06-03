@@ -43,8 +43,16 @@ GATEWAY_API_KEY=your-secret-key-here
 GATEWAY_HOST=0.0.0.0
 GATEWAY_PORT=7913
 
+# Database backend. SQLite is the implemented backend today; postgres/mariadb
+# are reserved targets for the adapter and migration work.
+DATABASE_BACKEND=sqlite
+
 # SQLite database path
 DATABASE_PATH=/opt/agentic/gateway/agent-gateway.db
+
+# Future postgres/mariadb adapters will use DATABASE_URL.
+# DATABASE_URL=postgres://gateway:secret@localhost/gateway
+# DATABASE_URL=mysql://gateway:secret@localhost/gateway
 
 # Delete messages older than N days that are behind the read cursor
 MESSAGE_RETENTION_DAYS=30

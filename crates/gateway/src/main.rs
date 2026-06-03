@@ -223,8 +223,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "7913".into())
         .parse()
         .context("GATEWAY_PORT must be a u16")?;
-    let db_path = std::env::var("DATABASE_PATH")
-        .unwrap_or_else(|_| "/opt/agentic/gateway/agent-gateway.db".into());
+    let db_config = db::DatabaseConfig::from_env().context("load database config")?;
     let retention_days: u64 = std::env::var("MESSAGE_RETENTION_DAYS")
         .unwrap_or_else(|_| "30".into())
         .parse()
@@ -235,11 +234,22 @@ async fn main() -> Result<()> {
     let artifact_auth_enforced = env_flag("GATEWAY_ARTIFACT_AUTH_ENFORCED", false)?;
 
     // ── Database ──────────────────────────────────────────────────────────────
-    if let Some(parent) = std::path::Path::new(&db_path).parent() {
-        std::fs::create_dir_all(parent).context("create db directory")?;
+    if let Some(path) = db_config.sqlite_path() {
+        if path != ":memory:" {
+            if let Some(parent) = std::path::Path::new(path)
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent).context("create db directory")?;
+            }
+        }
     }
-    let db = db::open(&db_path)?;
-    info!("SQLite database opened at {db_path}");
+    let db = db::open_config(&db_config)?;
+    info!(
+        "Database opened with backend={} location={}",
+        db.backend(),
+        db_config.display_location()
+    );
 
     // ── Plugin registry ───────────────────────────────────────────────────────
     #[allow(unused_mut)]
