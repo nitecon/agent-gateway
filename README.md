@@ -109,6 +109,13 @@ cp crates/gateway/.env.example crates/gateway/.env
 DISCORD_BOT_TOKEN=your-bot-token-here      # optional; omit to disable Discord
 DISCORD_GUILD_ID=123456789012345678       # optional; required only with DISCORD_BOT_TOKEN
 DISCORD_CATEGORY_ID=                  # optional -- leave blank for top-level channels
+WHATSAPP_ACCESS_TOKEN=                # optional; omit to disable WhatsApp
+WHATSAPP_PHONE_NUMBER_ID=             # required with WHATSAPP_ACCESS_TOKEN
+WHATSAPP_WEBHOOK_VERIFY_TOKEN=        # required for /webhooks/whatsapp verification
+WHATSAPP_APP_SECRET=                  # optional; validates X-Hub-Signature-256
+WHATSAPP_GRAPH_API_VERSION=v25.0
+WHATSAPP_PROJECT_ROOMS=agent-gateway=15551234567
+WHATSAPP_DEFAULT_RECIPIENT=
 GATEWAY_API_KEY=choose-a-long-random-secret
 GATEWAY_HOST=0.0.0.0
 GATEWAY_PORT=7913
@@ -123,6 +130,8 @@ RUST_LOG=info
 > `GATEWAY_API_KEY` is the shared secret between the gateway and all clients. Use a long random string (e.g. `openssl rand -hex 32`).
 
 When `DISCORD_BOT_TOKEN` and `DISCORD_GUILD_ID` are not both set, the Discord plugin is skipped at startup. Existing pages and non-channel APIs still run; attempts to send through a project whose channel plugin is unavailable return `503 Service Unavailable`.
+
+When WhatsApp is enabled, configure Meta webhooks to call `https://<gateway-host>/webhooks/whatsapp`. `WHATSAPP_PROJECT_ROOMS` maps gateway project idents to WhatsApp recipient `wa_id` values so inbound webhook senders and outbound project messages resolve to the same room.
 
 ---
 

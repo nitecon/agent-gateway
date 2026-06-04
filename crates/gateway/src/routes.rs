@@ -10059,6 +10059,8 @@ mod tests {
         AppState {
             db,
             plugins: std::sync::Arc::new(std::collections::HashMap::new()),
+            #[cfg(feature = "whatsapp")]
+            whatsapp: None,
             default_channel: "discord".to_string(),
             api_key: "test-key".to_string(),
             artifact_operations,

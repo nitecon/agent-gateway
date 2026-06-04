@@ -5451,6 +5451,23 @@ pub fn insert_message(conn: &Connection, m: &Message) -> Result<i64> {
     Ok(msg_id)
 }
 
+pub fn message_external_id_exists(
+    conn: &Connection,
+    project_ident: &str,
+    external_message_id: &str,
+) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM messages
+            WHERE project_ident = ?1
+              AND external_message_id = ?2
+        )",
+        params![project_ident, external_message_id],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
 /// Lazily register an agent for a project.
 pub fn upsert_agent(conn: &Connection, project_ident: &str, agent_id: &str) -> Result<()> {
     crud(conn).insert_do_nothing(
