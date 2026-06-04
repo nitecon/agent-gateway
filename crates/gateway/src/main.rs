@@ -46,6 +46,8 @@ enum Command {
 pub struct AppState {
     pub db: Db,
     pub plugins: Arc<HashMap<String, Arc<dyn ChannelPlugin>>>,
+    #[cfg(feature = "whatsapp")]
+    pub whatsapp: Option<Arc<channels::whatsapp::WhatsAppPlugin>>,
     pub default_channel: String,
     pub api_key: String,
     pub artifact_operations: db::ArtifactOperationsEnvelope,
@@ -96,6 +98,14 @@ fn spawn_inbound_processor(db: Db, mut rx: mpsc::Receiver<PluginEvent>) {
                         return Ok::<_, anyhow::Error>(());
                     }
                 };
+                if db::message_external_id_exists(&conn, &project.ident, &message.id)? {
+                    tracing::debug!(
+                        "Skipping duplicate inbound message {} for project {}",
+                        message.id,
+                        project.ident
+                    );
+                    return Ok::<_, anyhow::Error>(());
+                }
 
                 let m = db::Message {
                     id: 0,
@@ -254,6 +264,8 @@ async fn main() -> Result<()> {
     // ── Plugin registry ───────────────────────────────────────────────────────
     #[allow(unused_mut)]
     let mut plugins: HashMap<String, Arc<dyn ChannelPlugin>> = HashMap::new();
+    #[cfg(feature = "whatsapp")]
+    let mut whatsapp_plugin: Option<Arc<channels::whatsapp::WhatsAppPlugin>> = None;
 
     #[cfg(feature = "discord")]
     {
@@ -289,6 +301,24 @@ async fn main() -> Result<()> {
                 warn!(
                     "Discord plugin disabled: DISCORD_BOT_TOKEN and DISCORD_GUILD_ID are not both set"
                 );
+            }
+        }
+    }
+
+    #[cfg(feature = "whatsapp")]
+    {
+        match channels::whatsapp::WhatsAppConfig::from_env() {
+            Ok(Some(config)) => {
+                let whatsapp = Arc::new(channels::whatsapp::WhatsAppPlugin::new(config));
+                plugins.insert("whatsapp".into(), whatsapp.clone());
+                whatsapp_plugin = Some(whatsapp);
+                info!("Registered channel plugin: whatsapp");
+            }
+            Ok(None) => {
+                warn!("WhatsApp plugin disabled: WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_NUMBER_ID, and WHATSAPP_WEBHOOK_VERIFY_TOKEN are not set");
+            }
+            Err(err) => {
+                anyhow::bail!("load WhatsApp channel config: {err:#}");
             }
         }
     }
@@ -357,6 +387,8 @@ async fn main() -> Result<()> {
     let state = AppState {
         db,
         plugins: Arc::new(plugins),
+        #[cfg(feature = "whatsapp")]
+        whatsapp: whatsapp_plugin,
         default_channel,
         api_key,
         artifact_operations,
@@ -637,9 +669,15 @@ async fn main() -> Result<()> {
         .route("/agents/new", get(routes::new_agent_page))
         .route("/agents/{name}", get(routes::agent_detail_page))
         .route("/settings", get(routes::settings_page))
-        .route("/theme", get(routes::get_theme).post(routes::set_theme))
-        .merge(api)
-        .with_state(state);
+        .route("/theme", get(routes::get_theme).post(routes::set_theme));
+
+    #[cfg(feature = "whatsapp")]
+    let app = app.route(
+        "/webhooks/whatsapp",
+        get(channels::whatsapp::verify_webhook).post(channels::whatsapp::receive_webhook),
+    );
+
+    let app = app.merge(api).with_state(state);
 
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()

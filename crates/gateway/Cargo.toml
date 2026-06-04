@@ -8,8 +8,9 @@ name = "gateway"
 path = "src/main.rs"
 
 [features]
-default = ["discord"]
+default = ["discord", "whatsapp"]
 discord = ["dep:serenity"]
+whatsapp = []
 # future: slack = ["dep:slack-morphism"]
 # future: email = ["dep:lettre", "dep:async-imap"]
 
@@ -25,6 +26,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.10"
 hex = "0.4"
+hmac = "0.12"
 tower = "0.5"
 async-trait = "0.1"
 anyhow = "1"
