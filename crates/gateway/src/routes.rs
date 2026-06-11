@@ -4248,7 +4248,9 @@ pub async fn list_memories_handler(
     let db = state.db.clone();
     let (project_exists, response) = spawn_blocking(move || {
         let conn = db.lock().unwrap();
-        if db::get_project(&conn, &ident)?.is_none() {
+        // The reserved global-memory route is always addressable, even before
+        // any global memory exists (it returns an empty response, not a 404).
+        if !db::is_global_memory_ident(&ident) && db::get_project(&conn, &ident)?.is_none() {
             return Ok::<_, anyhow::Error>((false, None));
         }
         let filters = db::MemoryFilters {
@@ -4284,7 +4286,9 @@ pub async fn pull_memories_handler(
     let db = state.db.clone();
     let (project_exists, response) = spawn_blocking(move || {
         let conn = db.lock().unwrap();
-        if db::get_project(&conn, &ident)?.is_none() {
+        // `__global__` is always pullable; an empty global store yields an empty
+        // response (server_revision 0) rather than a 404.
+        if !db::is_global_memory_ident(&ident) && db::get_project(&conn, &ident)?.is_none() {
             return Ok::<_, anyhow::Error>((false, None));
         }
         Ok((
@@ -4330,7 +4334,10 @@ pub async fn push_memories_handler(
     let db = state.db.clone();
     let (project_exists, response) = spawn_blocking(move || {
         let conn = db.lock().unwrap();
-        if db::get_project(&conn, &ident)?.is_none() {
+        // Global pushes skip the existence check: `push_project_memories`
+        // materializes the reserved `__global__` project row on demand so the
+        // memory foreign key holds.
+        if !db::is_global_memory_ident(&ident) && db::get_project(&conn, &ident)?.is_none() {
             return Ok::<_, anyhow::Error>((false, None));
         }
         Ok((
@@ -4353,6 +4360,23 @@ pub async fn push_memories_handler(
     Ok(Json(
         response.expect("memory push response exists for project"),
     ))
+}
+
+/// `GET /v1/memories/projects` — discovery endpoint for `memory pull --all`.
+///
+/// Returns every project ident the gateway holds durable memories for (the
+/// gateway is the source of truth, so this includes projects that do not exist
+/// on the caller's machine), plus `__global__` when global memories exist.
+pub async fn discover_memory_projects_handler(
+    State(state): State<AppState>,
+) -> Result<Json<db::MemoryProjectsResponse>> {
+    let db = state.db.clone();
+    let response = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::discover_memory_projects(&conn)
+    })
+    .await??;
+    Ok(Json(response))
 }
 
 // ── Agent API docs ───────────────────────────────────────────────────────────

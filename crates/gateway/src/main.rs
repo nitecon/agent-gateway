@@ -501,6 +501,10 @@ async fn main() -> Result<()> {
             post(routes::push_memories_handler),
         )
         .route(
+            "/v1/memories/projects",
+            get(routes::discover_memory_projects_handler),
+        )
+        .route(
             "/v1/projects/{ident}/artifacts",
             get(routes::list_artifacts_handler).post(routes::create_artifact_handler),
         )

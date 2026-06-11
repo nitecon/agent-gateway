@@ -44,8 +44,8 @@ content:
       guidance: For design-review, spec, and documentation workflows, retrieve the artifact/version/manifest-item context by stable gateway IDs before searching source files. Scratch files remain compatibility state during migration, not the canonical handoff surface.
     - name: Migrate client and skill handoff to artifacts
       guidance: "`/design-review`, `/spec`, and `/implement` should pass project_ident, artifact_id, artifact_version_id, workflow_run_id, contribution_id, manifest_item_id, and generated task_id values between agents. Source-adjacent scratch files and task Specification text remain dual-read fallbacks until `docs/artifact-client-skill-migration.md` release gates pass."
-    - name: Keep memory sync project-scoped
-      guidance: Memory gateway APIs only accept durable project memories. Do not push global/user-preference memories or WorkingContext state through `/v1/projects/:ident/memories`; those remain local memory CLI responsibility.
+    - name: Route durable memories by scope, never WorkingContext
+      guidance: "Durable memories sync by scope. Project-scoped memories use `/v1/projects/:ident/memories` with that project's ident. Global (cross-project, user-preference) memories use the reserved ident `__global__` on the same routes; only memory_type global/preference/user_preference and scope=global are accepted there. The two are mutually exclusive per route: a project route rejects global types and scope=global, and `__global__` rejects project types and scope=project. WorkingContext (memory_type working_context) is never synced through the gateway on any route — it stays local memory CLI responsibility. Discover every memory-bearing project (including `__global__`) for `memory pull --all` via GET /v1/memories/projects."
   relationships:
     - app: agent-tools
       relationship: Primary CLI client for agents. It wraps gateway comms, tasks, patterns, API docs, and setup flows.
@@ -78,12 +78,16 @@ content:
         - Validate locally with agent-tools docs validate --file PATH.
         - Publish with agent-tools docs publish --file PATH or POST /v1/projects/:ident/api-docs.
         - Retrieve RAG chunks with GET /v1/projects/:ident/api-docs/chunks.
-    - name: Sync project memories
+    - name: Sync durable memories across all scopes
       steps:
-        - Push local project-scoped durable memories with POST /v1/projects/:ident/memories/push or POST /v1/projects/:ident/memories.
-        - Include local_memory_id or client_id for idempotent linking, content, memory_type, tags, content_hash when known, timestamps, optional gateway_memory_id, optional base_gateway_revision, and provenance metadata.
+        - Push project-scoped durable memories with POST /v1/projects/:ident/memories/push (or POST /v1/projects/:ident/memories) using the real project ident.
+        - Push global (cross-project, user-preference) durable memories with the same routes but the reserved ident __global__, scope=global, and memory_type global/preference/user_preference. The gateway materializes the reserved __global__ store on first push; it is excluded from human-facing project listings.
+        - Never push WorkingContext (memory_type working_context) on any route — it is rejected everywhere.
+        - Include local_memory_id or client_id for idempotent linking, content, memory_type, tags, content_hash when known, timestamps, optional gateway_memory_id, optional base_gateway_revision, and a provenance blob.
+        - Carry provenance fields (source_agent_id, source_machine_id, source_os, source_arch, source_system, pushed_at) inside the provenance JSON blob; the gateway round-trips them unchanged on pull and never folds them into normal memory tags. source_agent_id is also persisted as a queryable column.
         - Treat push responses per item: created, updated, linked, tombstoned, conflict, or rejected.
-        - Pull remote changes with POST /v1/projects/:ident/memories/pull using since_revision and known gateway_memory_id/server_revision pairs.
+        - Pull remote changes with POST /v1/projects/:ident/memories/pull (or /v1/projects/__global__/memories/pull for global) using since_revision and known gateway_memory_id/server_revision pairs. An empty store returns server_revision 0 and no rows, not a 404.
+        - For full multi-project sync (memory pull --all), first call GET /v1/memories/projects to discover every memory-bearing project ident the gateway holds (the gateway is source of truth, so this includes projects absent on the local machine) plus __global__ when global memories exist, then pull each.
         - Use GET /v1/projects/:ident/memories with q, type, tag, since_revision, limit, and include_tombstones filters for dashboard/search retrieval.
         - Resolve conflicts client-side when base_gateway_revision has moved; the gateway returns remote revision, hash, and updated_at metadata.
     - name: Work with artifact-backed specs
@@ -227,8 +231,15 @@ content:
       path: /v1/projects/:ident/api-docs/:id
       intent: Delete one API context document.
     - method: GET
+      path: /v1/memories/projects
+      intent: Discover every project ident the gateway holds durable memories for, for memory pull --all.
+      response: "{ projects[] } where each entry has project_ident, memory_count (live, non-tombstoned), and server_revision (max)."
+      notes:
+        - Computed directly from gateway_memories grouped by project_ident, independent of the projects table, so it includes projects that do not exist on the caller's machine (the gateway is source of truth).
+        - Includes the reserved __global__ ident only when global memories exist; a project appears whenever it has any memory rows.
+    - method: GET
       path: /v1/projects/:ident/memories
-      intent: Search project-scoped durable memories for dashboard and client retrieval.
+      intent: Search durable memories for dashboard and client retrieval. Use the reserved ident __global__ for global memories.
       query:
         q: Search memory id, content, type, tags, content hash, source metadata, and provenance.
         type: Exact memory_type filter, such as project, reference, feedback, or user.
@@ -237,6 +248,8 @@ content:
         limit: Maximum records to return, clamped to the gateway batch limit.
         include_tombstones: Include tombstoned memory records when true.
       response: "{ project_ident, server_revision, memories[] }"
+      notes:
+        - ident __global__ lists global durable memories and is always addressable, returning an empty result before any global memory exists rather than a 404.
     - method: POST
       path: /v1/projects/:ident/memories
       intent: Compatibility alias for memory push.
@@ -244,7 +257,7 @@ content:
         - Same request and response shape as POST /v1/projects/:ident/memories/push.
     - method: POST
       path: /v1/projects/:ident/memories/push
-      intent: Push an array of local project memories and receive canonical gateway ids and revisions.
+      intent: Push an array of durable memories and receive canonical gateway ids and revisions. Use the reserved ident __global__ for global memories.
       headers:
         X-Agent-Id: Optional source agent identity.
         X-Agent-Hostname: Optional source hostname.
@@ -254,19 +267,24 @@ content:
         memories: Array of memory structs. Each item may include local_memory_id, client_id, gateway_memory_id, base_gateway_revision, project_ident, scope, content, memory_type, tags, content_hash, client_created_at, client_updated_at, provenance, tombstone, or deleted.
       response: "{ project_ident, server_revision, results[] } where each result has action, gateway_memory_id, server_revision, content_hash, optional conflict, and optional error."
       notes:
-        - Only project-scoped durable memories are accepted. scope=global, user preferences, and WorkingContext-style memory types are rejected.
+        - "Scope is enforced per route. Project routes accept only project-scoped durable memories and reject scope=global and global/preference/user_preference types. The reserved __global__ route accepts only scope=global and global/preference/user_preference types and rejects scope=project and project types."
+        - WorkingContext-style memories (memory_type working_context) are rejected on every route, including __global__.
+        - The first push to __global__ materializes the reserved project row on demand so the memory foreign key holds; it is never seeded at init and stays out of human-facing project listings.
+        - "Provenance fields (source_agent_id, source_machine_id, source_os, source_arch, source_system, pushed_at) ride inside the provenance JSON blob and round-trip unchanged on pull. They are never mapped into normal memory tags. source_agent_id is additionally stored as a queryable column."
         - Exact content_hash duplicates link to the existing active memory instead of creating a new row.
         - Updates use compare-and-swap semantics when base_gateway_revision is supplied; stale bases return action=conflict.
         - Tombstones preserve content metadata and advance server_revision for pull clients.
     - method: POST
       path: /v1/projects/:ident/memories/pull
-      intent: Pull newer remote project memory changes and tombstones since a known revision.
+      intent: Pull newer remote durable memory changes and tombstones since a known revision. Use the reserved ident __global__ for global memories.
       request:
         since_revision: Optional last seen server_revision. Defaults to 0.
         known: Optional array of gateway_memory_id, server_revision, and content_hash values for conflict detection.
         page_size: Optional batch size, clamped to the gateway batch limit.
         include_tombstones: Include deletion/tombstone rows in the response. Defaults to true.
       response: "{ project_ident, server_revision, since_revision, next_since_revision, has_more, memories[], tombstones[], conflicts[] }"
+      notes:
+        - ident __global__ pulls global durable memories and is always addressable, returning server_revision 0 with no rows before any global memory exists rather than a 404.
     - method: GET
       path: /v1/projects/:ident/artifacts
       intent: List durable artifacts by kind, lifecycle state, label, actor, or search query.
