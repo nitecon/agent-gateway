@@ -5310,10 +5310,13 @@ pub fn insert_project(conn: &Connection, p: &Project) -> Result<()> {
 }
 
 pub fn all_projects(conn: &Connection) -> Result<Vec<Project>> {
+    // Exclude the reserved global-memory project: it is not a real project and
+    // must not surface in room registration or any human-facing enumeration.
     let mut stmt = conn.prepare_cached(
         "SELECT ident, channel_name, room_id, last_msg_id, created_at,
                 repo_provider, repo_namespace, repo_name, repo_full_name
-         FROM projects",
+         FROM projects
+         WHERE ident != '__global__'",
     )?;
     let collected = stmt
         .query_map([], row_to_project)?
@@ -5601,6 +5604,26 @@ pub fn now_ms() -> i64 {
 pub const MEMORY_BATCH_LIMIT: usize = 500;
 const DEFAULT_MEMORY_PAGE_SIZE: usize = 100;
 
+/// Reserved project ident under which durable *global* (cross-project,
+/// user-preference) memories are stored on the gateway.
+///
+/// This is not a real project: it is excluded from every human-facing project
+/// enumeration (dashboard, task picker, comms) but is a first-class citizen of
+/// the memory-sync surface so `memory pull --all` can discover and exchange
+/// global memories. The reserved `projects` row is created on demand (the first
+/// global push) purely to satisfy the `gateway_memories.project_ident` foreign
+/// key — never seeded unconditionally.
+pub const GLOBAL_MEMORY_IDENT: &str = "__global__";
+
+/// Returns `true` when `ident` is the reserved global-memory route ident.
+///
+/// Memory handlers use this to skip the normal project-existence `404` check,
+/// and project enumerations use it to filter the reserved row out of
+/// human-facing listings.
+pub fn is_global_memory_ident(ident: &str) -> bool {
+    ident == GLOBAL_MEMORY_IDENT
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MemoryRecord {
     #[serde(rename = "gateway_memory_id")]
@@ -5794,28 +5817,56 @@ fn memory_content_hash(content: &str) -> String {
     hex::encode(digest)
 }
 
-fn normalize_memory_type(value: &str) -> std::result::Result<String, String> {
+/// Normalize and validate a memory type for a given route.
+///
+/// On the reserved global route (`is_global == true`) the cross-project types
+/// `global | preference | user_preference` are accepted; on normal project
+/// routes they are rejected. `working_context` is rejected on *every* route —
+/// WorkingContext never travels through the gateway.
+fn normalize_memory_type(
+    value: &str,
+    is_global: bool,
+) -> std::result::Result<String, String> {
     let value = value.trim();
     if value.is_empty() {
         return Err("memory_type is required".to_string());
     }
     let lower = value.to_ascii_lowercase();
-    if matches!(
-        lower.as_str(),
-        "global" | "preference" | "user_preference" | "working_context"
-    ) {
+    if lower == "working_context" {
+        return Err("working_context memories are never synced to the gateway".to_string());
+    }
+    let is_global_type = matches!(lower.as_str(), "global" | "preference" | "user_preference");
+    if is_global_type && !is_global {
         return Err("only project-scoped durable memories may be pushed".to_string());
+    }
+    if !is_global_type && is_global {
+        return Err("only global-scoped durable memories may be pushed under __global__".to_string());
     }
     Ok(lower)
 }
 
+/// Validate the declared `scope`/`project_ident` of a push item against the
+/// route it arrived on.
+///
+/// On the reserved global route only `scope == "global"` is accepted; on normal
+/// project routes only `scope == "project"` is accepted. When present, the
+/// item's `project_ident` must equal the route ident (so `__global__` matches
+/// `__global__`).
 fn validate_memory_scope(
     item: &MemoryPushItem,
     project_ident: &str,
+    is_global: bool,
 ) -> std::result::Result<(), String> {
     if let Some(scope) = clean_optional(&item.scope) {
         let scope = scope.to_ascii_lowercase();
-        if scope != "project" {
+        if is_global {
+            if scope != "global" {
+                return Err(
+                    "only global-scoped durable memories may be pushed under __global__"
+                        .to_string(),
+                );
+            }
+        } else if scope != "project" {
             return Err("only project-scoped durable memories may be pushed".to_string());
         }
     }
@@ -5863,6 +5914,54 @@ pub fn memory_project_revision(conn: &Connection, project_ident: &str) -> Result
         |r| r.get(0),
     )?;
     Ok(current)
+}
+
+/// One discovered memory-bearing project for the `memory pull --all` flow.
+///
+/// `memory_count` is the live (non-tombstoned) count, consistent with
+/// [`list_project_stats`]; `server_revision` is `MAX(server_revision)`,
+/// consistent with [`memory_project_revision`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryProjectDiscovery {
+    pub project_ident: String,
+    pub memory_count: i64,
+    pub server_revision: i64,
+}
+
+/// Response for `GET /v1/memories/projects` — every project ident the gateway
+/// holds durable memories for (the gateway is the source of truth, so this is
+/// independent of which projects exist on the caller's machine), including
+/// `__global__` when global memories exist.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryProjectsResponse {
+    pub projects: Vec<MemoryProjectDiscovery>,
+}
+
+/// Discover all projects that have any durable memory rows on the gateway.
+///
+/// Queries `gateway_memories` directly grouped by `project_ident` so it is
+/// independent of the `projects` table. A project appears whenever it has any
+/// row (live or tombstoned); `memory_count` reports only live rows. `__global__`
+/// is included on equal footing, but only when it actually has rows.
+pub fn discover_memory_projects(conn: &Connection) -> Result<MemoryProjectsResponse> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT project_ident,
+                COUNT(*) FILTER (WHERE tombstoned_at IS NULL),
+                MAX(server_revision)
+         FROM gateway_memories
+         GROUP BY project_ident
+         ORDER BY project_ident ASC",
+    )?;
+    let projects = stmt
+        .query_map([], |r| {
+            Ok(MemoryProjectDiscovery {
+                project_ident: r.get(0)?,
+                memory_count: r.get(1)?,
+                server_revision: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(MemoryProjectsResponse { projects })
 }
 
 fn row_to_memory_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRecord> {
@@ -6222,13 +6321,14 @@ fn push_one_memory(
     project_ident: &str,
     source: &MemoryPushSource,
     item: &MemoryPushItem,
+    is_global: bool,
 ) -> Result<MemoryPushResult> {
     let local_memory_id = clean_optional(&item.local_memory_id);
     let gateway_memory_id = clean_optional(&item.gateway_memory_id);
     let client_id = clean_optional(&item.client_id).or_else(|| clean_optional(&source.client_id));
     let tombstone = item.tombstone || item.deleted;
 
-    if let Err(error) = validate_memory_scope(item, project_ident) {
+    if let Err(error) = validate_memory_scope(item, project_ident, is_global) {
         return Ok(rejected_memory_result(
             error,
             client_id,
@@ -6358,7 +6458,7 @@ fn push_one_memory(
         let memory_type = match item
             .memory_type
             .as_deref()
-            .map(normalize_memory_type)
+            .map(|value| normalize_memory_type(value, is_global))
             .transpose()
         {
             Ok(value) => value.unwrap_or_else(|| record.memory_type.clone()),
@@ -6444,7 +6544,7 @@ fn push_one_memory(
             gateway_memory_id,
         ));
     };
-    let memory_type = match normalize_memory_type(memory_type) {
+    let memory_type = match normalize_memory_type(memory_type, is_global) {
         Ok(value) => value,
         Err(error) => {
             return Ok(rejected_memory_result(
@@ -6483,15 +6583,43 @@ pub fn push_project_memories(
     source: &MemoryPushSource,
     memories: &[MemoryPushItem],
 ) -> Result<MemoryPushResponse> {
+    let is_global = is_global_memory_ident(project_ident);
+    if is_global {
+        // Materialize the reserved project row on demand so the
+        // `gateway_memories.project_ident` foreign key holds. Idempotent — never
+        // seeded at DB init, so global rows only ever exist once a global memory
+        // has actually been pushed.
+        ensure_global_memory_project(conn)?;
+    }
     let mut results = Vec::with_capacity(memories.len());
     for item in memories {
-        results.push(push_one_memory(conn, project_ident, source, item)?);
+        results.push(push_one_memory(conn, project_ident, source, item, is_global)?);
     }
     Ok(MemoryPushResponse {
         project_ident: project_ident.to_string(),
         server_revision: memory_project_revision(conn, project_ident)?,
         results,
     })
+}
+
+/// Idempotently create the reserved `__global__` project row backing global
+/// durable memories. Uses sentinel channel/room values and `INSERT … DO
+/// NOTHING`, so concurrent first-pushes converge on a single row.
+fn ensure_global_memory_project(conn: &Connection) -> Result<()> {
+    insert_project(
+        conn,
+        &Project {
+            ident: GLOBAL_MEMORY_IDENT.to_string(),
+            channel_name: GLOBAL_MEMORY_IDENT.to_string(),
+            room_id: GLOBAL_MEMORY_IDENT.to_string(),
+            last_msg_id: None,
+            created_at: now_ms(),
+            repo_provider: None,
+            repo_namespace: None,
+            repo_name: None,
+            repo_full_name: None,
+        },
+    )
 }
 
 fn normalized_memory_limit(limit: Option<usize>) -> usize {
@@ -6712,6 +6840,7 @@ pub fn list_project_stats(conn: &Connection) -> Result<Vec<ProjectStats>> {
                 p.repo_provider, p.repo_namespace, p.repo_name, p.repo_full_name
          FROM projects p
          LEFT JOIN messages m ON m.project_ident = p.ident
+         WHERE p.ident != '__global__'
          GROUP BY p.ident
          ORDER BY p.created_at DESC",
     )?;
@@ -6743,6 +6872,7 @@ pub fn list_project_task_stats(conn: &Connection) -> Result<Vec<ProjectTaskStats
                 COALESCE(SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END), 0)
          FROM projects p
          LEFT JOIN tasks t ON t.project_ident = p.ident
+         WHERE p.ident != '__global__'
          GROUP BY p.ident
          ORDER BY
             COALESCE(SUM(CASE WHEN t.status = 'todo' THEN 1 ELSE 0 END), 0) DESC,
@@ -6764,7 +6894,11 @@ pub fn list_project_task_stats(conn: &Connection) -> Result<Vec<ProjectTaskStats
 }
 
 pub fn get_dashboard_data(conn: &Connection) -> Result<DashboardData> {
-    let project_count: i64 = conn.query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))?;
+    let project_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM projects WHERE ident != '__global__'",
+        [],
+        |r| r.get(0),
+    )?;
     let total_messages: i64 = conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?;
     let agent_messages: i64 = conn.query_row(
         "SELECT COUNT(*) FROM messages WHERE source='agent'",
@@ -10138,6 +10272,266 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rejected.results[0].action, "rejected");
+    }
+
+    #[test]
+    fn memory_global_scope_push_pull_round_trip_under_global_ident() {
+        let conn = test_conn();
+        // The reserved __global__ project must NOT exist until the first global
+        // push materializes it on demand.
+        assert!(get_project(&conn, GLOBAL_MEMORY_IDENT).unwrap().is_none());
+
+        let source = MemoryPushSource {
+            agent_id: Some("agent-g".to_string()),
+            hostname: Some("host-g".to_string()),
+            client_id: Some("client-g".to_string()),
+            client_version: Some("2.0.0".to_string()),
+        };
+
+        let created = push_project_memories(
+            &conn,
+            GLOBAL_MEMORY_IDENT,
+            &source,
+            &[MemoryPushItem {
+                local_memory_id: Some("g-local-1".to_string()),
+                scope: Some("global".to_string()),
+                content: Some("user prefers tabs over spaces".to_string()),
+                memory_type: Some("preference".to_string()),
+                tags: Some(vec!["style".to_string()]),
+                ..MemoryPushItem::default()
+            }],
+        )
+        .unwrap();
+        assert_eq!(created.results[0].action, "created");
+        assert_eq!(created.server_revision, 1);
+        // The reserved project row now exists to back the FK.
+        assert!(get_project(&conn, GLOBAL_MEMORY_IDENT).unwrap().is_some());
+
+        let memory_id = created.results[0].gateway_memory_id.clone().unwrap();
+        let pulled =
+            pull_project_memories(&conn, GLOBAL_MEMORY_IDENT, Some(0), &[], false, Some(100))
+                .unwrap();
+        assert_eq!(pulled.project_ident, GLOBAL_MEMORY_IDENT);
+        assert_eq!(pulled.memories.len(), 1);
+        assert_eq!(pulled.memories[0].id, memory_id);
+        assert_eq!(pulled.memories[0].memory_type, "preference");
+
+        // __global__ must stay out of human-facing project listings.
+        assert!(list_project_stats(&conn).unwrap().is_empty());
+        assert!(list_project_task_stats(&conn).unwrap().is_empty());
+        assert!(all_projects(&conn).unwrap().is_empty());
+        let dashboard = get_dashboard_data(&conn).unwrap();
+        assert_eq!(dashboard.project_count, 0);
+        // The global memory still counts toward the durable-memory rollup.
+        assert_eq!(dashboard.memory_count, 1);
+    }
+
+    #[test]
+    fn memory_global_route_rejects_project_and_working_context_types() {
+        let conn = test_conn();
+        let source = MemoryPushSource::default();
+
+        // `working_context` is rejected on the global route.
+        let wc = push_project_memories(
+            &conn,
+            GLOBAL_MEMORY_IDENT,
+            &source,
+            &[MemoryPushItem {
+                scope: Some("global".to_string()),
+                content: Some("ephemeral handoff state".to_string()),
+                memory_type: Some("working_context".to_string()),
+                ..MemoryPushItem::default()
+            }],
+        )
+        .unwrap();
+        assert_eq!(wc.results[0].action, "rejected");
+
+        // A project-scoped type is rejected under __global__.
+        let proj = push_project_memories(
+            &conn,
+            GLOBAL_MEMORY_IDENT,
+            &source,
+            &[MemoryPushItem {
+                scope: Some("project".to_string()),
+                content: Some("belongs to a project".to_string()),
+                memory_type: Some("project".to_string()),
+                ..MemoryPushItem::default()
+            }],
+        )
+        .unwrap();
+        assert_eq!(proj.results[0].action, "rejected");
+    }
+
+    #[test]
+    fn memory_normal_route_rejects_global_and_working_context_types() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("proj")).unwrap();
+        let source = MemoryPushSource::default();
+
+        for memory_type in ["global", "preference", "user_preference", "working_context"] {
+            let rejected = push_project_memories(
+                &conn,
+                "proj",
+                &source,
+                &[MemoryPushItem {
+                    content: Some(format!("body for {memory_type}")),
+                    memory_type: Some(memory_type.to_string()),
+                    ..MemoryPushItem::default()
+                }],
+            )
+            .unwrap();
+            assert_eq!(
+                rejected.results[0].action, "rejected",
+                "{memory_type} must be rejected on a normal project route"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_global_pull_on_empty_store_returns_empty_not_error() {
+        let conn = test_conn();
+        // No global push has happened; the reserved row does not exist.
+        let pulled =
+            pull_project_memories(&conn, GLOBAL_MEMORY_IDENT, None, &[], false, Some(100)).unwrap();
+        assert_eq!(pulled.server_revision, 0);
+        assert!(pulled.memories.is_empty());
+        assert_eq!(memory_project_revision(&conn, GLOBAL_MEMORY_IDENT).unwrap(), 0);
+    }
+
+    #[test]
+    fn discover_memory_projects_lists_projects_and_global_when_populated() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("alpha")).unwrap();
+        insert_project(&conn, &test_project("beta")).unwrap();
+        let source = MemoryPushSource::default();
+
+        // Before any global push, __global__ must not appear.
+        push_project_memories(
+            &conn,
+            "alpha",
+            &source,
+            &[
+                MemoryPushItem {
+                    local_memory_id: Some("a1".to_string()),
+                    content: Some("alpha one".to_string()),
+                    memory_type: Some("project".to_string()),
+                    ..MemoryPushItem::default()
+                },
+                MemoryPushItem {
+                    local_memory_id: Some("a2".to_string()),
+                    content: Some("alpha two".to_string()),
+                    memory_type: Some("project".to_string()),
+                    ..MemoryPushItem::default()
+                },
+            ],
+        )
+        .unwrap();
+
+        let before = discover_memory_projects(&conn).unwrap();
+        assert_eq!(before.projects.len(), 1);
+        assert_eq!(before.projects[0].project_ident, "alpha");
+        assert_eq!(before.projects[0].memory_count, 2);
+        assert_eq!(before.projects[0].server_revision, 2);
+        assert!(!before
+            .projects
+            .iter()
+            .any(|p| p.project_ident == GLOBAL_MEMORY_IDENT));
+
+        // After a global push, __global__ surfaces alongside real projects.
+        push_project_memories(
+            &conn,
+            GLOBAL_MEMORY_IDENT,
+            &source,
+            &[MemoryPushItem {
+                local_memory_id: Some("g1".to_string()),
+                scope: Some("global".to_string()),
+                content: Some("global pref".to_string()),
+                memory_type: Some("global".to_string()),
+                ..MemoryPushItem::default()
+            }],
+        )
+        .unwrap();
+
+        let after = discover_memory_projects(&conn).unwrap();
+        let idents: Vec<&str> = after
+            .projects
+            .iter()
+            .map(|p| p.project_ident.as_str())
+            .collect();
+        assert!(idents.contains(&"alpha"));
+        assert!(idents.contains(&GLOBAL_MEMORY_IDENT));
+        // "beta" had no memories, so it must NOT be discovered.
+        assert!(!idents.contains(&"beta"));
+        let global = after
+            .projects
+            .iter()
+            .find(|p| p.project_ident == GLOBAL_MEMORY_IDENT)
+            .unwrap();
+        assert_eq!(global.memory_count, 1);
+        assert_eq!(global.server_revision, 1);
+    }
+
+    #[test]
+    fn memory_provenance_round_trips_without_contaminating_tags() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("proj")).unwrap();
+        let source = MemoryPushSource {
+            agent_id: Some("agent-prov".to_string()),
+            hostname: Some("host-prov".to_string()),
+            client_id: Some("client-prov".to_string()),
+            client_version: Some("3.1.0".to_string()),
+        };
+
+        // Provenance fields that travel inside the JSON blob, not as columns.
+        let provenance = serde_json::json!({
+            "source_agent_id": "agent-prov",
+            "source_machine_id": "machine-xyz",
+            "source_os": "linux",
+            "source_arch": "x86_64",
+            "source_system": "memory-cli",
+            "pushed_at": 1_700_000_000_000_i64,
+        });
+
+        let created = push_project_memories(
+            &conn,
+            "proj",
+            &source,
+            &[MemoryPushItem {
+                local_memory_id: Some("p1".to_string()),
+                content: Some("memory with provenance".to_string()),
+                memory_type: Some("project".to_string()),
+                tags: Some(vec!["real-tag".to_string()]),
+                provenance: Some(provenance.clone()),
+                ..MemoryPushItem::default()
+            }],
+        )
+        .unwrap();
+        assert_eq!(created.results[0].action, "created");
+
+        let pulled =
+            pull_project_memories(&conn, "proj", Some(0), &[], false, Some(100)).unwrap();
+        assert_eq!(pulled.memories.len(), 1);
+        let record = &pulled.memories[0];
+
+        // Provenance blob round-trips byte-for-byte.
+        assert_eq!(record.provenance, provenance);
+        assert_eq!(record.source_agent_id.as_deref(), Some("agent-prov"));
+
+        // Tags stay clean: only the real user tag, no provenance leakage.
+        assert_eq!(record.tags, vec!["real-tag".to_string()]);
+        for forbidden in [
+            "source_machine_id",
+            "source_os",
+            "source_arch",
+            "source_system",
+            "pushed_at",
+            "machine-xyz",
+        ] {
+            assert!(
+                !record.tags.iter().any(|t| t.contains(forbidden)),
+                "tag list leaked provenance field '{forbidden}'"
+            );
+        }
     }
 
     #[test]
