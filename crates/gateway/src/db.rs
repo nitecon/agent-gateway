@@ -5823,10 +5823,7 @@ fn memory_content_hash(content: &str) -> String {
 /// `global | preference | user_preference` are accepted; on normal project
 /// routes they are rejected. `working_context` is rejected on *every* route —
 /// WorkingContext never travels through the gateway.
-fn normalize_memory_type(
-    value: &str,
-    is_global: bool,
-) -> std::result::Result<String, String> {
+fn normalize_memory_type(value: &str, is_global: bool) -> std::result::Result<String, String> {
     let value = value.trim();
     if value.is_empty() {
         return Err("memory_type is required".to_string());
@@ -5840,7 +5837,9 @@ fn normalize_memory_type(
         return Err("only project-scoped durable memories may be pushed".to_string());
     }
     if !is_global_type && is_global {
-        return Err("only global-scoped durable memories may be pushed under __global__".to_string());
+        return Err(
+            "only global-scoped durable memories may be pushed under __global__".to_string(),
+        );
     }
     Ok(lower)
 }
@@ -6593,7 +6592,13 @@ pub fn push_project_memories(
     }
     let mut results = Vec::with_capacity(memories.len());
     for item in memories {
-        results.push(push_one_memory(conn, project_ident, source, item, is_global)?);
+        results.push(push_one_memory(
+            conn,
+            project_ident,
+            source,
+            item,
+            is_global,
+        )?);
     }
     Ok(MemoryPushResponse {
         project_ident: project_ident.to_string(),
@@ -10395,7 +10400,10 @@ mod tests {
             pull_project_memories(&conn, GLOBAL_MEMORY_IDENT, None, &[], false, Some(100)).unwrap();
         assert_eq!(pulled.server_revision, 0);
         assert!(pulled.memories.is_empty());
-        assert_eq!(memory_project_revision(&conn, GLOBAL_MEMORY_IDENT).unwrap(), 0);
+        assert_eq!(
+            memory_project_revision(&conn, GLOBAL_MEMORY_IDENT).unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -10508,8 +10516,7 @@ mod tests {
         .unwrap();
         assert_eq!(created.results[0].action, "created");
 
-        let pulled =
-            pull_project_memories(&conn, "proj", Some(0), &[], false, Some(100)).unwrap();
+        let pulled = pull_project_memories(&conn, "proj", Some(0), &[], false, Some(100)).unwrap();
         assert_eq!(pulled.memories.len(), 1);
         let record = &pulled.memories[0];
 
