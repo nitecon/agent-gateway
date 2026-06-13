@@ -9401,7 +9401,7 @@ pub async fn tasks_board(
 /// CDN base for the ndesign runtime and theme stylesheets. Shared by
 /// `control_panel_head` / `control_panel_close` and every page that uses
 /// them. Kept as a constant so the version is bumped in one place.
-const NDESIGN_BASE: &str = "https://storage.googleapis.com/ndesign-cdn/ndesign/latest";
+const NDESIGN_BASE: &str = "https://storage.googleapis.com/ndesign-cdn/ndesign/v0.4.0";
 
 fn theme_toggle_button() -> &'static str {
     r#"<button class="nd-btn-secondary" data-nd-theme-toggle title="Toggle theme">Theme</button>"#
