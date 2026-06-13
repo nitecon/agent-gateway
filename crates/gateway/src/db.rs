@@ -6607,6 +6607,29 @@ pub fn push_project_memories(
     })
 }
 
+pub fn reject_missing_project_memories(
+    project_ident: &str,
+    source: &MemoryPushSource,
+    memories: &[MemoryPushItem],
+) -> MemoryPushResponse {
+    let error = format!("project '{project_ident}' not found on gateway");
+    let results = memories
+        .iter()
+        .map(|item| {
+            let local_memory_id = clean_optional(&item.local_memory_id);
+            let gateway_memory_id = clean_optional(&item.gateway_memory_id);
+            let client_id =
+                clean_optional(&item.client_id).or_else(|| clean_optional(&source.client_id));
+            rejected_memory_result(error.clone(), client_id, local_memory_id, gateway_memory_id)
+        })
+        .collect();
+    MemoryPushResponse {
+        project_ident: project_ident.to_string(),
+        server_revision: 0,
+        results,
+    }
+}
+
 /// Idempotently create the reserved `__global__` project row backing global
 /// durable memories. Uses sentinel channel/room values and `INSERT … DO
 /// NOTHING`, so concurrent first-pushes converge on a single row.
@@ -10390,6 +10413,57 @@ mod tests {
                 "{memory_type} must be rejected on a normal project route"
             );
         }
+    }
+
+    #[test]
+    fn memory_missing_project_push_response_rejects_items_with_ident() {
+        let source = MemoryPushSource {
+            client_id: Some("source-client".to_string()),
+            ..MemoryPushSource::default()
+        };
+        let response = reject_missing_project_memories(
+            "missing-proj",
+            &source,
+            &[
+                MemoryPushItem {
+                    local_memory_id: Some("local-1".to_string()),
+                    content: Some("project memory".to_string()),
+                    memory_type: Some("project".to_string()),
+                    ..MemoryPushItem::default()
+                },
+                MemoryPushItem {
+                    client_id: Some("item-client".to_string()),
+                    gateway_memory_id: Some("gateway-1".to_string()),
+                    tombstone: true,
+                    ..MemoryPushItem::default()
+                },
+            ],
+        );
+
+        assert_eq!(response.project_ident, "missing-proj");
+        assert_eq!(response.server_revision, 0);
+        assert_eq!(response.results.len(), 2);
+        assert_eq!(response.results[0].action, "rejected");
+        assert_eq!(
+            response.results[0].error.as_deref(),
+            Some("project 'missing-proj' not found on gateway")
+        );
+        assert_eq!(
+            response.results[0].local_memory_id.as_deref(),
+            Some("local-1")
+        );
+        assert_eq!(
+            response.results[0].client_id.as_deref(),
+            Some("source-client")
+        );
+        assert_eq!(
+            response.results[1].client_id.as_deref(),
+            Some("item-client")
+        );
+        assert_eq!(
+            response.results[1].gateway_memory_id.as_deref(),
+            Some("gateway-1")
+        );
     }
 
     #[test]

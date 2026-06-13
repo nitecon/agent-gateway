@@ -4332,34 +4332,25 @@ pub async fn push_memories_handler(
     }
     let source = memory_push_source(&headers);
     let db = state.db.clone();
-    let (project_exists, response) = spawn_blocking(move || {
+    let response = spawn_blocking(move || {
         let conn = db.lock().unwrap();
-        // Global pushes skip the existence check: `push_project_memories`
-        // materializes the reserved `__global__` project row on demand so the
-        // memory foreign key holds.
+        // Unknown normal projects return a structured push response rather
+        // than a transport 404. All-scope clients push one project at a time;
+        // a transport error would abort the remaining projects.
         if !db::is_global_memory_ident(&ident) && db::get_project(&conn, &ident)?.is_none() {
-            return Ok::<_, anyhow::Error>((false, None));
-        }
-        Ok((
-            true,
-            Some(db::push_project_memories(
-                &conn,
+            return Ok::<_, anyhow::Error>(db::reject_missing_project_memories(
                 &ident,
                 &source,
                 &req.memories,
-            )?),
-        ))
+            ));
+        }
+        // Global pushes skip the existence check: `push_project_memories`
+        // materializes the reserved `__global__` project row on demand so the
+        // memory foreign key holds.
+        db::push_project_memories(&conn, &ident, &source, &req.memories)
     })
     .await??;
-    if !project_exists {
-        return Err(AppError(
-            StatusCode::NOT_FOUND,
-            "project not found".to_string(),
-        ));
-    }
-    Ok(Json(
-        response.expect("memory push response exists for project"),
-    ))
+    Ok(Json(response))
 }
 
 /// `GET /v1/memories/projects` — discovery endpoint for `memory pull --all`.
@@ -10219,6 +10210,51 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string()
+    }
+
+    #[tokio::test]
+    async fn memory_push_unknown_project_returns_rejected_batch_not_transport_404() {
+        let state = test_state();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-memory-client-id",
+            HeaderValue::from_static("memory-client"),
+        );
+
+        let Json(body) = push_memories_handler(
+            State(state.clone()),
+            headers,
+            Path("missing-proj".to_string()),
+            Json(PushMemoriesRequest {
+                memories: vec![db::MemoryPushItem {
+                    local_memory_id: Some("local-1".to_string()),
+                    content: Some("project memory".to_string()),
+                    memory_type: Some("project".to_string()),
+                    ..db::MemoryPushItem::default()
+                }],
+            }),
+        )
+        .await
+        .expect("unknown project pushes should be item rejections, not transport errors");
+
+        assert_eq!(body.project_ident, "missing-proj");
+        assert_eq!(body.server_revision, 0);
+        assert_eq!(body.results.len(), 1);
+        let result = &body.results[0];
+        assert_eq!(result.action, "rejected");
+        assert_eq!(result.local_memory_id.as_deref(), Some("local-1"));
+        assert_eq!(result.client_id.as_deref(), Some("memory-client"));
+        assert_eq!(
+            result.error.as_deref(),
+            Some("project 'missing-proj' not found on gateway")
+        );
+
+        let conn = state.db.lock().unwrap();
+        assert!(db::get_project(&conn, "missing-proj").unwrap().is_none());
+        assert_eq!(
+            db::memory_project_revision(&conn, "missing-proj").unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
