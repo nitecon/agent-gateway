@@ -8,6 +8,7 @@ use rusqlite::{
 };
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     fmt,
     sync::{Arc, LockResult, Mutex, MutexGuard},
 };
@@ -853,7 +854,7 @@ fn apply_schema(conn: &Connection) -> Result<()> {
                SELECT COALESCE(c.last_read_id, 0)
                FROM cursors c
                WHERE c.project_ident = messages.project_ident
-           )",
+        )",
         [],
     )?;
 
@@ -6856,7 +6857,7 @@ pub struct DashboardData {
 /// identity, its channel, the originating room id, the total message count,
 /// active task counts, and the number of unconfirmed user-sourced messages.
 pub fn list_project_stats(conn: &Connection) -> Result<Vec<ProjectStats>> {
-    let mut stmt = conn.prepare_cached(
+    let sql = format!(
         "SELECT p.ident, p.channel_name, p.room_id,
                 COUNT(m.id),
                 (SELECT COUNT(*) FROM messages m2
@@ -6872,8 +6873,7 @@ pub fn list_project_stats(conn: &Connection) -> Result<Vec<ProjectStats>> {
                 (SELECT COUNT(*) FROM tasks t
                  WHERE t.project_ident = p.ident
                    AND t.status = 'done'),
-                (SELECT COUNT(*) FROM api_docs d
-                 WHERE d.project_ident = p.ident),
+                {API_DOC_LOGICAL_COUNT_PROJECT_SQL},
                 (SELECT COUNT(*) FROM gateway_memories gm
                  WHERE gm.project_ident = p.ident
                    AND gm.tombstoned_at IS NULL),
@@ -6894,7 +6894,8 @@ pub fn list_project_stats(conn: &Connection) -> Result<Vec<ProjectStats>> {
                AND m2.confirmed_at IS NULL
                AND m2.source = 'user') DESC,
             p.created_at DESC",
-    )?;
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
     let projects = stmt
         .query_map([], |r| {
             Ok(ProjectStats {
@@ -6965,7 +6966,7 @@ pub fn get_dashboard_data(conn: &Connection) -> Result<DashboardData> {
         |r| r.get(0),
     )?;
     let skill_count: i64 = conn.query_row("SELECT COUNT(*) FROM skills", [], |r| r.get(0))?;
-    let api_doc_count: i64 = conn.query_row("SELECT COUNT(*) FROM api_docs", [], |r| r.get(0))?;
+    let api_doc_count: i64 = conn.query_row(API_DOC_LOGICAL_COUNT_TOTAL_SQL, [], |r| r.get(0))?;
     let memory_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM gateway_memories WHERE tombstoned_at IS NULL",
         [],
@@ -7642,6 +7643,17 @@ pub struct ApiDocSummary {
     pub linked_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ApiDocVersionSummary {
+    pub doc_id: String,
+    pub artifact_id: String,
+    pub artifact_version_id: String,
+    pub version_label: Option<String>,
+    pub created_at: i64,
+    pub is_latest: bool,
+    pub body_available: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct ApiDocFilters<'a> {
     pub query: Option<&'a str>,
@@ -7861,6 +7873,15 @@ const API_DOC_ARTIFACT_SELECT_COLS: &str = "a.artifact_id, a.accepted_version_id
 
 const API_DOC_SELECT_COLS: &str = "d.id, d.project_ident, d.app, d.title, d.summary, d.kind, d.source_format, d.source_ref, d.version, d.labels, d.content_json, d.author, d.created_at, d.updated_at";
 const API_DOC_SUMMARY_SELECT_COLS: &str = "d.id, d.project_ident, d.app, d.title, d.summary, d.kind, d.source_format, d.source_ref, d.version, d.labels, d.author, d.created_at, d.updated_at";
+const API_DOC_LOGICAL_COUNT_PROJECT_SQL: &str = "(SELECT COUNT(*) FROM (
+    SELECT 1 FROM api_docs d
+    WHERE d.project_ident = p.ident
+    GROUP BY lower(trim(d.app)), lower(trim(d.title)), lower(trim(d.kind))
+))";
+const API_DOC_LOGICAL_COUNT_TOTAL_SQL: &str = "SELECT COUNT(*) FROM (
+    SELECT 1 FROM api_docs d
+    GROUP BY d.project_ident, lower(trim(d.app)), lower(trim(d.title)), lower(trim(d.kind))
+)";
 
 fn api_doc_select_sql(full: bool) -> String {
     let cols = if full {
@@ -7878,6 +7899,91 @@ fn api_doc_select_sql(full: bool) -> String {
           AND a.subkind = '{API_DOC_SUBKIND}'
          LEFT JOIN artifact_versions av
            ON av.artifact_version_id = a.accepted_version_id"
+    )
+}
+
+fn api_doc_key_part(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn api_doc_logical_key(app: &str, title: &str, kind: &str) -> String {
+    [app, title, kind]
+        .into_iter()
+        .map(api_doc_key_part)
+        .collect::<Vec<_>>()
+        .join("\x1f")
+}
+
+fn api_doc_summary_logical_key(doc: &ApiDocSummary) -> String {
+    api_doc_logical_key(&doc.app, &doc.title, &doc.kind)
+}
+
+fn find_api_doc_by_logical_key(
+    conn: &Connection,
+    project_ident: &str,
+    app: &str,
+    title: &str,
+    kind: &str,
+) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT id FROM api_docs
+         WHERE project_ident = ?1
+           AND lower(trim(app)) = ?2
+           AND lower(trim(title)) = ?3
+           AND lower(trim(kind)) = ?4
+         ORDER BY updated_at DESC, id DESC
+         LIMIT 1",
+        params![
+            project_ident,
+            api_doc_key_part(app),
+            api_doc_key_part(title),
+            api_doc_key_part(kind)
+        ],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn api_doc_summaries_for_logical_key(
+    conn: &Connection,
+    project_ident: &str,
+    app: &str,
+    title: &str,
+    kind: &str,
+) -> Result<Vec<ApiDocSummary>> {
+    let sql = format!(
+        "{} WHERE d.project_ident = ?1
+              AND lower(trim(d.app)) = ?2
+              AND lower(trim(d.title)) = ?3
+              AND lower(trim(d.kind)) = ?4
+         ORDER BY d.updated_at DESC, d.id DESC",
+        api_doc_select_sql(false)
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(
+            params![
+                project_ident,
+                api_doc_key_part(app),
+                api_doc_key_part(title),
+                api_doc_key_part(kind)
+            ],
+            row_to_api_doc_summary,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn latest_api_doc_summary_for_key(
+    conn: &Connection,
+    project_ident: &str,
+    doc: &ApiDocSummary,
+) -> Result<Option<ApiDocSummary>> {
+    Ok(
+        api_doc_summaries_for_logical_key(conn, project_ident, &doc.app, &doc.title, &doc.kind)?
+            .into_iter()
+            .next(),
     )
 }
 
@@ -8258,6 +8364,54 @@ pub fn insert_api_doc(
     project_ident: &str,
     doc: &ApiDocInsert<'_>,
 ) -> Result<ApiDoc> {
+    if let Some(existing_id) =
+        find_api_doc_by_logical_key(conn, project_ident, doc.app, doc.title, doc.kind)?
+    {
+        let now = now_ms();
+        let labels_json = serialize_string_array(doc.labels);
+        let content_json = serde_json::to_string(doc.content)?;
+        crud(conn).update(
+            "api_docs",
+            &[
+                crud_col("app", doc.app),
+                crud_col("title", doc.title),
+                crud_col("summary", doc.summary),
+                crud_col("kind", doc.kind),
+                crud_col("source_format", doc.source_format),
+                crud_col("source_ref", doc.source_ref),
+                crud_col("version", doc.version),
+                crud_col("labels", labels_json.as_deref()),
+                crud_col("content_json", content_json.as_str()),
+                crud_col("author", doc.author),
+                crud_col("updated_at", now),
+            ],
+            &[
+                crud_eq("project_ident", project_ident),
+                crud_eq("id", existing_id.as_str()),
+            ],
+        )?;
+        ensure_api_doc_artifact_version(
+            conn,
+            &ApiDocArtifactVersionInput {
+                id: &existing_id,
+                project_ident,
+                app: doc.app,
+                title: doc.title,
+                summary: doc.summary,
+                kind: doc.kind,
+                source_format: doc.source_format,
+                source_ref: doc.source_ref,
+                version: doc.version,
+                labels: doc.labels,
+                content: doc.content,
+                author: doc.author,
+                created_at: now,
+            },
+        )?;
+        return get_api_doc(conn, project_ident, &existing_id)?
+            .ok_or_else(|| anyhow::anyhow!("updated api doc not found"));
+    }
+
     let id = new_uuid();
     let now = now_ms();
     let labels_json = serialize_string_array(doc.labels);
@@ -8361,7 +8515,23 @@ pub fn list_api_docs(
     let rows = stmt
         .query_map(params_vec.as_slice(), row_to_api_doc_summary)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for row in rows {
+        let key = api_doc_summary_logical_key(&row);
+        if seen.insert(key) {
+            let latest = latest_api_doc_summary_for_key(conn, project_ident, &row)?;
+            deduped.push(latest.unwrap_or(row));
+        }
+    }
+    deduped.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.app.cmp(&b.app))
+            .then_with(|| a.title.cmp(&b.title))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    Ok(deduped)
 }
 
 pub fn get_api_doc(conn: &Connection, project_ident: &str, id: &str) -> Result<Option<ApiDoc>> {
@@ -8373,6 +8543,48 @@ pub fn get_api_doc(conn: &Connection, project_ident: &str, id: &str) -> Result<O
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query_map(params![project_ident, id], row_to_api_doc)?;
     Ok(rows.next().transpose()?)
+}
+
+pub fn list_api_doc_versions(
+    conn: &Connection,
+    project_ident: &str,
+    id: &str,
+) -> Result<Vec<ApiDocVersionSummary>> {
+    ensure_existing_api_doc_artifacts(conn, project_ident)?;
+    let base = match get_api_doc(conn, project_ident, id)? {
+        Some(doc) => doc,
+        None => return Ok(Vec::new()),
+    };
+    let logical_docs =
+        api_doc_summaries_for_logical_key(conn, project_ident, &base.app, &base.title, &base.kind)?;
+    let latest_doc_id = logical_docs.first().map(|doc| doc.id.clone());
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for doc in logical_docs {
+        for version in list_artifact_versions(conn, project_ident, &doc.artifact_id)? {
+            if !seen.insert(version.artifact_version_id.clone()) {
+                continue;
+            }
+            let is_latest = latest_doc_id.as_deref() == Some(doc.id.as_str())
+                && doc.artifact_version_id.as_deref() == Some(version.artifact_version_id.as_str());
+            out.push(ApiDocVersionSummary {
+                doc_id: doc.id.clone(),
+                artifact_id: doc.artifact_id.clone(),
+                artifact_version_id: version.artifact_version_id,
+                version_label: version.version_label,
+                created_at: version.created_at,
+                is_latest,
+                body_available: version.body.is_some(),
+            });
+        }
+    }
+    out.sort_by(|a, b| {
+        b.is_latest
+            .cmp(&a.is_latest)
+            .then_with(|| b.created_at.cmp(&a.created_at))
+            .then_with(|| a.artifact_version_id.cmp(&b.artifact_version_id))
+    });
+    Ok(out)
 }
 
 pub fn update_api_doc(
@@ -10169,6 +10381,186 @@ mod tests {
         assert_eq!(project_stats[0].api_doc_count, 1);
         let dashboard = get_dashboard_data(&conn).unwrap();
         assert_eq!(dashboard.api_doc_count, 1);
+    }
+
+    #[test]
+    fn api_docs_publish_upserts_logical_doc_and_keeps_version_history() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("billing")).unwrap();
+
+        let content_v1 = serde_json::json!({
+            "purpose": "Owns invoice state.",
+            "workflows": "create draft invoices"
+        });
+        let doc_v1 = insert_api_doc(
+            &conn,
+            "billing",
+            &ApiDocInsert {
+                app: "billing-api",
+                title: "Billing API agent context",
+                summary: Some("System of record for invoices."),
+                kind: "agent_context",
+                source_format: "agent_context",
+                source_ref: Some(".agent/api/billing.yaml"),
+                version: Some("2026-04-28"),
+                labels: &["billing".into(), "invoices".into()],
+                content: &content_v1,
+                author: "tester",
+            },
+        )
+        .unwrap();
+        let v1_id = doc_v1.artifact_version_id.clone().unwrap();
+
+        let content_v2 = serde_json::json!({
+            "purpose": "Owns invoice and credit memo state.",
+            "workflows": "create draft invoices and credit memos"
+        });
+        let doc_v2 = insert_api_doc(
+            &conn,
+            "billing",
+            &ApiDocInsert {
+                app: "billing-api",
+                title: "Billing API agent context",
+                summary: Some("Expanded billing context."),
+                kind: "agent_context",
+                source_format: "agent_context",
+                source_ref: Some(".agent/api/billing-renamed.yaml"),
+                version: Some("2026-05-01"),
+                labels: &["billing".into(), "credit-memos".into()],
+                content: &content_v2,
+                author: "tester-2",
+            },
+        )
+        .unwrap();
+        let v2_id = doc_v2.artifact_version_id.clone().unwrap();
+
+        assert_eq!(doc_v2.id, doc_v1.id);
+        assert_ne!(v1_id, v2_id);
+        assert_eq!(
+            doc_v2.content["purpose"],
+            "Owns invoice and credit memo state."
+        );
+        assert_eq!(
+            doc_v2.source_ref.as_deref(),
+            Some(".agent/api/billing-renamed.yaml")
+        );
+
+        let docs = list_api_docs(&conn, "billing", &ApiDocFilters::default()).unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].id, doc_v1.id);
+        assert_eq!(docs[0].version.as_deref(), Some("2026-05-01"));
+
+        let versions = list_api_doc_versions(&conn, "billing", &doc_v1.id).unwrap();
+        assert_eq!(versions.len(), 2);
+        assert!(versions[0].is_latest);
+        let version_ids: std::collections::HashSet<_> = versions
+            .iter()
+            .map(|version| version.artifact_version_id.as_str())
+            .collect();
+        assert!(version_ids.contains(v1_id.as_str()));
+        assert!(version_ids.contains(v2_id.as_str()));
+
+        let current =
+            list_api_doc_chunks(&conn, "billing", &ApiDocFilters::default(), false).unwrap();
+        assert!(current
+            .chunks
+            .iter()
+            .all(|chunk| chunk.artifact_version_id == v2_id && chunk.freshness == "current"));
+        assert!(current
+            .chunks
+            .iter()
+            .any(|chunk| chunk.text.contains("credit memo")));
+
+        let history =
+            list_api_doc_chunks(&conn, "billing", &ApiDocFilters::default(), true).unwrap();
+        assert!(history
+            .chunks
+            .iter()
+            .any(|chunk| chunk.artifact_version_id == v1_id
+                && chunk.freshness == "superseded_history"));
+        assert!(history
+            .chunks
+            .iter()
+            .any(|chunk| chunk.artifact_version_id == v2_id && chunk.freshness == "current"));
+
+        assert_eq!(list_project_stats(&conn).unwrap()[0].api_doc_count, 1);
+        assert_eq!(get_dashboard_data(&conn).unwrap().api_doc_count, 1);
+    }
+
+    #[test]
+    fn api_docs_list_collapses_legacy_duplicate_rows_to_latest_logical_doc() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("traderx")).unwrap();
+        let first_at = now_ms();
+        let second_at = first_at + 1;
+        let content_v1 = serde_json::json!({"purpose": "legacy old-only traderx detail"});
+        let content_v2 = serde_json::json!({"purpose": "latest traderx detail"});
+
+        conn.execute(
+            "INSERT INTO api_docs (
+                 id, project_ident, app, title, summary, kind, source_format,
+                 source_ref, version, labels, content_json, author, created_at,
+                 updated_at
+             )
+             VALUES (?1, 'traderx', 'traderx', 'TraderX API agent context',
+                     'old duplicate', 'agent_context', 'agent_context',
+                     '.agent/api/traderx-old.yaml', '2026-05-01', ?2, ?3,
+                     'tester', ?4, ?4)",
+            params![
+                "legacy-doc-old",
+                serde_json::to_string(&vec!["traderx"]).unwrap(),
+                serde_json::to_string(&content_v1).unwrap(),
+                first_at,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO api_docs (
+                 id, project_ident, app, title, summary, kind, source_format,
+                 source_ref, version, labels, content_json, author, created_at,
+                 updated_at
+             )
+             VALUES (?1, 'traderx', 'traderx', 'TraderX API agent context',
+                     'latest duplicate', 'agent_context', 'agent_context',
+                     '.agent/api/traderx.yaml', '2026-05-02', ?2, ?3,
+                     'tester', ?4, ?4)",
+            params![
+                "legacy-doc-new",
+                serde_json::to_string(&vec!["traderx"]).unwrap(),
+                serde_json::to_string(&content_v2).unwrap(),
+                second_at,
+            ],
+        )
+        .unwrap();
+
+        let docs = list_api_docs(&conn, "traderx", &ApiDocFilters::default()).unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].id, "legacy-doc-new");
+        assert_eq!(docs[0].summary.as_deref(), Some("latest duplicate"));
+
+        let old_content_search = list_api_docs(
+            &conn,
+            "traderx",
+            &ApiDocFilters {
+                query: Some("old-only"),
+                ..ApiDocFilters::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(old_content_search.len(), 1);
+        assert_eq!(old_content_search[0].id, "legacy-doc-new");
+
+        let versions = list_api_doc_versions(&conn, "traderx", "legacy-doc-new").unwrap();
+        assert_eq!(versions.len(), 2);
+        let doc_ids: std::collections::HashSet<_> = versions
+            .iter()
+            .map(|version| version.doc_id.as_str())
+            .collect();
+        assert!(doc_ids.contains("legacy-doc-old"));
+        assert!(doc_ids.contains("legacy-doc-new"));
+
+        assert_eq!(list_project_stats(&conn).unwrap()[0].api_doc_count, 1);
+        assert_eq!(get_dashboard_data(&conn).unwrap().api_doc_count, 1);
     }
 
     #[test]

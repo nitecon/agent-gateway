@@ -4,7 +4,7 @@ summary: Agent coordination gateway for project-scoped comms, task boards, proje
 kind: agent_context
 source_format: agent_context
 source_ref: .agent/api/agent-gateway.yaml
-version: v1.7.0
+version: v1.12.0
 labels:
   - gateway
   - agents
@@ -77,6 +77,8 @@ content:
         - Include purpose, workflows, endpoints, auth, safety, relationships, examples, operations, and schemas where applicable.
         - Validate locally with agent-tools docs validate --file PATH.
         - Publish with agent-tools docs publish --file PATH or POST /v1/projects/:ident/api-docs.
+        - Re-publishing the same app + title + kind updates one logical documentation item and creates a new immutable artifact version instead of creating another visible wiki page.
+        - Use a distinct title, app, or kind when the content is a separate documentation page rather than a new version of an existing page.
         - Retrieve RAG chunks with GET /v1/projects/:ident/api-docs/chunks.
     - name: Sync durable memories across all scopes
       steps:
@@ -108,8 +110,9 @@ content:
     - name: Publish and retrieve artifact-backed docs
       steps:
         - "Continue using docs-first commands for API context: agent-tools docs validate, publish, search, and chunks."
-        - Gateway stores docs as compatibility api_docs records plus documentation artifacts and immutable artifact_versions with retained API context bodies.
-        - Retrieve chunks with GET /v1/projects/:ident/api-docs/chunks. Use include_history=true when historical immutable chunks are needed; default retrieval is current-version oriented.
+        - Gateway stores docs as one logical api_docs record per project/app/title/kind plus documentation artifacts and immutable artifact_versions with retained API context bodies.
+        - GET /v1/projects/:ident/api-docs returns one latest logical document per project/app/title/kind, including for legacy duplicate rows that predate logical upsert behavior.
+        - Retrieve chunks with GET /v1/projects/:ident/api-docs/chunks. Default retrieval is current-version oriented and returns chunks for the latest logical document only; use include_history=true when historical immutable chunks are needed.
         - "Use artifact routes when the broader graph is needed: links to specs, tasks, patterns, repository refs, comments, versions, and stale/partial chunk status."
     - name: Export artifact-backed docs to source files
       steps:
@@ -204,6 +207,9 @@ content:
         app: Exact app filter.
         label: Label filter.
         kind: Kind filter, usually agent_context.
+      notes:
+        - Results are logical documentation items, deduplicated by project, app, title, and kind.
+        - Repeated publishes with the same app, title, and kind appear once and resolve to the latest record/version.
     - method: POST
       path: /v1/projects/:ident/api-docs
       intent: Publish a docs-first agent API context document.
@@ -218,9 +224,16 @@ content:
         version: Optional version or source version.
         labels: Optional labels array or comma-separated string.
         author: Optional author.
+      notes:
+        - The publish key is project_ident + app + title + kind.
+        - Publishing an existing key updates the stable api_doc id, creates a new artifact_version, and preserves prior versions for history retrieval.
+        - Separate documentation pages must use distinct titles, apps, or kinds.
     - method: GET
       path: /v1/projects/:ident/api-docs/chunks
       intent: Return RAG-ready chunks generated from stored agent API context.
+      notes:
+        - Default chunk retrieval returns current chunks for the latest logical docs only.
+        - include_history=true includes superseded artifact chunks for version/history-aware retrieval.
     - method: GET
       path: /v1/projects/:ident/api-docs/:id
       intent: Fetch one full agent API context document.
@@ -508,9 +521,16 @@ content:
         - content
       fields:
         app: App/service identifier.
-        title: Human readable title.
+        title: Human readable title. Together with app and kind, this identifies the logical documentation page.
         content: Structured agent-native context JSON.
         labels: Array or comma-separated string.
+      identity:
+        logical_key:
+          - project_ident
+          - app
+          - title
+          - kind
+        behavior: Re-publishing the same logical key updates the same api_doc id and appends an immutable artifact_version.
     artifact_mutation_envelope:
       headers:
         Authorization: Bearer token required for /v1 API routes.

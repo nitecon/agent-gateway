@@ -4384,6 +4384,11 @@ pub struct ListApiDocsQuery {
     pub envelope: bool,
 }
 
+#[derive(Deserialize, Default)]
+pub struct ApiDocDetailQuery {
+    pub version_id: Option<String>,
+}
+
 #[derive(Deserialize)]
 pub struct CreateApiDocRequest {
     pub app: String,
@@ -5801,6 +5806,67 @@ fn documentation_page_href(project_ident: &str, doc_id: &str) -> String {
     )
 }
 
+fn format_epoch_ms(epoch_ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(epoch_ms)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| epoch_ms.to_string())
+}
+
+fn documentation_version_selector(
+    project_ident: &str,
+    versions: &[db::ApiDocVersionSummary],
+    selected_version_id: Option<&str>,
+) -> String {
+    if versions.len() <= 1 {
+        return String::new();
+    }
+
+    let options = versions
+        .iter()
+        .map(|version| {
+            let href = if version.is_latest {
+                documentation_page_href(project_ident, &version.doc_id)
+            } else {
+                format!(
+                    "{}?version_id={}",
+                    documentation_page_href(project_ident, &version.doc_id),
+                    path_segment(&version.artifact_version_id)
+                )
+            };
+            let selected = match selected_version_id {
+                Some(id) => id == version.artifact_version_id,
+                None => version.is_latest,
+            };
+            let selected_attr = if selected { " selected" } else { "" };
+            let timestamp = format_epoch_ms(version.created_at);
+            let label = match (version.is_latest, version.version_label.as_deref()) {
+                (true, Some(label)) if !label.trim().is_empty() => {
+                    format!("latest ({})", label.trim())
+                }
+                (true, _) => "latest".to_string(),
+                (false, Some(label)) if !label.trim().is_empty() => {
+                    format!("{} ({})", timestamp, label.trim())
+                }
+                (false, _) => timestamp,
+            };
+            format!(
+                r#"<option value="{href}"{selected}>{label}</option>"#,
+                href = he(&href),
+                selected = selected_attr,
+                label = he(&label),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"<label class="nd-grid nd-gap-xs nd-mb-md">
+  <span class="nd-text-xs nd-text-muted">Version</span>
+  <select class="nd-input" onchange="if (this.value) window.location.href = this.value">{options}</select>
+</label>"#
+    )
+}
+
 fn documentation_nav(
     project_ident: &str,
     docs: &[db::ApiDocSummary],
@@ -6494,19 +6560,40 @@ pub async fn api_docs_page(
 pub async fn api_doc_detail_page(
     State(state): State<AppState>,
     Path((ident, id)): Path<(String, String)>,
+    Query(query): Query<ApiDocDetailQuery>,
 ) -> Result<Html<String>> {
     let db = state.db.clone();
     let ident_for_lookup = ident.clone();
     let id_for_lookup = id.clone();
-    let (project, doc, docs, theme) = spawn_blocking(move || -> anyhow::Result<_> {
-        let conn = db.lock().unwrap();
-        let project = db::get_project(&conn, &ident_for_lookup)?;
-        let doc = db::get_api_doc(&conn, &ident_for_lookup, &id_for_lookup)?;
-        let docs = db::list_api_docs(&conn, &ident_for_lookup, &db::ApiDocFilters::default())?;
-        let theme = db::get_theme(&conn)?;
-        Ok((project, doc, docs, theme))
-    })
-    .await??;
+    let requested_version_id = query
+        .version_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let (project, doc, docs, versions, selected_version, theme) =
+        spawn_blocking(move || -> anyhow::Result<_> {
+            let conn = db.lock().unwrap();
+            let project = db::get_project(&conn, &ident_for_lookup)?;
+            let doc = db::get_api_doc(&conn, &ident_for_lookup, &id_for_lookup)?;
+            let versions = match doc.as_ref() {
+                Some(doc) => db::list_api_doc_versions(&conn, &ident_for_lookup, &doc.id)?,
+                None => Vec::new(),
+            };
+            let selected_version = match (doc.as_ref(), requested_version_id.as_deref()) {
+                (Some(doc), Some(version_id)) => db::get_artifact_version(
+                    &conn,
+                    &ident_for_lookup,
+                    &doc.artifact_id,
+                    version_id,
+                )?,
+                _ => None,
+            };
+            let docs = db::list_api_docs(&conn, &ident_for_lookup, &db::ApiDocFilters::default())?;
+            let theme = db::get_theme(&conn)?;
+            Ok((project, doc, docs, versions, selected_version, theme))
+        })
+        .await??;
 
     let project = project.ok_or_else(|| {
         AppError(
@@ -6517,16 +6604,31 @@ pub async fn api_doc_detail_page(
     let doc =
         doc.ok_or_else(|| AppError(StatusCode::NOT_FOUND, format!("api doc '{}' not found", id)))?;
 
-    let labels = if doc.labels.is_empty() {
+    let selected_version_id = selected_version
+        .as_ref()
+        .map(|version| version.artifact_version_id.as_str());
+    let mut display_doc = doc.clone();
+    if let Some(version) = selected_version.as_ref() {
+        if let Some(body) = version.body.as_deref() {
+            display_doc.content =
+                serde_json::from_str(body).unwrap_or_else(|_| Value::String(body.to_string()));
+        }
+        display_doc.version = version.version_label.clone();
+        display_doc.updated_at = version.created_at;
+        display_doc.artifact_version_id = Some(version.artifact_version_id.clone());
+    }
+
+    let labels = if display_doc.labels.is_empty() {
         String::new()
     } else {
-        doc.labels
+        display_doc
+            .labels
             .iter()
             .map(|label| format!(r#"<span class="nd-badge nd-badge-sm">{}</span>"#, he(label)))
             .collect::<Vec<_>>()
             .join(" ")
     };
-    let chunks = api_doc_chunks(&doc)
+    let chunks = api_doc_chunks(&display_doc)
         .into_iter()
         .map(|chunk| {
             format!(
@@ -6545,13 +6647,15 @@ pub async fn api_doc_detail_page(
     } else {
         chunks
     };
-    let content_json =
-        serde_json::to_string_pretty(&doc.content).unwrap_or_else(|_| doc.content.to_string());
-    let source_ref = doc.source_ref.as_deref().unwrap_or("");
-    let version = doc.version.as_deref().unwrap_or("");
-    let summary = doc.summary.as_deref().unwrap_or("");
+    let content_json = serde_json::to_string_pretty(&display_doc.content)
+        .unwrap_or_else(|_| display_doc.content.to_string());
+    let source_ref = display_doc.source_ref.as_deref().unwrap_or("");
+    let version = display_doc.version.as_deref().unwrap_or("");
+    let summary = display_doc.summary.as_deref().unwrap_or("");
     let ident_attr = he(&project.ident);
     let nav = documentation_nav(&project.ident, &docs, Some(&doc.id));
+    let version_selector =
+        documentation_version_selector(&project.ident, &versions, selected_version_id);
 
     let content = format!(
         r#"  <div class="nd-flex nd-gap-md nd-mb-md">
@@ -6591,7 +6695,8 @@ pub async fn api_doc_detail_page(
           <div class="nd-text-xs nd-text-muted">App</div><strong>{app}</strong>
           <div class="nd-text-xs nd-text-muted nd-mt-sm">Kind</div><strong>{kind}</strong>
           <div class="nd-text-xs nd-text-muted nd-mt-sm">Source</div><strong>{source}</strong>
-          <div class="nd-text-xs nd-text-muted nd-mt-sm">Version</div><strong>{version}</strong>
+          <div class="nd-mt-sm">{version_selector}</div>
+          <div class="nd-text-xs nd-text-muted nd-mt-sm">Current label</div><strong>{version}</strong>
           <div class="nd-text-xs nd-text-muted nd-mt-sm">Source ref</div><div class="nd-text-sm">{source_ref}</div>
           <div class="nd-text-xs nd-text-muted nd-mt-sm">Record ID</div><code>{artifact_id}</code>
         </div>
@@ -6600,15 +6705,16 @@ pub async fn api_doc_detail_page(
   </div>"#,
         ident = ident_attr,
         nav = nav,
-        title = he(&doc.title),
-        app = he(&doc.app),
-        kind = he(&doc.kind),
-        source = he(&doc.source_format),
+        title = he(&display_doc.title),
+        app = he(&display_doc.app),
+        kind = he(&display_doc.kind),
+        source = he(&display_doc.source_format),
+        version_selector = version_selector,
         version = he(version),
         summary = he(summary),
         labels = labels,
         source_ref = he(source_ref),
-        artifact_id = he(&doc.artifact_id),
+        artifact_id = he(&display_doc.artifact_id),
         content_json = he(&content_json),
         chunks = chunks,
     );
