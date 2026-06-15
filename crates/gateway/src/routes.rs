@@ -5793,6 +5793,64 @@ fn empty_table_rows(rows: String, colspan: usize) -> String {
     }
 }
 
+fn documentation_page_href(project_ident: &str, doc_id: &str) -> String {
+    format!(
+        "/projects/{}/documentation/{}",
+        path_segment(project_ident),
+        path_segment(doc_id)
+    )
+}
+
+fn documentation_nav(
+    project_ident: &str,
+    docs: &[db::ApiDocSummary],
+    current_doc_id: Option<&str>,
+) -> String {
+    if docs.is_empty() {
+        return r#"<p class="nd-text-muted nd-text-sm">No documentation pages yet.</p>"#
+            .to_string();
+    }
+
+    let items = docs
+        .iter()
+        .map(|doc| {
+            let active = if current_doc_id == Some(doc.id.as_str()) {
+                " nd-active"
+            } else {
+                ""
+            };
+            format!(
+                r#"<li class="nd-mb-xs">
+  <a class="nd-btn-ghost nd-text-left nd-w-full{active}" href="{href}">
+    <strong>{title}</strong>
+    <div class="nd-text-xs nd-text-muted">{app} · {kind}</div>
+  </a>
+</li>"#,
+                active = active,
+                href = he(&documentation_page_href(project_ident, &doc.id)),
+                title = he(&doc.title),
+                app = he(&doc.app),
+                kind = he(&doc.kind),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(r#"<ul class="nd-list-unstyled nd-m-0 nd-p-0">{items}</ul>"#)
+}
+
+fn documentation_head_extra() -> &'static str {
+    r#"<style>
+.documentation-summary {
+  overflow-wrap: anywhere;
+}
+.documentation-content pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+</style>"#
+}
+
 fn artifact_auth_signal(state: &AppState) -> &'static str {
     if state.artifact_auth_enforced {
         "Authorization: project-scoped"
@@ -5836,19 +5894,43 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
         }
     };
 
+    let active_task_count: i64 = data
+        .projects
+        .iter()
+        .map(|p| p.todo_count + p.in_progress_count)
+        .sum();
+    let in_progress_task_count: i64 = data.projects.iter().map(|p| p.in_progress_count).sum();
+    let unanswered_message_count: i64 = data.projects.iter().map(|p| p.unread_count).sum();
+
     let rows = if data.project_count == 0 {
-        r#"<tr><td colspan="9" class="nd-text-muted nd-text-center">No projects registered yet</td></tr>"#.to_string()
+        r#"<tr><td colspan="6" class="nd-text-muted nd-text-center">No projects registered yet</td></tr>"#.to_string()
     } else {
         data.projects
             .iter()
             .map(|p| {
-                let unread_cell = if p.unread_count > 0 {
+                let active_tasks = p.todo_count + p.in_progress_count;
+                let work_cell = if active_tasks > 0 {
                     format!(
-                        r#"<span class="nd-badge nd-badge-sm nd-text-danger">{}</span>"#,
+                        r#"<a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/tasks">{active} active</a>
+<div class="nd-text-xs nd-text-muted">{in_progress} in progress · {todo} open</div>"#,
+                        ident = he(&p.ident),
+                        active = active_tasks,
+                        in_progress = p.in_progress_count,
+                        todo = p.todo_count,
+                    )
+                } else {
+                    format!(
+                        r#"<a class="nd-btn-ghost nd-btn-sm" href="/projects/{}/tasks">No active tasks</a>"#,
+                        he(&p.ident)
+                    )
+                };
+                let messages_cell = if p.unread_count > 0 {
+                    format!(
+                        r#"<span class="nd-badge nd-badge-sm nd-text-danger">{} unanswered</span>"#,
                         p.unread_count
                     )
                 } else {
-                    "0".into()
+                    r#"<span class="nd-text-muted">Clear</span>"#.into()
                 };
                 let build_cell = match &p.repo_full_name {
                     Some(repo) => format!(
@@ -5860,20 +5942,16 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
                 };
                 let docs_cell = if p.api_doc_count > 0 {
                     format!(
-                        r#"<a class="nd-btn-secondary nd-btn-sm" href="/projects/{}/api-docs">{} docs</a>"#,
+                        r#"<a class="nd-btn-secondary nd-btn-sm" href="/projects/{}/documentation">{} pages</a>"#,
                         he(&p.ident),
                         p.api_doc_count
                     )
                 } else {
                     format!(
-                        r#"<a class="nd-btn-ghost nd-btn-sm" href="/projects/{}/api-docs">No docs</a>"#,
+                        r#"<a class="nd-btn-ghost nd-btn-sm" href="/projects/{}/documentation">No docs</a>"#,
                         he(&p.ident)
                     )
                 };
-                let tasks_cell = format!(
-                    r#"<a class="nd-btn-secondary nd-btn-sm" href="/projects/{}/tasks">Tasks</a>"#,
-                    he(&p.ident)
-                );
                 let memories_cell = if p.memory_count > 0 {
                     format!(
                         r#"<a class="nd-btn-secondary nd-btn-sm" href="/projects/{}/memories">{} memories</a>"#,
@@ -5887,16 +5965,14 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
                     )
                 };
                 format!(
-                    "<tr><td>{}</td><td>{}</td><td class=\"nd-text-muted\">{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    "<tr><td><strong>{}</strong><div class=\"nd-text-xs nd-text-muted\">{}</div></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                     he(&p.ident),
-                    he(&p.channel_name),
-                    he(&p.room_id),
-                    p.total_messages,
-                    unread_cell,
-                    build_cell,
+                    he(p.repo_full_name.as_deref().unwrap_or(&p.channel_name)),
+                    work_cell,
+                    messages_cell,
                     docs_cell,
+                    build_cell,
                     memories_cell,
-                    tasks_cell,
                 )
             })
             .collect::<Vec<_>>()
@@ -5905,23 +5981,23 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
 
     let content = format!(
         r#"  {banner}
-  <p class="nd-text-muted nd-text-sm">Channel plugin dashboard · v{version}</p>
+  <p class="nd-text-muted nd-text-sm">Operations dashboard · v{version}</p>
 
   <section class="nd-row nd-gap-md nd-mb-lg">
     <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{projects}</div><div class="nd-text-xs nd-text-muted">Projects</div></div></div></div>
-    <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{total}</div><div class="nd-text-xs nd-text-muted">Total messages</div></div></div></div>
-    <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{agent}</div><div class="nd-text-xs nd-text-muted">Agent</div></div></div></div>
-    <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{user}</div><div class="nd-text-xs nd-text-muted">User</div></div></div></div>
+    <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{active_tasks}</div><div class="nd-text-xs nd-text-muted">Active tasks</div></div></div></div>
+    <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{in_progress_tasks}</div><div class="nd-text-xs nd-text-muted">In progress</div></div></div></div>
+    <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{unanswered}</div><div class="nd-text-xs nd-text-muted">Unanswered</div></div></div></div>
     <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{skills}</div><div class="nd-text-xs nd-text-muted">Skills</div></div></div></div>
-    <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{api_docs}</div><div class="nd-text-xs nd-text-muted">API docs</div></div></div></div>
+    <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{api_docs}</div><div class="nd-text-xs nd-text-muted">Docs</div></div></div></div>
     <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{memories}</div><div class="nd-text-xs nd-text-muted">Memories</div></div></div></div>
   </section>
 
   <section class="nd-card">
-    <div class="nd-card-header"><strong>Projects</strong></div>
+    <div class="nd-card-header"><strong>Attention queue</strong></div>
     <div class="nd-card-body nd-p-0">
       <table class="nd-table nd-table-hover">
-        <thead><tr><th>Project</th><th>Channel</th><th>Room ID</th><th>Messages</th><th>Unread</th><th>Build</th><th>Docs</th><th>Memories</th><th>Tasks</th></tr></thead>
+        <thead><tr><th>Project</th><th>Work</th><th>Messages</th><th>Documentation</th><th>Build</th><th>Memory</th></tr></thead>
         <tbody>{rows}</tbody>
       </table>
     </div>
@@ -5929,9 +6005,9 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
         banner = update_banner,
         version = he(current_version),
         projects = data.project_count,
-        total = data.total_messages,
-        agent = data.agent_messages,
-        user = data.user_messages,
+        active_tasks = active_task_count,
+        in_progress_tasks = in_progress_task_count,
+        unanswered = unanswered_message_count,
         skills = data.skill_count,
         api_docs = data.api_doc_count,
         memories = data.memory_count,
@@ -5958,20 +6034,20 @@ pub async fn api_docs_index_page(State(state): State<AppState>) -> Result<Html<S
     .await??;
 
     let rows = if projects.is_empty() {
-        r#"<tr><td colspan="5" class="nd-text-muted nd-text-center">No projects registered yet.</td></tr>"#.to_string()
+        r#"<tr><td colspan="3" class="nd-text-muted nd-text-center">No projects registered yet.</td></tr>"#.to_string()
     } else {
         projects
             .iter()
             .map(|project| {
                 let docs_cell = if project.api_doc_count > 0 {
                     format!(
-                        r#"<a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/api-docs">{count} docs</a>"#,
+                        r#"<a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/documentation">{count} pages</a>"#,
                         ident = he(&project.ident),
                         count = project.api_doc_count,
                     )
                 } else {
                     format!(
-                        r#"<a class="nd-btn-ghost nd-btn-sm" href="/projects/{ident}/api-docs">Start docs</a>"#,
+                        r#"<a class="nd-btn-ghost nd-btn-sm" href="/projects/{ident}/documentation">Start wiki</a>"#,
                         ident = he(&project.ident),
                     )
                 };
@@ -5980,15 +6056,11 @@ pub async fn api_docs_index_page(State(state): State<AppState>) -> Result<Html<S
                     r#"<tr>
   <td><strong>{ident}</strong><div class="nd-text-xs nd-text-muted">{repo}</div></td>
   <td>{docs}</td>
-  <td>{messages}</td>
-  <td>{unread}</td>
-  <td><a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/tasks">Tasks</a></td>
+  <td><a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/documentation">Open wiki</a></td>
 </tr>"#,
                     ident = he(&project.ident),
                     repo = he(repo),
                     docs = docs_cell,
-                    messages = project.total_messages,
-                    unread = project.unread_count,
                 )
             })
             .collect::<Vec<_>>()
@@ -5997,10 +6069,10 @@ pub async fn api_docs_index_page(State(state): State<AppState>) -> Result<Html<S
 
     let content = format!(
         r#"  <section class="nd-card">
-    <div class="nd-card-header"><strong>API Docs by Project</strong></div>
+    <div class="nd-card-header"><strong>Documentation Spaces</strong></div>
     <div class="nd-card-body nd-p-0">
       <table class="nd-table nd-table-hover">
-        <thead><tr><th>Project</th><th>Docs</th><th>Messages</th><th>Unread</th><th>Tasks</th></tr></thead>
+        <thead><tr><th>Project</th><th>Pages</th><th></th></tr></thead>
         <tbody>{rows}</tbody>
       </table>
     </div>
@@ -6010,8 +6082,8 @@ pub async fn api_docs_index_page(State(state): State<AppState>) -> Result<Html<S
 
     let html = format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
-        head = control_panel_head("agent-gateway - API docs", &theme, ""),
-        open = control_panel_open("API Docs", "api-docs"),
+        head = control_panel_head("agent-gateway - Documentation", &theme, ""),
+        open = control_panel_open("Documentation", "documentation"),
         content = content,
         close = control_panel_close(&state.api_key),
     );
@@ -6027,7 +6099,7 @@ pub async fn memories_index_page(State(state): State<AppState>) -> Result<Html<S
     .await??;
 
     let rows = if projects.is_empty() {
-        r#"<tr><td colspan="5" class="nd-text-muted nd-text-center">No projects registered yet.</td></tr>"#.to_string()
+        r#"<tr><td colspan="3" class="nd-text-muted nd-text-center">No projects registered yet.</td></tr>"#.to_string()
     } else {
         projects
             .iter()
@@ -6049,15 +6121,11 @@ pub async fn memories_index_page(State(state): State<AppState>) -> Result<Html<S
                     r#"<tr>
   <td><strong>{ident}</strong><div class="nd-text-xs nd-text-muted">{repo}</div></td>
   <td>{memories}</td>
-  <td>{docs}</td>
-  <td>{messages}</td>
-  <td><a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/tasks">Tasks</a></td>
+  <td><a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/memories">Open memory</a></td>
 </tr>"#,
                     ident = he(&project.ident),
                     repo = he(repo),
                     memories = memories_cell,
-                    docs = project.api_doc_count,
-                    messages = project.total_messages,
                 )
             })
             .collect::<Vec<_>>()
@@ -6069,7 +6137,7 @@ pub async fn memories_index_page(State(state): State<AppState>) -> Result<Html<S
     <div class="nd-card-header"><strong>Memories by Project</strong></div>
     <div class="nd-card-body nd-p-0">
       <table class="nd-table nd-table-hover">
-        <thead><tr><th>Project</th><th>Memories</th><th>API docs</th><th>Messages</th><th>Tasks</th></tr></thead>
+        <thead><tr><th>Project</th><th>Memories</th><th></th></tr></thead>
         <tbody>{rows}</tbody>
       </table>
     </div>
@@ -6225,7 +6293,7 @@ pub async fn memories_page(
     <a class="nd-btn-secondary nd-btn-sm" href="/memories">All projects</a>
     <a class="nd-btn-secondary nd-btn-sm" href="/">Dashboard</a>
     <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/tasks">Tasks</a>
-    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/api-docs">API docs</a>
+    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/documentation">Documentation</a>
   </div>
 
   <section class="nd-card">
@@ -6284,13 +6352,27 @@ pub async fn memories_page(
 pub async fn api_docs_page(
     State(state): State<AppState>,
     Path(ident): Path<String>,
+    Query(query): Query<ListApiDocsQuery>,
 ) -> Result<Html<String>> {
     let db = state.db.clone();
     let ident_for_lookup = ident.clone();
+    let q = query.q.clone();
+    let app = query.app.clone();
+    let label = query.label.clone();
+    let kind = query.kind.clone();
     let (project, docs, theme) = spawn_blocking(move || -> anyhow::Result<_> {
         let conn = db.lock().unwrap();
         let project = db::get_project(&conn, &ident_for_lookup)?;
-        let docs = db::list_api_docs(&conn, &ident_for_lookup, &db::ApiDocFilters::default())?;
+        let docs = db::list_api_docs(
+            &conn,
+            &ident_for_lookup,
+            &db::ApiDocFilters {
+                query: q.as_deref(),
+                app: app.as_deref(),
+                label: label.as_deref(),
+                kind: kind.as_deref(),
+            },
+        )?;
         let theme = db::get_theme(&conn)?;
         Ok((project, docs, theme))
     })
@@ -6303,8 +6385,8 @@ pub async fn api_docs_page(
         )
     })?;
 
-    let rows = if docs.is_empty() {
-        r#"<tr><td colspan="6" class="nd-text-muted nd-text-center">No agent API context has been published for this project.</td></tr>"#.to_string()
+    let pages = if docs.is_empty() {
+        r#"<p class="nd-text-muted nd-text-sm">No documentation pages match the current filters.</p>"#.to_string()
     } else {
         docs.iter()
             .map(|doc| {
@@ -6321,18 +6403,19 @@ pub async fn api_docs_page(
                 };
                 let summary = doc.summary.as_deref().unwrap_or("");
                 format!(
-                    r#"<tr>
-  <td><a class="nd-btn-ghost nd-text-left" href="/projects/{ident}/api-docs/{id}"><strong>{app}</strong><div class="nd-text-xs nd-text-muted">{title}</div></a></td>
-  <td>{kind}</td>
-  <td>{source}</td>
-  <td>{version}</td>
-  <td>{labels}</td>
-  <td class="nd-text-muted">{summary}</td>
-</tr>"#,
-                    ident = he(&project.ident),
-                    id = he(&doc.id),
-                    app = he(&doc.app),
+                    r#"<article class="nd-card nd-mb-md">
+  <div class="nd-card-body">
+    <a class="nd-btn-ghost nd-text-left nd-w-full" href="{href}">
+      <strong>{title}</strong>
+      <div class="nd-text-xs nd-text-muted">{app} · {kind} · {source} {version}</div>
+    </a>
+    <p class="nd-text-sm nd-text-muted documentation-summary">{summary}</p>
+    <div>{labels}</div>
+  </div>
+</article>"#,
+                    href = he(&documentation_page_href(&project.ident, &doc.id)),
                     title = he(&doc.title),
+                    app = he(&doc.app),
                     kind = he(&doc.kind),
                     source = he(&doc.source_format),
                     version = he(doc.version.as_deref().unwrap_or("")),
@@ -6345,39 +6428,63 @@ pub async fn api_docs_page(
     };
 
     let ident_attr = he(&project.ident);
+    let nav = documentation_nav(&project.ident, &docs, None);
+    let q_value = he(query.q.as_deref().unwrap_or(""));
+    let app_value = he(query.app.as_deref().unwrap_or(""));
+    let label_value = he(query.label.as_deref().unwrap_or(""));
+    let kind_value = he(query.kind.as_deref().unwrap_or(""));
     let content = format!(
         r#"  <div class="nd-flex nd-gap-md nd-mb-md">
-    <a class="nd-btn-secondary nd-btn-sm" href="/api-docs">All API docs</a>
+    <a class="nd-btn-secondary nd-btn-sm" href="/documentation">All documentation</a>
     <a class="nd-btn-secondary nd-btn-sm" href="/">Dashboard</a>
     <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/tasks">Tasks</a>
     <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/build">Build</a>
   </div>
 
-  <section class="nd-card">
-    <div class="nd-card-header"><strong>Agent API Context</strong></div>
-    <div class="nd-card-body nd-p-0">
-      <table class="nd-table nd-table-hover">
-        <thead><tr><th>App</th><th>Kind</th><th>Source</th><th>Version</th><th>Labels</th><th>Summary</th></tr></thead>
-        <tbody>{rows}</tbody>
-      </table>
+  <section class="nd-card nd-mb-lg">
+    <div class="nd-card-header"><strong>Search Documentation</strong></div>
+    <div class="nd-card-body">
+      <form class="nd-grid nd-gap-sm" method="get" action="/projects/{ident}/documentation">
+        <input class="nd-input" name="q" placeholder="Search pages, chunks, source refs, linked records" value="{q}">
+        <input class="nd-input" name="app" placeholder="App" value="{app}">
+        <input class="nd-input" name="label" placeholder="Label" value="{label}">
+        <input class="nd-input" name="kind" placeholder="Kind" value="{kind}">
+        <button class="nd-btn-primary" type="submit">Search</button>
+      </form>
     </div>
   </section>
 
-  <section class="nd-card nd-mt-lg">
-    <div class="nd-card-header"><strong>Agent endpoints</strong></div>
-    <div class="nd-card-body">
-      <p class="nd-text-muted nd-text-sm">Publish docs-first context with <code>POST /v1/projects/{ident}/api-docs</code>. Retrieve RAG-ready chunks with <code>GET /v1/projects/{ident}/api-docs/chunks</code>.</p>
-    </div>
-  </section>"#,
+  <div class="nd-row">
+    <aside class="nd-col-3">
+      <section class="nd-card">
+        <div class="nd-card-header"><strong>Wiki Navigation</strong></div>
+        <div class="nd-card-body">{nav}</div>
+      </section>
+    </aside>
+    <section class="nd-col-9">
+      {pages}
+    </section>
+  </div>
+
+  "#,
         ident = ident_attr,
-        rows = rows,
+        nav = nav,
+        pages = pages,
+        q = q_value,
+        app = app_value,
+        label = label_value,
+        kind = kind_value,
     );
 
-    let page_title = format!("API docs - {}", project.ident);
+    let page_title = format!("Documentation - {}", project.ident);
     let html = format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
-        head = control_panel_head("agent-gateway - API docs", &theme, ""),
-        open = control_panel_open(&page_title, "dashboard"),
+        head = control_panel_head(
+            "agent-gateway - Documentation",
+            &theme,
+            documentation_head_extra()
+        ),
+        open = control_panel_open(&page_title, "documentation"),
         content = content,
         close = control_panel_close(&state.api_key),
     );
@@ -6391,12 +6498,13 @@ pub async fn api_doc_detail_page(
     let db = state.db.clone();
     let ident_for_lookup = ident.clone();
     let id_for_lookup = id.clone();
-    let (project, doc, theme) = spawn_blocking(move || -> anyhow::Result<_> {
+    let (project, doc, docs, theme) = spawn_blocking(move || -> anyhow::Result<_> {
         let conn = db.lock().unwrap();
         let project = db::get_project(&conn, &ident_for_lookup)?;
         let doc = db::get_api_doc(&conn, &ident_for_lookup, &id_for_lookup)?;
+        let docs = db::list_api_docs(&conn, &ident_for_lookup, &db::ApiDocFilters::default())?;
         let theme = db::get_theme(&conn)?;
-        Ok((project, doc, theme))
+        Ok((project, doc, docs, theme))
     })
     .await??;
 
@@ -6422,7 +6530,7 @@ pub async fn api_doc_detail_page(
         .into_iter()
         .map(|chunk| {
             format!(
-                r#"<section class="nd-card nd-mt-md">
+                r#"<section class="nd-card nd-mb-md documentation-content">
   <div class="nd-card-header"><strong>{chunk_type}</strong></div>
   <div class="nd-card-body"><pre><code>{text}</code></pre></div>
 </section>"#,
@@ -6432,44 +6540,66 @@ pub async fn api_doc_detail_page(
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let chunks = if chunks.is_empty() {
+        r#"<p class="nd-text-muted nd-text-sm">No indexed sections are available for this page yet.</p>"#.to_string()
+    } else {
+        chunks
+    };
     let content_json =
         serde_json::to_string_pretty(&doc.content).unwrap_or_else(|_| doc.content.to_string());
     let source_ref = doc.source_ref.as_deref().unwrap_or("");
     let version = doc.version.as_deref().unwrap_or("");
     let summary = doc.summary.as_deref().unwrap_or("");
     let ident_attr = he(&project.ident);
+    let nav = documentation_nav(&project.ident, &docs, Some(&doc.id));
 
     let content = format!(
         r#"  <div class="nd-flex nd-gap-md nd-mb-md">
-    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/api-docs">Back to project docs</a>
-    <a class="nd-btn-secondary nd-btn-sm" href="/api-docs">All API docs</a>
+    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/documentation">Back to wiki</a>
+    <a class="nd-btn-secondary nd-btn-sm" href="/documentation">All documentation</a>
   </div>
 
-  <section class="nd-card">
-    <div class="nd-card-header"><strong>{title}</strong></div>
-    <div class="nd-card-body">
-      <div class="nd-row nd-gap-md">
-        <div class="nd-col-3"><div class="nd-text-xs nd-text-muted">App</div><strong>{app}</strong></div>
-        <div class="nd-col-3"><div class="nd-text-xs nd-text-muted">Kind</div><strong>{kind}</strong></div>
-        <div class="nd-col-3"><div class="nd-text-xs nd-text-muted">Source</div><strong>{source}</strong></div>
-        <div class="nd-col-3"><div class="nd-text-xs nd-text-muted">Version</div><strong>{version}</strong></div>
-      </div>
-      <p class="nd-text-muted nd-mt-md">{summary}</p>
-      <div class="nd-mt-md">{labels}</div>
-      <div class="nd-text-xs nd-text-muted nd-mt-md">Source ref: {source_ref}</div>
-    </div>
-  </section>
+  <div class="nd-row">
+    <aside class="nd-col-3">
+      <section class="nd-card">
+        <div class="nd-card-header"><strong>Wiki Navigation</strong></div>
+        <div class="nd-card-body">{nav}</div>
+      </section>
+    </aside>
 
-  <section class="nd-card nd-mt-lg">
-    <div class="nd-card-header"><strong>Stored agent context</strong></div>
-    <div class="nd-card-body"><pre><code>{content_json}</code></pre></div>
-  </section>
+    <main class="nd-col-6">
+      <section class="nd-card nd-mb-lg">
+        <div class="nd-card-header"><strong>{title}</strong></div>
+        <div class="nd-card-body">
+          <p class="nd-text-muted documentation-summary">{summary}</p>
+          <div class="nd-mt-md">{labels}</div>
+        </div>
+      </section>
 
-  <section class="nd-mt-lg">
-    <h2 class="nd-text-lg nd-mb-sm">RAG chunks</h2>
-    {chunks}
-  </section>"#,
+      {chunks}
+
+      <section class="nd-card nd-mt-lg documentation-content">
+        <div class="nd-card-header"><strong>Source Record</strong></div>
+        <div class="nd-card-body"><pre><code>{content_json}</code></pre></div>
+      </section>
+    </main>
+
+    <aside class="nd-col-3">
+      <section class="nd-card">
+        <div class="nd-card-header"><strong>Page Info</strong></div>
+        <div class="nd-card-body">
+          <div class="nd-text-xs nd-text-muted">App</div><strong>{app}</strong>
+          <div class="nd-text-xs nd-text-muted nd-mt-sm">Kind</div><strong>{kind}</strong>
+          <div class="nd-text-xs nd-text-muted nd-mt-sm">Source</div><strong>{source}</strong>
+          <div class="nd-text-xs nd-text-muted nd-mt-sm">Version</div><strong>{version}</strong>
+          <div class="nd-text-xs nd-text-muted nd-mt-sm">Source ref</div><div class="nd-text-sm">{source_ref}</div>
+          <div class="nd-text-xs nd-text-muted nd-mt-sm">Record ID</div><code>{artifact_id}</code>
+        </div>
+      </section>
+    </aside>
+  </div>"#,
         ident = ident_attr,
+        nav = nav,
         title = he(&doc.title),
         app = he(&doc.app),
         kind = he(&doc.kind),
@@ -6478,6 +6608,7 @@ pub async fn api_doc_detail_page(
         summary = he(summary),
         labels = labels,
         source_ref = he(source_ref),
+        artifact_id = he(&doc.artifact_id),
         content_json = he(&content_json),
         chunks = chunks,
     );
@@ -6485,8 +6616,12 @@ pub async fn api_doc_detail_page(
     let page_title = format!("{} - {}", doc.app, project.ident);
     let html = format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
-        head = control_panel_head("agent-gateway - API doc", &theme, ""),
-        open = control_panel_open(&page_title, "api-docs"),
+        head = control_panel_head(
+            "agent-gateway - Documentation",
+            &theme,
+            documentation_head_extra()
+        ),
+        open = control_panel_open(&page_title, "documentation"),
         content = content,
         close = control_panel_close(&state.api_key),
     );
@@ -6514,7 +6649,7 @@ pub async fn artifacts_index_page(State(state): State<AppState>) -> Result<Html<
   <td>{api_docs}</td>
   <td>{tasks}</td>
   <td>{messages}</td>
-  <td><a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/artifacts">Open workspace</a></td>
+  <td><a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/artifacts">Open records</a></td>
 </tr>"#,
                     ident = he(&project.ident),
                     api_docs = project.api_doc_count,
@@ -6530,10 +6665,10 @@ pub async fn artifacts_index_page(State(state): State<AppState>) -> Result<Html<
         r#"  <div class="nd-alert nd-mb-md">{auth_signal}</div>
 
   <section class="nd-card">
-    <div class="nd-card-header"><strong>Artifact Workspaces</strong></div>
+    <div class="nd-card-header"><strong>Advanced Record Workspaces</strong></div>
     <div class="nd-card-body nd-p-0">
       <table class="nd-table nd-table-hover">
-        <thead><tr><th>Project</th><th>API docs</th><th>Tasks</th><th>Messages</th><th></th></tr></thead>
+        <thead><tr><th>Project</th><th>Documentation</th><th>Tasks</th><th>Messages</th><th></th></tr></thead>
         <tbody>{rows}</tbody>
       </table>
     </div>
@@ -6544,8 +6679,8 @@ pub async fn artifacts_index_page(State(state): State<AppState>) -> Result<Html<
 
     let html = format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
-        head = control_panel_head("agent-gateway - Artifacts", &theme, ""),
-        open = control_panel_open("Artifacts", "artifacts"),
+        head = control_panel_head("agent-gateway - Advanced records", &theme, ""),
+        open = control_panel_open("Advanced Records", "documentation"),
         content = content,
         close = control_panel_close(&state.api_key),
     );
@@ -6602,7 +6737,7 @@ pub async fn artifact_workspace_page(
     })?;
     let ident_attr = he(&project.ident);
     let artifacts_rows = if artifacts.is_empty() {
-        r#"<tr><td colspan="8" class="nd-text-center nd-text-muted">No artifacts match these filters.</td></tr>"#.to_string()
+        r#"<tr><td colspan="8" class="nd-text-center nd-text-muted">No records match these filters.</td></tr>"#.to_string()
     } else {
         artifacts
             .iter()
@@ -6646,7 +6781,7 @@ pub async fn artifact_workspace_page(
         docs.iter()
             .map(|doc| {
                 format!(
-                    r#"<tr><td><a href="/projects/{ident}/api-docs/{id}">{app}</a></td><td>{kind}</td><td>{subkind}</td><td>{version}</td><td>{summary}</td></tr>"#,
+                    r#"<tr><td><a href="/projects/{ident}/documentation/{id}">{app}</a></td><td>{kind}</td><td>{subkind}</td><td>{version}</td><td>{summary}</td></tr>"#,
                     ident = ident_attr,
                     id = he(&doc.id),
                     app = he(&doc.app),
@@ -6662,18 +6797,18 @@ pub async fn artifact_workspace_page(
     let filter_value = |value: &Option<String>| he(value.as_deref().unwrap_or(""));
     let content = format!(
         r#"  <div class="nd-flex nd-gap-md nd-mb-md">
-    <a class="nd-btn-secondary nd-btn-sm" href="/artifacts">All projects</a>
-    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/api-docs">API docs</a>
+    <a class="nd-btn-secondary nd-btn-sm" href="/documentation">Documentation</a>
+    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/documentation">Project wiki</a>
     <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/tasks">Tasks</a>
   </div>
 
   <div class="nd-alert nd-mb-md">{auth_signal}</div>
 
   <section class="nd-card">
-    <div class="nd-card-header"><strong>Artifact filters</strong></div>
+    <div class="nd-card-header"><strong>Record filters</strong></div>
     <div class="nd-card-body">
       <form class="nd-grid nd-gap-sm" method="get" action="/projects/{ident}/artifacts">
-        <input class="nd-input" name="q" placeholder="Search artifacts, bodies, contributions, links, docs" value="{q}">
+        <input class="nd-input" name="q" placeholder="Search records, bodies, contributions, links, docs" value="{q}">
         <input class="nd-input" name="kind" placeholder="kind: spec, design_review, documentation" value="{kind}">
         <input class="nd-input" name="status" placeholder="lifecycle status" value="{status}">
         <input class="nd-input" name="label" placeholder="label" value="{label}">
@@ -6684,7 +6819,7 @@ pub async fn artifact_workspace_page(
   </section>
 
   <section class="nd-card nd-mt-lg">
-    <div class="nd-card-header"><strong>Artifacts</strong></div>
+    <div class="nd-card-header"><strong>Advanced Records</strong></div>
     <div class="nd-card-body nd-p-0">
       <table class="nd-table nd-table-hover">
         <thead><tr><th>Artifact</th><th>Kind</th><th>Lifecycle</th><th>Review</th><th>Implementation</th><th>Labels</th><th>Current</th><th>Accepted</th></tr></thead>
@@ -6694,7 +6829,7 @@ pub async fn artifact_workspace_page(
   </section>
 
   <section class="nd-card nd-mt-lg">
-    <div class="nd-card-header"><strong>Documentation browser</strong></div>
+    <div class="nd-card-header"><strong>Documentation Pages</strong></div>
     <div class="nd-card-body nd-p-0">
       <table class="nd-table nd-table-hover">
         <thead><tr><th>App</th><th>Legacy kind</th><th>Subkind</th><th>Version</th><th>Summary</th></tr></thead>
@@ -6713,11 +6848,11 @@ pub async fn artifact_workspace_page(
         docs_rows = docs_rows,
     );
 
-    let page_title = format!("Artifacts - {}", project.ident);
+    let page_title = format!("Advanced records - {}", project.ident);
     let html = format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
-        head = control_panel_head("agent-gateway - Artifacts", &theme, ""),
-        open = control_panel_open(&page_title, "artifacts"),
+        head = control_panel_head("agent-gateway - Advanced records", &theme, ""),
+        open = control_panel_open(&page_title, "documentation"),
         content = content,
         close = control_panel_close(&state.api_key),
     );
@@ -7006,8 +7141,8 @@ pub async fn artifact_detail_page(
 
     let content = format!(
         r#"  <div class="nd-flex nd-gap-md nd-mb-md">
-    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/artifacts">Back to artifacts</a>
-    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/api-docs">API docs</a>
+    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/artifacts">Back to records</a>
+    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/documentation">Documentation</a>
     <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/tasks">Tasks</a>
   </div>
 
@@ -7064,11 +7199,11 @@ pub async fn artifact_detail_page(
         link_rows = empty_table_rows(link_rows, 5),
     );
 
-    let page_title = format!("Artifact - {}", artifact.title);
+    let page_title = format!("Record - {}", artifact.title);
     let html = format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
-        head = control_panel_head("agent-gateway - Artifact", &theme, ""),
-        open = control_panel_open(&page_title, "artifacts"),
+        head = control_panel_head("agent-gateway - Advanced record", &theme, ""),
+        open = control_panel_open(&page_title, "documentation"),
         content = content,
         close = control_panel_close(&state.api_key),
     );
@@ -9443,14 +9578,15 @@ fn control_panel_head(title: &str, theme: &str, extra: &str) -> String {
 /// Open the control-panel body up to the start of `<main class="app-content">`.
 ///
 /// Emits `<body class="app-page">`, the app layout wrapper, the sidebar (brand
-/// plus the Main section with Dashboard, Tasks, Patterns, Skills, Commands,
-/// Agents, and Settings links), and the header (hamburger toggle, page title,
-/// theme toggle).
+/// plus the Main section with Dashboard, Documentation, Tasks, Patterns,
+/// Skills, Commands, Agents, and Settings links), and the header (hamburger
+/// toggle, page title, theme toggle).
 ///
 /// * `page_title` — rendered inside the header's `<h1>`.
 /// * `active` — which sidebar link receives `class="nd-active"`. Accepts
-///   `"dashboard"`, `"tasks"`, `"patterns"`, `"skills"`, `"commands"`,
-///   `"agents"`, or `"settings"`. Any other value leaves all links inactive.
+///   `"dashboard"`, `"documentation"`, `"tasks"`, `"patterns"`, `"skills"`,
+///   `"commands"`, `"agents"`, or `"settings"`. The legacy `"api-docs"`
+///   value maps to Documentation for compatibility.
 fn control_panel_open(page_title: &str, active: &str) -> String {
     let cls = |key: &str| -> &'static str {
         if key == active {
@@ -9458,6 +9594,11 @@ fn control_panel_open(page_title: &str, active: &str) -> String {
         } else {
             ""
         }
+    };
+    let documentation_cls = if matches!(active, "documentation" | "api-docs") {
+        r#" class="nd-active""#
+    } else {
+        ""
     };
     format!(
         r#"<body class="app-page">
@@ -9467,8 +9608,7 @@ fn control_panel_open(page_title: &str, active: &str) -> String {
     <p class="nd-nav-section">Main</p>
     <ul class="nd-nav-menu">
       <li><a href="/"{dashboard}>Dashboard</a></li>
-      <li><a href="/api-docs"{api_docs}>API Docs</a></li>
-      <li><a href="/artifacts"{artifacts}>Artifacts</a></li>
+      <li><a href="/documentation"{documentation}>Documentation</a></li>
       <li><a href="/memories"{memories}>Memories</a></li>
       <li><a href="/tasks"{tasks}>Tasks</a></li>
       <li><a href="/patterns"{patterns}>Patterns</a></li>
@@ -9490,8 +9630,7 @@ fn control_panel_open(page_title: &str, active: &str) -> String {
     </header>
     <main class="app-content">"#,
         dashboard = cls("dashboard"),
-        api_docs = cls("api-docs"),
-        artifacts = cls("artifacts"),
+        documentation = documentation_cls,
         memories = cls("memories"),
         tasks = cls("tasks"),
         patterns = cls("patterns"),
@@ -10031,17 +10170,20 @@ mod tests {
     }
 
     #[test]
-    fn control_panel_nav_exposes_api_docs() {
-        let html = control_panel_open("API Docs", "api-docs");
+    fn control_panel_nav_exposes_documentation() {
+        let html = control_panel_open("Documentation", "documentation");
 
-        assert!(html.contains(r#"<li><a href="/api-docs" class="nd-active">API Docs</a></li>"#));
+        assert!(html
+            .contains(r#"<li><a href="/documentation" class="nd-active">Documentation</a></li>"#));
     }
 
     #[test]
-    fn control_panel_nav_exposes_artifacts() {
-        let html = control_panel_open("Artifacts", "artifacts");
+    fn control_panel_nav_maps_legacy_api_docs_to_documentation() {
+        let html = control_panel_open("API Docs", "api-docs");
 
-        assert!(html.contains(r#"<li><a href="/artifacts" class="nd-active">Artifacts</a></li>"#));
+        assert!(html
+            .contains(r#"<li><a href="/documentation" class="nd-active">Documentation</a></li>"#));
+        assert!(!html.contains(r#">Artifacts</a>"#));
     }
 
     #[test]
@@ -10287,8 +10429,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(list.0.contains("Artifact filters"));
-        assert!(list.0.contains("Documentation browser"));
+        assert!(list.0.contains("Record filters"));
+        assert!(list.0.contains("Documentation Pages"));
         assert!(list.0.contains(&artifact_id));
 
         let detail = artifact_detail_page(
@@ -10339,7 +10481,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(page.0.contains("Artifact filters"));
+        assert!(page.0.contains("Record filters"));
         assert!(page.0.contains("gateway-smoke"));
     }
 

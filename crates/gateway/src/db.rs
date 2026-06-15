@@ -6818,6 +6818,9 @@ pub struct ProjectStats {
     pub room_id: String,
     pub total_messages: i64,
     pub unread_count: i64,
+    pub todo_count: i64,
+    pub in_progress_count: i64,
+    pub done_count: i64,
     pub api_doc_count: i64,
     pub memory_count: i64,
     pub repo_provider: Option<String>,
@@ -6846,12 +6849,12 @@ pub struct DashboardData {
     pub projects: Vec<ProjectStats>,
 }
 
-/// Return per-project stats ordered by most-recently-created first.
+/// Return per-project stats ordered by the work that needs attention first.
 ///
 /// Shared by the HTML dashboard (via [`get_dashboard_data`]) and the JSON
 /// helper endpoint the task picker binds to. Each row contains the project's
 /// identity, its channel, the originating room id, the total message count,
-/// and the number of unconfirmed user-sourced messages.
+/// active task counts, and the number of unconfirmed user-sourced messages.
 pub fn list_project_stats(conn: &Connection) -> Result<Vec<ProjectStats>> {
     let mut stmt = conn.prepare_cached(
         "SELECT p.ident, p.channel_name, p.room_id,
@@ -6860,6 +6863,15 @@ pub fn list_project_stats(conn: &Connection) -> Result<Vec<ProjectStats>> {
                  WHERE m2.project_ident = p.ident
                    AND m2.confirmed_at IS NULL
                    AND m2.source = 'user'),
+                (SELECT COUNT(*) FROM tasks t
+                 WHERE t.project_ident = p.ident
+                   AND t.status = 'todo'),
+                (SELECT COUNT(*) FROM tasks t
+                 WHERE t.project_ident = p.ident
+                   AND t.status = 'in_progress'),
+                (SELECT COUNT(*) FROM tasks t
+                 WHERE t.project_ident = p.ident
+                   AND t.status = 'done'),
                 (SELECT COUNT(*) FROM api_docs d
                  WHERE d.project_ident = p.ident),
                 (SELECT COUNT(*) FROM gateway_memories gm
@@ -6870,7 +6882,18 @@ pub fn list_project_stats(conn: &Connection) -> Result<Vec<ProjectStats>> {
          LEFT JOIN messages m ON m.project_ident = p.ident
          WHERE p.ident != '__global__'
          GROUP BY p.ident
-         ORDER BY p.created_at DESC",
+         ORDER BY
+            (SELECT COUNT(*) FROM tasks t
+             WHERE t.project_ident = p.ident
+               AND t.status = 'in_progress') DESC,
+            (SELECT COUNT(*) FROM tasks t
+             WHERE t.project_ident = p.ident
+               AND t.status = 'todo') DESC,
+            (SELECT COUNT(*) FROM messages m2
+             WHERE m2.project_ident = p.ident
+               AND m2.confirmed_at IS NULL
+               AND m2.source = 'user') DESC,
+            p.created_at DESC",
     )?;
     let projects = stmt
         .query_map([], |r| {
@@ -6880,12 +6903,15 @@ pub fn list_project_stats(conn: &Connection) -> Result<Vec<ProjectStats>> {
                 room_id: r.get(2)?,
                 total_messages: r.get(3)?,
                 unread_count: r.get(4)?,
-                api_doc_count: r.get(5)?,
-                memory_count: r.get(6)?,
-                repo_provider: r.get(7)?,
-                repo_namespace: r.get(8)?,
-                repo_name: r.get(9)?,
-                repo_full_name: r.get(10)?,
+                todo_count: r.get(5)?,
+                in_progress_count: r.get(6)?,
+                done_count: r.get(7)?,
+                api_doc_count: r.get(8)?,
+                memory_count: r.get(9)?,
+                repo_provider: r.get(10)?,
+                repo_namespace: r.get(11)?,
+                repo_name: r.get(12)?,
+                repo_full_name: r.get(13)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -6903,8 +6929,8 @@ pub fn list_project_task_stats(conn: &Connection) -> Result<Vec<ProjectTaskStats
          WHERE p.ident != '__global__'
          GROUP BY p.ident
          ORDER BY
-            COALESCE(SUM(CASE WHEN t.status = 'todo' THEN 1 ELSE 0 END), 0) DESC,
             COALESCE(SUM(CASE WHEN t.status = 'in_progress' THEN 1 ELSE 0 END), 0) DESC,
+            COALESCE(SUM(CASE WHEN t.status = 'todo' THEN 1 ELSE 0 END), 0) DESC,
             COALESCE(SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END), 0) DESC,
             p.ident ASC",
     )?;
@@ -9929,7 +9955,7 @@ mod tests {
 
         let stats = list_project_task_stats(&conn).unwrap();
         let idents = stats.into_iter().map(|s| s.ident).collect::<Vec<_>>();
-        assert_eq!(idents, vec!["bravo", "alpha", "charlie"]);
+        assert_eq!(idents, vec!["alpha", "bravo", "charlie"]);
         assert_eq!(bravo_todo_1.status, "todo");
         assert_eq!(bravo_todo_2.status, "todo");
     }

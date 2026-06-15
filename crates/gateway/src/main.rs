@@ -641,6 +641,7 @@ async fn main() -> Result<()> {
     // old /manage tab hub.
     let app = Router::new()
         .route("/", get(routes::dashboard))
+        .route("/documentation", get(routes::api_docs_index_page))
         .route("/api-docs", get(routes::api_docs_index_page))
         .route("/artifacts", get(routes::artifacts_index_page))
         .route("/memories", get(routes::memories_index_page))
@@ -654,7 +655,15 @@ async fn main() -> Result<()> {
             "/projects/{ident}/artifacts/{artifact_id}",
             get(routes::artifact_detail_page),
         )
+        .route(
+            "/projects/{ident}/documentation",
+            get(routes::api_docs_page),
+        )
         .route("/projects/{ident}/api-docs", get(routes::api_docs_page))
+        .route(
+            "/projects/{ident}/documentation/{id}",
+            get(routes::api_doc_detail_page),
+        )
         .route(
             "/projects/{ident}/api-docs/{id}",
             get(routes::api_doc_detail_page),
