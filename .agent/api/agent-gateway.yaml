@@ -4,11 +4,13 @@ summary: Agent coordination gateway for project-scoped comms, task boards, proje
 kind: agent_context
 source_format: agent_context
 source_ref: .agent/api/agent-gateway.yaml
-version: v1.12.0
+version: v1.13.0
 labels:
   - gateway
   - agents
   - api-docs
+  - global-docs
+  - hierarchy
   - artifacts
   - tasks
   - memories
@@ -79,6 +81,8 @@ content:
         - Publish with agent-tools docs publish --file PATH or POST /v1/projects/:ident/api-docs.
         - Re-publishing the same app + title + kind updates one logical documentation item and creates a new immutable artifact version instead of creating another visible wiki page.
         - Use a distinct title, app, or kind when the content is a separate documentation page rather than a new version of an existing page.
+        - Place pages in the wiki hierarchy with optional parent_id, slug, and sort_order fields.
+        - Mark owner-project pages or folders globally visible with an explicit positive global_rank such as 1, 2, or 3; global_descendants=true makes descendants inherit that configured rank.
         - Retrieve RAG chunks with GET /v1/projects/:ident/api-docs/chunks.
     - name: Sync durable memories across all scopes
       steps:
@@ -111,8 +115,12 @@ content:
       steps:
         - "Continue using docs-first commands for API context: agent-tools docs validate, publish, search, and chunks."
         - Gateway stores docs as one logical api_docs record per project/app/title/kind plus documentation artifacts and immutable artifact_versions with retained API context bodies.
-        - GET /v1/projects/:ident/api-docs returns one latest logical document per project/app/title/kind, including for legacy duplicate rows that predate logical upsert behavior.
-        - Retrieve chunks with GET /v1/projects/:ident/api-docs/chunks. Default retrieval is current-version oriented and returns chunks for the latest logical document only; use include_history=true when historical immutable chunks are needed.
+        - GET /v1/projects/:ident/api-docs returns local project docs plus globally visible docs from other owner projects, one latest logical document per owner project/app/title/kind, including for legacy duplicate rows that predate logical upsert behavior.
+        - Global results are selected only from configured global_rank visibility or inherited global_descendants visibility; there is no hardcoded owner/project precedence.
+        - Result metadata includes scope, owner_project, wiki_path, global_rank, direct_global_rank, parent_id, slug, sort_order, and global_descendants.
+        - Retrieve the wiki tree with GET /v1/projects/:ident/api-docs/hierarchy. The tree includes local pages and effective global pages visible to the requesting project.
+        - Retrieve chunks with GET /v1/projects/:ident/api-docs/chunks. Default retrieval is current-version oriented and returns chunks for visible latest logical docs only; use include_history=true when historical immutable chunks are needed.
+        - Chunk responses include scope, owner_project, wiki_path, and global_rank so agents can attribute global context correctly.
         - "Use artifact routes when the broader graph is needed: links to specs, tasks, patterns, repository refs, comments, versions, and stale/partial chunk status."
     - name: Export artifact-backed docs to source files
       steps:
@@ -201,15 +209,18 @@ content:
       intent: Update delegation completion state for a delegated task.
     - method: GET
       path: /v1/projects/:ident/api-docs
-      intent: List agent API context summaries for a project.
+      intent: List local and globally visible agent API context summaries for a project.
       query:
         q: Search app, title, summary, metadata, labels, and content JSON.
         app: Exact app filter.
         label: Label filter.
         kind: Kind filter, usually agent_context.
+        scope: Optional local, global, or all filter. Omit or use all for both local and global visible docs.
       notes:
-        - Results are logical documentation items, deduplicated by project, app, title, and kind.
+        - Results are logical documentation items, deduplicated by owner project, app, title, and kind.
         - Repeated publishes with the same app, title, and kind appear once and resolve to the latest record/version.
+        - Local project docs are returned with scope=local. Docs from other projects are returned only when global_rank is configured directly or inherited from a global_descendants ancestor and have scope=global.
+        - Global docs are ordered by configured global_rank and relevance; no owner or project name has built-in precedence.
     - method: POST
       path: /v1/projects/:ident/api-docs
       intent: Publish a docs-first agent API context document.
@@ -223,23 +234,46 @@ content:
         source_ref: Optional source path or external reference.
         version: Optional version or source version.
         labels: Optional labels array or comma-separated string.
+        parent_id: Optional wiki parent page/folder id in the owner project. Null clears placement when explicitly supplied.
+        slug: Optional wiki path segment. Null or omission derives it from the title on first create.
+        sort_order: Optional integer ordering within a parent.
+        global_rank: Optional positive integer global visibility rank. Null clears global visibility when explicitly supplied.
+        global_descendants: Optional boolean; true lets descendants inherit the page/folder global_rank.
         author: Optional author.
       notes:
         - The publish key is project_ident + app + title + kind.
         - Publishing an existing key updates the stable api_doc id, creates a new artifact_version, and preserves prior versions for history retrieval.
+        - Omitted hierarchy/global fields on an existing logical document preserve current placement and visibility.
         - Separate documentation pages must use distinct titles, apps, or kinds.
     - method: GET
+      path: /v1/projects/:ident/api-docs/hierarchy
+      intent: Return a navigable documentation tree for local project docs plus globally visible docs.
+      query:
+        q: Optional search filter applied to visible pages.
+        app: Exact app filter.
+        label: Label filter.
+        kind: Kind filter.
+        scope: Optional local, global, or all filter.
+      notes:
+        - Nodes include node_type, breadcrumbs, children, scope, owner_project, wiki_path, global_rank, direct_global_rank, parent_id, slug, sort_order, labels, and artifact version metadata.
+        - Current node_type values are page for stored documentation pages; the field is included so clients can remain compatible with future folder/section nodes.
+        - A descendant of a global_descendants page is globally visible with the ancestor's rank unless it has its own direct global_rank.
+    - method: GET
       path: /v1/projects/:ident/api-docs/chunks
-      intent: Return RAG-ready chunks generated from stored agent API context.
+      intent: Return RAG-ready chunks generated from visible local and global agent API context.
       notes:
         - Default chunk retrieval returns current chunks for the latest logical docs only.
         - include_history=true includes superseded artifact chunks for version/history-aware retrieval.
+        - Chunks include scope, owner_project, wiki_path, and global_rank metadata.
     - method: GET
       path: /v1/projects/:ident/api-docs/:id
-      intent: Fetch one full agent API context document.
+      intent: Fetch one full agent API context document, including globally visible docs by id.
     - method: PATCH
       path: /v1/projects/:ident/api-docs/:id
-      intent: Update API context metadata or content. Nullable fields can clear summary, source_ref, or version.
+      intent: Update an owner-project API context document's metadata, hierarchy placement, global visibility, or content.
+      notes:
+        - Nullable fields can clear summary, source_ref, version, parent_id, slug, or global_rank.
+        - global_rank must be a positive integer when set; UI should present explicit choices such as Global 1, Global 2, and Global 3.
     - method: DELETE
       path: /v1/projects/:ident/api-docs/:id
       intent: Delete one API context document.
@@ -524,6 +558,11 @@ content:
         title: Human readable title. Together with app and kind, this identifies the logical documentation page.
         content: Structured agent-native context JSON.
         labels: Array or comma-separated string.
+        parent_id: Optional owner-project parent page/folder id.
+        slug: Optional wiki path segment.
+        sort_order: Optional integer ordering within parent.
+        global_rank: Optional positive integer rank; lower values are higher-priority global docs.
+        global_descendants: Optional boolean for descendant inheritance.
       identity:
         logical_key:
           - project_ident
@@ -531,6 +570,13 @@ content:
           - title
           - kind
         behavior: Re-publishing the same logical key updates the same api_doc id and appends an immutable artifact_version.
+      response_metadata:
+        scope: local or global relative to the requesting project.
+        owner_project: Project that owns the page.
+        wiki_path: Slash-prefixed path from wiki hierarchy slugs.
+        breadcrumbs: Hierarchy path segments in tree responses.
+        global_rank: Effective global rank after inheritance.
+        direct_global_rank: Rank configured directly on the page, when any.
     artifact_mutation_envelope:
       headers:
         Authorization: Bearer token required for /v1 API routes.

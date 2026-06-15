@@ -4378,6 +4378,7 @@ pub struct ListApiDocsQuery {
     pub app: Option<String>,
     pub label: Option<String>,
     pub kind: Option<String>,
+    pub scope: Option<String>,
     #[serde(default)]
     pub include_history: bool,
     #[serde(default)]
@@ -4402,6 +4403,11 @@ pub struct CreateApiDocRequest {
     pub version: Option<String>,
     #[serde(default)]
     pub labels: Value,
+    pub parent_id: Option<Value>,
+    pub slug: Option<Value>,
+    pub sort_order: Option<i64>,
+    pub global_rank: Option<Value>,
+    pub global_descendants: Option<bool>,
     pub content: Value,
     pub author: Option<String>,
 }
@@ -4416,6 +4422,11 @@ pub struct UpdateApiDocRequest {
     pub source_ref: Option<Value>,
     pub version: Option<Value>,
     pub labels: Option<Value>,
+    pub parent_id: Option<Value>,
+    pub slug: Option<Value>,
+    pub sort_order: Option<i64>,
+    pub global_rank: Option<Value>,
+    pub global_descendants: Option<Value>,
     pub content: Option<Value>,
 }
 
@@ -4446,6 +4457,65 @@ fn optional_string_field(field: &str, value: Value) -> Result<Option<String>> {
         _ => Err(AppError(
             StatusCode::BAD_REQUEST,
             format!("{field} must be a string or null"),
+        )),
+    }
+}
+
+fn optional_positive_i64_field(field: &str, value: Value) -> Result<Option<i64>> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Number(n) => match n.as_i64().filter(|value| *value > 0) {
+            Some(value) => Ok(Some(value)),
+            None => Err(AppError(
+                StatusCode::BAD_REQUEST,
+                format!("{field} must be a positive integer or null"),
+            )),
+        },
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            trimmed
+                .parse::<i64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .map(Some)
+                .ok_or_else(|| {
+                    AppError(
+                        StatusCode::BAD_REQUEST,
+                        format!("{field} must be a positive integer or null"),
+                    )
+                })
+        }
+        _ => Err(AppError(
+            StatusCode::BAD_REQUEST,
+            format!("{field} must be a positive integer or null"),
+        )),
+    }
+}
+
+fn optional_bool_field(field: &str, value: Value) -> Result<Option<bool>> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Bool(value) => Ok(Some(value)),
+        Value::String(s) => {
+            let trimmed = s.trim().to_ascii_lowercase();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            match trimmed.as_str() {
+                "true" => Ok(Some(true)),
+                "false" => Ok(Some(false)),
+                _ => Err(AppError(
+                    StatusCode::BAD_REQUEST,
+                    format!("{field} must be true, false, or null"),
+                )),
+            }
+        }
+        _ => Err(AppError(
+            StatusCode::BAD_REQUEST,
+            format!("{field} must be true, false, or null"),
         )),
     }
 }
@@ -4567,6 +4637,7 @@ pub async fn list_api_docs_handler(
             app: q.app.as_deref(),
             label: q.label.as_deref(),
             kind: q.kind.as_deref(),
+            scope: q.scope.as_deref(),
         };
         let docs = db::list_api_docs(&conn, &ident, &filters)?;
         Ok((true, docs))
@@ -4579,6 +4650,37 @@ pub async fn list_api_docs_handler(
         ));
     }
     Ok(Json(docs))
+}
+
+pub async fn api_doc_hierarchy_handler(
+    State(state): State<AppState>,
+    Path(ident): Path<String>,
+    Query(q): Query<ListApiDocsQuery>,
+) -> Result<Json<Vec<db::ApiDocHierarchyNode>>> {
+    let db = state.db.clone();
+    let (project_exists, nodes) = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        if db::get_project(&conn, &ident)?.is_none() {
+            return Ok::<_, anyhow::Error>((false, Vec::new()));
+        }
+        let filters = db::ApiDocFilters {
+            query: q.q.as_deref(),
+            app: q.app.as_deref(),
+            label: q.label.as_deref(),
+            kind: q.kind.as_deref(),
+            scope: q.scope.as_deref(),
+        };
+        let nodes = db::api_doc_hierarchy(&conn, &ident, &filters)?;
+        Ok((true, nodes))
+    })
+    .await??;
+    if !project_exists {
+        return Err(AppError(
+            StatusCode::NOT_FOUND,
+            "project not found".to_string(),
+        ));
+    }
+    Ok(Json(nodes))
 }
 
 pub async fn create_api_doc_handler(
@@ -4600,6 +4702,18 @@ pub async fn create_api_doc_handler(
         ));
     }
     let labels = decode_labels_field("labels", Some(req.labels))?;
+    let parent_id = match req.parent_id {
+        Some(value) => Some(optional_string_field("parent_id", value)?),
+        None => None,
+    };
+    let slug = match req.slug {
+        Some(value) => Some(optional_string_field("slug", value)?),
+        None => None,
+    };
+    let global_rank = match req.global_rank {
+        Some(value) => Some(optional_positive_i64_field("global_rank", value)?),
+        None => None,
+    };
     let author = resolve_identity(req.author, &headers);
     let db = state.db.clone();
     let doc = spawn_blocking(move || {
@@ -4631,6 +4745,15 @@ pub async fn create_api_doc_handler(
                     .map(str::trim)
                     .filter(|s| !s.is_empty()),
                 labels: &labels,
+                parent_id: parent_id
+                    .as_ref()
+                    .map(|value| value.as_deref().map(str::trim).filter(|s| !s.is_empty())),
+                slug: slug
+                    .as_ref()
+                    .map(|value| value.as_deref().map(str::trim).filter(|s| !s.is_empty())),
+                sort_order: req.sort_order,
+                global_rank,
+                global_descendants: req.global_descendants,
                 content: &req.content,
                 author: &author,
             },
@@ -4693,6 +4816,22 @@ pub async fn update_api_doc_handler(
         Some(value) => Some(optional_string_field("version", value)?),
         None => None,
     };
+    let parent_id = match req.parent_id {
+        Some(value) => Some(optional_string_field("parent_id", value)?),
+        None => None,
+    };
+    let slug = match req.slug {
+        Some(value) => Some(optional_string_field("slug", value)?),
+        None => None,
+    };
+    let global_rank = match req.global_rank {
+        Some(value) => Some(optional_positive_i64_field("global_rank", value)?),
+        None => None,
+    };
+    let global_descendants = match req.global_descendants {
+        Some(value) => optional_bool_field("global_descendants", value)?,
+        None => None,
+    };
     let db = state.db.clone();
     let doc = spawn_blocking(move || {
         let conn = db.lock().unwrap();
@@ -4715,6 +4854,15 @@ pub async fn update_api_doc_handler(
                     .as_ref()
                     .map(|value| value.as_deref().map(str::trim).filter(|s| !s.is_empty())),
                 labels: labels.as_deref(),
+                parent_id: parent_id
+                    .as_ref()
+                    .map(|value| value.as_deref().map(str::trim).filter(|s| !s.is_empty())),
+                slug: slug
+                    .as_ref()
+                    .map(|value| value.as_deref().map(str::trim).filter(|s| !s.is_empty())),
+                sort_order: req.sort_order,
+                global_rank,
+                global_descendants,
                 content: req.content.as_ref(),
             },
         )
@@ -4780,6 +4928,7 @@ pub async fn list_api_doc_chunks_handler(
             app: q.app.as_deref(),
             label: q.label.as_deref(),
             kind: q.kind.as_deref(),
+            scope: q.scope.as_deref(),
         };
         let chunks = db::list_api_doc_chunks(&conn, &ident, &filters, q.include_history)?;
         Ok::<_, anyhow::Error>((true, chunks))
@@ -5867,42 +6016,282 @@ fn documentation_version_selector(
     )
 }
 
-fn documentation_nav(
+fn documentation_scope_filter_options(selected: &str) -> String {
+    [
+        ("all", "Project + Global"),
+        ("local", "Project docs"),
+        ("global", "Global docs"),
+    ]
+    .iter()
+    .map(|(value, label)| {
+        let selected_attr = if selected == *value { " selected" } else { "" };
+        format!(
+            r#"<option value="{value}"{selected_attr}>{label}</option>"#,
+            value = value,
+            label = label,
+            selected_attr = selected_attr
+        )
+    })
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
+fn documentation_rank_options(selected: Option<i64>) -> String {
+    let mut options = vec![format!(
+        r#"<option value=""{}>Local only</option>"#,
+        if selected.is_none() { " selected" } else { "" }
+    )];
+    let max_rank = selected.unwrap_or(0).max(9);
+    for rank in 1..=max_rank {
+        let selected_attr = if selected == Some(rank) {
+            " selected"
+        } else {
+            ""
+        };
+        options.push(format!(
+            r#"<option value="{rank}"{selected_attr}>Global {rank}</option>"#,
+            rank = rank,
+            selected_attr = selected_attr
+        ));
+    }
+    options.join("\n")
+}
+
+fn documentation_descendants_options(selected: bool) -> String {
+    let page_selected = if selected { "" } else { " selected" };
+    let descendants_selected = if selected { " selected" } else { "" };
+    format!(
+        r#"<option value="false"{page_selected}>Page only</option>
+<option value="true"{descendants_selected}>Page and descendants</option>"#,
+        page_selected = page_selected,
+        descendants_selected = descendants_selected,
+    )
+}
+
+fn documentation_scope_badges(
+    scope: &str,
+    global_rank: Option<i64>,
+    direct_global_rank: Option<i64>,
+    owner_project: &str,
+) -> String {
+    let mut badges = Vec::new();
+    if let Some(rank) = global_rank {
+        badges.push(format!(
+            r#"<span class="nd-badge nd-badge-sm">Global {}</span>"#,
+            rank
+        ));
+        if direct_global_rank.is_none() {
+            badges.push(r#"<span class="nd-badge nd-badge-sm">inherited</span>"#.to_string());
+        }
+    }
+    if scope == "global" || global_rank.is_some() {
+        badges.push(format!(
+            r#"<span class="nd-badge nd-badge-sm">owner {}</span>"#,
+            he(owner_project)
+        ));
+    }
+    badges.join(" ")
+}
+
+fn documentation_visibility_controls(
     project_ident: &str,
-    docs: &[db::ApiDocSummary],
-    current_doc_id: Option<&str>,
+    doc_id: &str,
+    owner_project: &str,
+    scope: &str,
+    direct_global_rank: Option<i64>,
+    global_descendants: bool,
+) -> String {
+    if owner_project != project_ident || scope == "global" {
+        return format!(
+            r#"<div class="documentation-readonly nd-text-xs nd-text-muted nd-mt-sm">Read-only global page from <strong>{owner}</strong></div>"#,
+            owner = he(owner_project)
+        );
+    }
+
+    format!(
+        r#"<form class="documentation-visibility-form nd-mt-md"
+      data-nd-action="PATCH /v1/projects/{ident}/api-docs/{doc_id}"
+      data-nd-success="reload">
+  <label>
+    <span class="nd-text-xs nd-text-muted">Global rank</span>
+    <select name="global_rank" aria-label="Global rank">
+      {rank_options}
+    </select>
+  </label>
+  <label>
+    <span class="nd-text-xs nd-text-muted">Apply to</span>
+    <select name="global_descendants" aria-label="Apply visibility to">
+      {descendants_options}
+    </select>
+  </label>
+  <button type="submit" class="nd-btn-primary nd-btn-sm">Save visibility</button>
+</form>"#,
+        ident = he(project_ident),
+        doc_id = he(doc_id),
+        rank_options = documentation_rank_options(direct_global_rank),
+        descendants_options = documentation_descendants_options(global_descendants),
+    )
+}
+
+fn documentation_page_card(project_ident: &str, doc: &db::ApiDocSummary) -> String {
+    let labels = if doc.labels.is_empty() {
+        String::new()
+    } else {
+        doc.labels
+            .iter()
+            .map(|label| format!(r#"<span class="nd-badge nd-badge-sm">{}</span>"#, he(label)))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let summary = doc.summary.as_deref().unwrap_or("");
+    let scope = documentation_scope_badges(
+        &doc.scope,
+        doc.global_rank,
+        doc.direct_global_rank,
+        &doc.owner_project,
+    );
+    let visibility = documentation_visibility_controls(
+        project_ident,
+        &doc.id,
+        &doc.owner_project,
+        &doc.scope,
+        doc.direct_global_rank,
+        doc.global_descendants,
+    );
+    format!(
+        r#"<article class="nd-card nd-mb-md">
+  <div class="nd-card-body">
+    <a class="nd-btn-ghost nd-text-left nd-w-full documentation-card-link" href="{href}">
+      <strong>{title}</strong>
+      <div class="nd-text-xs nd-text-muted">{app} / {kind} / {source} {version}</div>
+      <div class="nd-text-xs nd-text-muted">{path} {scope}</div>
+    </a>
+    <p class="nd-text-sm nd-text-muted documentation-summary">{summary}</p>
+    <div>{labels}</div>
+    {visibility}
+  </div>
+</article>"#,
+        href = he(&documentation_page_href(project_ident, &doc.id)),
+        title = he(&doc.title),
+        app = he(&doc.app),
+        kind = he(&doc.kind),
+        source = he(&doc.source_format),
+        version = he(doc.version.as_deref().unwrap_or("")),
+        path = he(&doc.wiki_path),
+        scope = scope,
+        labels = labels,
+        summary = he(summary),
+        visibility = visibility,
+    )
+}
+
+fn documentation_doc_group(
+    project_ident: &str,
+    title: &str,
+    docs: &[&db::ApiDocSummary],
 ) -> String {
     if docs.is_empty() {
+        return String::new();
+    }
+
+    let pages = docs
+        .iter()
+        .map(|doc| documentation_page_card(project_ident, doc))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        r#"<section class="documentation-doc-group nd-mb-lg">
+  <div class="documentation-group-heading nd-mb-sm">
+    <h3>{title}</h3>
+    <span class="nd-badge nd-badge-sm">{count} pages</span>
+  </div>
+  {pages}
+</section>"#,
+        title = he(title),
+        count = docs.len(),
+        pages = pages,
+    )
+}
+
+fn documentation_tree_nav(
+    project_ident: &str,
+    nodes: &[db::ApiDocHierarchyNode],
+    current_doc_id: Option<&str>,
+) -> String {
+    if nodes.is_empty() {
         return r#"<p class="nd-text-muted nd-text-sm">No documentation pages yet.</p>"#
             .to_string();
     }
 
-    let items = docs
+    format!(
+        r#"<ul class="documentation-tree">{items}</ul>"#,
+        items = documentation_tree_items(project_ident, nodes, current_doc_id)
+    )
+}
+
+fn documentation_tree_items(
+    project_ident: &str,
+    nodes: &[db::ApiDocHierarchyNode],
+    current_doc_id: Option<&str>,
+) -> String {
+    nodes
         .iter()
-        .map(|doc| {
-            let active = if current_doc_id == Some(doc.id.as_str()) {
+        .map(|node| {
+            let active = if current_doc_id == Some(node.id.as_str()) {
                 " nd-active"
             } else {
                 ""
             };
+            let children = if node.children.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    r#"<ul>{}</ul>"#,
+                    documentation_tree_items(project_ident, &node.children, current_doc_id)
+                )
+            };
+            let badges = documentation_scope_badges(
+                &node.scope,
+                node.global_rank,
+                node.direct_global_rank,
+                &node.owner_project,
+            );
             format!(
-                r#"<li class="nd-mb-xs">
-  <a class="nd-btn-ghost nd-text-left nd-w-full{active}" href="{href}">
+                r#"<li>
+  <a class="nd-btn-ghost nd-text-left nd-w-full documentation-tree-link{active}" href="{href}">
     <strong>{title}</strong>
-    <div class="nd-text-xs nd-text-muted">{app} · {kind}</div>
+    <div class="nd-text-xs nd-text-muted">{path} {badges}</div>
   </a>
+  {children}
 </li>"#,
                 active = active,
-                href = he(&documentation_page_href(project_ident, &doc.id)),
-                title = he(&doc.title),
-                app = he(&doc.app),
-                kind = he(&doc.kind),
+                href = he(&documentation_page_href(project_ident, &node.id)),
+                title = he(&node.title),
+                path = he(&node.wiki_path),
+                badges = badges,
+                children = children,
             )
         })
         .collect::<Vec<_>>()
-        .join("\n");
+        .join("\n")
+}
 
-    format!(r#"<ul class="nd-list-unstyled nd-m-0 nd-p-0">{items}</ul>"#)
+fn documentation_visibility_panel(project_ident: &str, doc: &db::ApiDoc) -> String {
+    let controls = documentation_visibility_controls(
+        project_ident,
+        &doc.id,
+        &doc.owner_project,
+        &doc.scope,
+        doc.direct_global_rank,
+        doc.global_descendants,
+    );
+    format!(
+        r#"<section class="nd-card nd-mt-lg">
+  <div class="nd-card-header"><strong>Visibility</strong></div>
+  <div class="nd-card-body">{controls}</div>
+</section>"#,
+        controls = controls,
+    )
 }
 
 fn documentation_head_extra() -> &'static str {
@@ -5913,6 +6302,56 @@ fn documentation_head_extra() -> &'static str {
 .documentation-content pre {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+.documentation-card-link,
+.documentation-tree-link {
+  display: block;
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.documentation-tree,
+.documentation-tree ul {
+  list-style: none;
+  margin: 0;
+  padding-left: 0;
+}
+.documentation-tree ul {
+  margin-left: 0.85rem;
+  padding-left: 0.85rem;
+  border-left: 1px solid rgba(120, 120, 120, 0.28);
+}
+.documentation-tree li {
+  margin-bottom: 0.35rem;
+}
+.documentation-group-heading {
+  align-items: center;
+  display: flex;
+  gap: 0.5rem;
+  justify-content: space-between;
+}
+.documentation-group-heading h3 {
+  font-size: 1rem;
+  line-height: 1.25;
+  margin: 0;
+}
+.documentation-visibility-form {
+  align-items: end;
+  display: grid;
+  gap: 0.5rem;
+  grid-template-columns: minmax(8rem, 1fr) minmax(9rem, 1fr) auto;
+}
+.documentation-visibility-form label {
+  display: grid;
+  gap: 0.25rem;
+}
+.documentation-readonly {
+  overflow-wrap: anywhere;
+}
+@media (max-width: 760px) {
+  .documentation-visibility-form {
+    grid-template-columns: 1fr;
+  }
 }
 </style>"#
 }
@@ -6426,21 +6865,21 @@ pub async fn api_docs_page(
     let app = query.app.clone();
     let label = query.label.clone();
     let kind = query.kind.clone();
-    let (project, docs, theme) = spawn_blocking(move || -> anyhow::Result<_> {
+    let scope = query.scope.clone();
+    let (project, docs, hierarchy, theme) = spawn_blocking(move || -> anyhow::Result<_> {
         let conn = db.lock().unwrap();
         let project = db::get_project(&conn, &ident_for_lookup)?;
-        let docs = db::list_api_docs(
-            &conn,
-            &ident_for_lookup,
-            &db::ApiDocFilters {
-                query: q.as_deref(),
-                app: app.as_deref(),
-                label: label.as_deref(),
-                kind: kind.as_deref(),
-            },
-        )?;
+        let filters = db::ApiDocFilters {
+            query: q.as_deref(),
+            app: app.as_deref(),
+            label: label.as_deref(),
+            kind: kind.as_deref(),
+            scope: scope.as_deref(),
+        };
+        let docs = db::list_api_docs(&conn, &ident_for_lookup, &filters)?;
+        let hierarchy = db::api_doc_hierarchy(&conn, &ident_for_lookup, &filters)?;
         let theme = db::get_theme(&conn)?;
-        Ok((project, docs, theme))
+        Ok((project, docs, hierarchy, theme))
     })
     .await??;
 
@@ -6454,51 +6893,30 @@ pub async fn api_docs_page(
     let pages = if docs.is_empty() {
         r#"<p class="nd-text-muted nd-text-sm">No documentation pages match the current filters.</p>"#.to_string()
     } else {
-        docs.iter()
-            .map(|doc| {
-                let labels = if doc.labels.is_empty() {
-                    String::new()
-                } else {
-                    doc.labels
-                        .iter()
-                        .map(|label| {
-                            format!(r#"<span class="nd-badge nd-badge-sm">{}</span>"#, he(label))
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                };
-                let summary = doc.summary.as_deref().unwrap_or("");
-                format!(
-                    r#"<article class="nd-card nd-mb-md">
-  <div class="nd-card-body">
-    <a class="nd-btn-ghost nd-text-left nd-w-full" href="{href}">
-      <strong>{title}</strong>
-      <div class="nd-text-xs nd-text-muted">{app} · {kind} · {source} {version}</div>
-    </a>
-    <p class="nd-text-sm nd-text-muted documentation-summary">{summary}</p>
-    <div>{labels}</div>
-  </div>
-</article>"#,
-                    href = he(&documentation_page_href(&project.ident, &doc.id)),
-                    title = he(&doc.title),
-                    app = he(&doc.app),
-                    kind = he(&doc.kind),
-                    source = he(&doc.source_format),
-                    version = he(doc.version.as_deref().unwrap_or("")),
-                    labels = labels,
-                    summary = he(summary),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        let mut project_docs = Vec::new();
+        let mut global_docs = Vec::new();
+        for doc in &docs {
+            if doc.scope == "global" {
+                global_docs.push(doc);
+            } else {
+                project_docs.push(doc);
+            }
+        }
+        [
+            documentation_doc_group(&project.ident, "Project docs", &project_docs),
+            documentation_doc_group(&project.ident, "Global docs", &global_docs),
+        ]
+        .join("\n")
     };
 
     let ident_attr = he(&project.ident);
-    let nav = documentation_nav(&project.ident, &docs, None);
+    let nav = documentation_tree_nav(&project.ident, &hierarchy, None);
     let q_value = he(query.q.as_deref().unwrap_or(""));
     let app_value = he(query.app.as_deref().unwrap_or(""));
     let label_value = he(query.label.as_deref().unwrap_or(""));
     let kind_value = he(query.kind.as_deref().unwrap_or(""));
+    let selected_scope = query.scope.as_deref().unwrap_or("all");
+    let scope_options = documentation_scope_filter_options(selected_scope);
     let content = format!(
         r#"  <div class="nd-flex nd-gap-md nd-mb-md">
     <a class="nd-btn-secondary nd-btn-sm" href="/documentation">All documentation</a>
@@ -6515,6 +6933,9 @@ pub async fn api_docs_page(
         <input class="nd-input" name="app" placeholder="App" value="{app}">
         <input class="nd-input" name="label" placeholder="Label" value="{label}">
         <input class="nd-input" name="kind" placeholder="Kind" value="{kind}">
+        <select class="nd-input" name="scope" aria-label="Documentation scope">
+          {scope_options}
+        </select>
         <button class="nd-btn-primary" type="submit">Search</button>
       </form>
     </div>
@@ -6540,6 +6961,7 @@ pub async fn api_docs_page(
         app = app_value,
         label = label_value,
         kind = kind_value,
+        scope_options = scope_options,
     );
 
     let page_title = format!("Documentation - {}", project.ident);
@@ -6571,7 +6993,7 @@ pub async fn api_doc_detail_page(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let (project, doc, docs, versions, selected_version, theme) =
+    let (project, doc, hierarchy, versions, selected_version, theme) =
         spawn_blocking(move || -> anyhow::Result<_> {
             let conn = db.lock().unwrap();
             let project = db::get_project(&conn, &ident_for_lookup)?;
@@ -6589,9 +7011,10 @@ pub async fn api_doc_detail_page(
                 )?,
                 _ => None,
             };
-            let docs = db::list_api_docs(&conn, &ident_for_lookup, &db::ApiDocFilters::default())?;
+            let hierarchy =
+                db::api_doc_hierarchy(&conn, &ident_for_lookup, &db::ApiDocFilters::default())?;
             let theme = db::get_theme(&conn)?;
-            Ok((project, doc, docs, versions, selected_version, theme))
+            Ok((project, doc, hierarchy, versions, selected_version, theme))
         })
         .await??;
 
@@ -6652,10 +7075,20 @@ pub async fn api_doc_detail_page(
     let source_ref = display_doc.source_ref.as_deref().unwrap_or("");
     let version = display_doc.version.as_deref().unwrap_or("");
     let summary = display_doc.summary.as_deref().unwrap_or("");
+    let global_rank = display_doc
+        .global_rank
+        .map(|rank| format!("Global {rank}"))
+        .unwrap_or_else(|| "Local only".to_string());
+    let descendants = if display_doc.global_descendants {
+        "included"
+    } else {
+        "not included"
+    };
     let ident_attr = he(&project.ident);
-    let nav = documentation_nav(&project.ident, &docs, Some(&doc.id));
+    let nav = documentation_tree_nav(&project.ident, &hierarchy, Some(&doc.id));
     let version_selector =
         documentation_version_selector(&project.ident, &versions, selected_version_id);
+    let visibility_panel = documentation_visibility_panel(&project.ident, &display_doc);
 
     let content = format!(
         r#"  <div class="nd-flex nd-gap-md nd-mb-md">
@@ -6695,12 +7128,18 @@ pub async fn api_doc_detail_page(
           <div class="nd-text-xs nd-text-muted">App</div><strong>{app}</strong>
           <div class="nd-text-xs nd-text-muted nd-mt-sm">Kind</div><strong>{kind}</strong>
           <div class="nd-text-xs nd-text-muted nd-mt-sm">Source</div><strong>{source}</strong>
+          <div class="nd-text-xs nd-text-muted nd-mt-sm">Owner</div><strong>{owner_project}</strong>
+          <div class="nd-text-xs nd-text-muted nd-mt-sm">Scope</div><strong>{scope}</strong>
+          <div class="nd-text-xs nd-text-muted nd-mt-sm">Wiki path</div><code>{wiki_path}</code>
+          <div class="nd-text-xs nd-text-muted nd-mt-sm">Global rank</div><strong>{global_rank}</strong>
+          <div class="nd-text-xs nd-text-muted nd-mt-sm">Descendants</div><strong>{descendants}</strong>
           <div class="nd-mt-sm">{version_selector}</div>
           <div class="nd-text-xs nd-text-muted nd-mt-sm">Current label</div><strong>{version}</strong>
           <div class="nd-text-xs nd-text-muted nd-mt-sm">Source ref</div><div class="nd-text-sm">{source_ref}</div>
           <div class="nd-text-xs nd-text-muted nd-mt-sm">Record ID</div><code>{artifact_id}</code>
         </div>
       </section>
+      {visibility_panel}
     </aside>
   </div>"#,
         ident = ident_attr,
@@ -6709,6 +7148,11 @@ pub async fn api_doc_detail_page(
         app = he(&display_doc.app),
         kind = he(&display_doc.kind),
         source = he(&display_doc.source_format),
+        owner_project = he(&display_doc.owner_project),
+        scope = he(&display_doc.scope),
+        wiki_path = he(&display_doc.wiki_path),
+        global_rank = he(&global_rank),
+        descendants = he(descendants),
         version_selector = version_selector,
         version = he(version),
         summary = he(summary),
@@ -6717,6 +7161,7 @@ pub async fn api_doc_detail_page(
         artifact_id = he(&display_doc.artifact_id),
         content_json = he(&content_json),
         chunks = chunks,
+        visibility_panel = visibility_panel,
     );
 
     let page_title = format!("{} - {}", doc.app, project.ident);
@@ -6828,6 +7273,7 @@ pub async fn artifact_workspace_page(
                 app: None,
                 label: label.as_deref(),
                 kind: None,
+                scope: None,
             },
         )?;
         let theme = db::get_theme(&conn)?;
@@ -10378,6 +10824,44 @@ mod tests {
         (status, value)
     }
 
+    fn insert_ui_doc(
+        conn: &rusqlite::Connection,
+        project_ident: &str,
+        title: &str,
+        slug: &str,
+        parent_id: Option<&str>,
+        sort_order: i64,
+        global_rank: Option<i64>,
+        global_descendants: bool,
+    ) -> db::ApiDoc {
+        let labels = vec!["docs".to_string()];
+        let content = serde_json::json!({
+            "purpose": format!("{title} documentation"),
+        });
+        db::insert_api_doc(
+            conn,
+            project_ident,
+            &db::ApiDocInsert {
+                app: "docs",
+                title,
+                summary: Some(title),
+                kind: "agent_context",
+                source_format: "agent_context",
+                source_ref: None,
+                version: None,
+                labels: &labels,
+                parent_id: parent_id.map(Some),
+                slug: Some(Some(slug)),
+                sort_order: Some(sort_order),
+                global_rank: global_rank.map(Some),
+                global_descendants: Some(global_descendants),
+                content: &content,
+                author: "tester",
+            },
+        )
+        .unwrap()
+    }
+
     async fn create_test_artifact(state: &AppState, key: &str) -> String {
         let response = create_artifact_handler(
             State(state.clone()),
@@ -11675,6 +12159,11 @@ mod tests {
                 source_ref: Some(".agent/api/billing.yaml".to_string()),
                 version: Some("2026-05-13".to_string()),
                 labels: serde_json::json!(["billing"]),
+                parent_id: None,
+                slug: None,
+                sort_order: None,
+                global_rank: None,
+                global_descendants: None,
                 content: serde_json::json!({
                     "purpose": "Owns invoice state.",
                     "endpoints": [{
@@ -11699,6 +12188,7 @@ mod tests {
                 app: None,
                 label: Some("billing".to_string()),
                 kind: Some("agent_context".to_string()),
+                scope: None,
                 include_history: false,
                 envelope: false,
             }),
@@ -11713,11 +12203,34 @@ mod tests {
         assert_eq!(chunks[0]["chunk_type"], "endpoints");
         assert_eq!(chunks[0]["freshness"], "current");
         assert_eq!(chunks[0]["retrieval_scope"], "current");
+        assert_eq!(chunks[0]["scope"], "local");
+        assert_eq!(chunks[0]["owner_project"], "demo");
+        assert_eq!(chunks[0]["wiki_path"], "/billing-api-agent-context");
         assert_eq!(chunks[0]["artifact_id"], created.0.artifact_id);
         assert_eq!(
             chunks[0]["artifact_version_id"],
             created.0.artifact_version_id.clone().unwrap()
         );
+
+        let hierarchy = api_doc_hierarchy_handler(
+            State(state.clone()),
+            Path("demo".to_string()),
+            Query(ListApiDocsQuery {
+                q: None,
+                app: None,
+                label: None,
+                kind: None,
+                scope: None,
+                include_history: false,
+                envelope: false,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(hierarchy.0.len(), 1);
+        assert_eq!(hierarchy.0[0].id, created.0.id);
+        assert_eq!(hierarchy.0[0].scope, "local");
+        assert_eq!(hierarchy.0[0].wiki_path, "/billing-api-agent-context");
 
         let envelope = list_api_doc_chunks_handler(
             State(state),
@@ -11727,6 +12240,7 @@ mod tests {
                 app: None,
                 label: Some("billing".to_string()),
                 kind: Some("agent_context".to_string()),
+                scope: None,
                 include_history: false,
                 envelope: true,
             }),
@@ -11740,6 +12254,193 @@ mod tests {
         assert_eq!(value["chunking_status"]["status"], "current");
         assert_eq!(value["chunking_status"]["current_chunk_count"], 1);
         assert_eq!(value["chunks"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn api_docs_ui_renders_hierarchy_groups_and_visibility_controls() {
+        let state = test_state();
+        let (local_root_id, global_id) = {
+            let conn = state.db.lock().unwrap();
+            db::insert_project(
+                &conn,
+                &db::Project {
+                    ident: "platform".to_string(),
+                    channel_name: "discord".to_string(),
+                    room_id: "room-platform".to_string(),
+                    last_msg_id: None,
+                    created_at: db::now_ms(),
+                    repo_provider: None,
+                    repo_namespace: None,
+                    repo_name: None,
+                    repo_full_name: None,
+                },
+            )
+            .unwrap();
+
+            let local_root = insert_ui_doc(
+                &conn,
+                "demo",
+                "Local Root",
+                "local-root",
+                None,
+                0,
+                None,
+                true,
+            );
+            insert_ui_doc(
+                &conn,
+                "demo",
+                "Local Child",
+                "child",
+                Some(local_root.id.as_str()),
+                1,
+                None,
+                false,
+            );
+            let global = insert_ui_doc(
+                &conn,
+                "platform",
+                "Platform Guide",
+                "platform-guide",
+                None,
+                0,
+                Some(1),
+                false,
+            );
+            (local_root.id, global.id)
+        };
+
+        let html = api_docs_page(
+            State(state.clone()),
+            Path("demo".to_string()),
+            Query(ListApiDocsQuery {
+                q: None,
+                app: None,
+                label: None,
+                kind: None,
+                scope: Some("all".to_string()),
+                include_history: false,
+                envelope: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert!(html.contains(r#"class="documentation-tree""#));
+        assert!(html.contains("Project docs"));
+        assert!(html.contains("Global docs"));
+        assert!(html.contains("/local-root/child"));
+        assert!(html.contains(r#"name="scope""#));
+        assert!(html.contains("Project + Global"));
+        assert!(html.contains(&format!(
+            r#"data-nd-action="PATCH /v1/projects/demo/api-docs/{local_root_id}""#
+        )));
+        assert!(html.contains("Global 1"));
+        assert!(html.contains("owner platform"));
+        assert!(html.contains("Read-only global page from <strong>platform</strong>"));
+        assert!(html.contains("Page only"));
+        assert!(html.contains("Page and descendants"));
+        assert!(!html.contains(&format!(
+            r#"data-nd-action="PATCH /v1/projects/demo/api-docs/{global_id}""#
+        )));
+
+        let detail_html = api_doc_detail_page(
+            State(state),
+            Path(("demo".to_string(), global_id.clone())),
+            Query(ApiDocDetailQuery { version_id: None }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(detail_html.contains("Read-only global page from <strong>platform</strong>"));
+        assert!(!detail_html.contains(&format!(
+            r#"data-nd-action="PATCH /v1/projects/demo/api-docs/{global_id}""#
+        )));
+    }
+
+    #[tokio::test]
+    async fn update_api_doc_accepts_ndesign_visibility_form_values() {
+        let state = test_state();
+        let created = create_api_doc_handler(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("demo".to_string()),
+            Json(CreateApiDocRequest {
+                app: "docs".to_string(),
+                title: "Visibility Controls".to_string(),
+                summary: Some("Visibility control test".to_string()),
+                kind: "agent_context".to_string(),
+                source_format: "agent_context".to_string(),
+                source_ref: None,
+                version: None,
+                labels: serde_json::json!(["docs"]),
+                parent_id: None,
+                slug: Some(serde_json::json!("visibility-controls")),
+                sort_order: Some(0),
+                global_rank: None,
+                global_descendants: None,
+                content: serde_json::json!({"purpose": "visibility controls"}),
+                author: Some("tester".to_string()),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let updated = update_api_doc_handler(
+            State(state.clone()),
+            Path(("demo".to_string(), created.id.clone())),
+            Json(UpdateApiDocRequest {
+                app: None,
+                title: None,
+                summary: None,
+                kind: None,
+                source_format: None,
+                source_ref: None,
+                version: None,
+                labels: None,
+                parent_id: None,
+                slug: None,
+                sort_order: None,
+                global_rank: Some(Value::String("2".to_string())),
+                global_descendants: Some(Value::String("true".to_string())),
+                content: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(updated.direct_global_rank, Some(2));
+        assert_eq!(updated.global_rank, Some(2));
+        assert!(updated.global_descendants);
+
+        let cleared = update_api_doc_handler(
+            State(state),
+            Path(("demo".to_string(), created.id)),
+            Json(UpdateApiDocRequest {
+                app: None,
+                title: None,
+                summary: None,
+                kind: None,
+                source_format: None,
+                source_ref: None,
+                version: None,
+                labels: None,
+                parent_id: None,
+                slug: None,
+                sort_order: None,
+                global_rank: Some(Value::String(String::new())),
+                global_descendants: Some(Value::String("false".to_string())),
+                content: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(cleared.direct_global_rank, None);
+        assert_eq!(cleared.global_rank, None);
+        assert!(!cleared.global_descendants);
     }
 
     /// Regression for T030: after consolidating artifact mutation route

@@ -483,6 +483,10 @@ async fn main() -> Result<()> {
             get(routes::list_api_doc_chunks_handler),
         )
         .route(
+            "/v1/projects/{ident}/api-docs/hierarchy",
+            get(routes::api_doc_hierarchy_handler),
+        )
+        .route(
             "/v1/projects/{ident}/api-docs/{id}",
             get(routes::get_api_doc_handler)
                 .patch(routes::update_api_doc_handler)

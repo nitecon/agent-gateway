@@ -8,7 +8,7 @@ use rusqlite::{
 };
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt,
     sync::{Arc, LockResult, Mutex, MutexGuard},
 };
@@ -1077,6 +1077,23 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             ON api_docs(project_ident, app, updated_at DESC);
          CREATE INDEX IF NOT EXISTS idx_api_docs_project_updated
              ON api_docs(project_ident, updated_at DESC);",
+    )?;
+    let _ = conn.execute("ALTER TABLE api_docs ADD COLUMN parent_id TEXT", []);
+    let _ = conn.execute("ALTER TABLE api_docs ADD COLUMN slug TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE api_docs ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE api_docs ADD COLUMN global_rank INTEGER", []);
+    let _ = conn.execute(
+        "ALTER TABLE api_docs ADD COLUMN global_descendants INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_api_docs_project_parent_order
+             ON api_docs(project_ident, parent_id, sort_order, title);
+         CREATE INDEX IF NOT EXISTS idx_api_docs_global_rank
+             ON api_docs(global_rank) WHERE global_rank IS NOT NULL;",
     )?;
 
     // ── Agent memory gateway: project-scoped durable memories only ───────────
@@ -7600,6 +7617,8 @@ pub fn delete_pattern(conn: &Connection, id_or_slug: &str) -> Result<bool> {
 pub struct ApiDoc {
     pub id: String,
     pub project_ident: String,
+    pub owner_project: String,
+    pub scope: String,
     pub app: String,
     pub title: String,
     pub summary: Option<String>,
@@ -7608,6 +7627,13 @@ pub struct ApiDoc {
     pub source_ref: Option<String>,
     pub version: Option<String>,
     pub labels: Vec<String>,
+    pub parent_id: Option<String>,
+    pub slug: String,
+    pub sort_order: i64,
+    pub wiki_path: String,
+    pub global_rank: Option<i64>,
+    pub direct_global_rank: Option<i64>,
+    pub global_descendants: bool,
     pub content: serde_json::Value,
     pub author: String,
     pub created_at: i64,
@@ -7624,6 +7650,8 @@ pub struct ApiDoc {
 pub struct ApiDocSummary {
     pub id: String,
     pub project_ident: String,
+    pub owner_project: String,
+    pub scope: String,
     pub app: String,
     pub title: String,
     pub summary: Option<String>,
@@ -7632,6 +7660,13 @@ pub struct ApiDocSummary {
     pub source_ref: Option<String>,
     pub version: Option<String>,
     pub labels: Vec<String>,
+    pub parent_id: Option<String>,
+    pub slug: String,
+    pub sort_order: i64,
+    pub wiki_path: String,
+    pub global_rank: Option<i64>,
+    pub direct_global_rank: Option<i64>,
+    pub global_descendants: bool,
     pub author: String,
     pub created_at: i64,
     pub updated_at: i64,
@@ -7641,6 +7676,32 @@ pub struct ApiDocSummary {
     pub manifest_chunk_count: Option<usize>,
     pub chunking_status: String,
     pub linked_ids: Vec<String>,
+    #[serde(skip)]
+    pub content_search: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ApiDocHierarchyNode {
+    pub id: String,
+    pub node_type: String,
+    pub owner_project: String,
+    pub scope: String,
+    pub app: String,
+    pub title: String,
+    pub summary: Option<String>,
+    pub kind: String,
+    pub labels: Vec<String>,
+    pub parent_id: Option<String>,
+    pub slug: String,
+    pub sort_order: i64,
+    pub wiki_path: String,
+    pub breadcrumbs: Vec<String>,
+    pub global_rank: Option<i64>,
+    pub direct_global_rank: Option<i64>,
+    pub global_descendants: bool,
+    pub artifact_id: String,
+    pub artifact_version_id: Option<String>,
+    pub children: Vec<ApiDocHierarchyNode>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -7660,6 +7721,7 @@ pub struct ApiDocFilters<'a> {
     pub app: Option<&'a str>,
     pub label: Option<&'a str>,
     pub kind: Option<&'a str>,
+    pub scope: Option<&'a str>,
 }
 
 pub struct ApiDocInsert<'a> {
@@ -7671,6 +7733,11 @@ pub struct ApiDocInsert<'a> {
     pub source_ref: Option<&'a str>,
     pub version: Option<&'a str>,
     pub labels: &'a [String],
+    pub parent_id: Option<Option<&'a str>>,
+    pub slug: Option<Option<&'a str>>,
+    pub sort_order: Option<i64>,
+    pub global_rank: Option<Option<i64>>,
+    pub global_descendants: Option<bool>,
     pub content: &'a serde_json::Value,
     pub author: &'a str,
 }
@@ -7685,6 +7752,11 @@ pub struct ApiDocUpdate<'a> {
     pub source_ref: Option<Option<&'a str>>,
     pub version: Option<Option<&'a str>>,
     pub labels: Option<&'a [String]>,
+    pub parent_id: Option<Option<&'a str>>,
+    pub slug: Option<Option<&'a str>>,
+    pub sort_order: Option<i64>,
+    pub global_rank: Option<Option<i64>>,
+    pub global_descendants: Option<bool>,
     pub content: Option<&'a serde_json::Value>,
 }
 
@@ -7692,6 +7764,10 @@ pub struct ApiDocUpdate<'a> {
 pub struct ApiDocChunkRecord {
     pub doc_id: String,
     pub project_ident: String,
+    pub owner_project: String,
+    pub scope: String,
+    pub global_rank: Option<i64>,
+    pub wiki_path: String,
     pub app: String,
     pub title: String,
     pub chunk_type: String,
@@ -7740,6 +7816,202 @@ fn parse_newline_strings(raw: Option<String>) -> Vec<String> {
         .collect()
 }
 
+fn api_doc_slug(title: &str, id: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in title.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            last_dash = false;
+        } else if !last_dash && !out.is_empty() {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        id.to_string()
+    } else {
+        out
+    }
+}
+
+fn clean_api_doc_slug(slug: Option<&str>, title: &str, id: &str) -> String {
+    slug.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| api_doc_slug(title, id))
+}
+
+fn normalize_global_rank(rank: Option<i64>) -> Option<i64> {
+    rank.filter(|value| *value > 0)
+}
+
+fn api_doc_logical_key_for_parts(
+    project_ident: &str,
+    app: &str,
+    title: &str,
+    kind: &str,
+) -> String {
+    [project_ident, app, title, kind]
+        .into_iter()
+        .map(api_doc_key_part)
+        .collect::<Vec<_>>()
+        .join("\x1f")
+}
+
+fn api_doc_effective_global_rank(
+    doc: &ApiDocSummary,
+    docs_by_id: &HashMap<String, ApiDocSummary>,
+) -> Option<i64> {
+    if let Some(rank) = normalize_global_rank(doc.direct_global_rank) {
+        return Some(rank);
+    }
+
+    let mut seen = HashSet::new();
+    let mut parent_id = doc.parent_id.as_deref();
+    while let Some(id) = parent_id {
+        if !seen.insert(id.to_string()) {
+            return None;
+        }
+        let Some(parent) = docs_by_id.get(id) else {
+            return None;
+        };
+        if parent.project_ident != doc.project_ident {
+            return None;
+        }
+        if parent.global_descendants {
+            if let Some(rank) = normalize_global_rank(parent.direct_global_rank) {
+                return Some(rank);
+            }
+        }
+        parent_id = parent.parent_id.as_deref();
+    }
+    None
+}
+
+fn api_doc_wiki_path(doc: &ApiDocSummary, docs_by_id: &HashMap<String, ApiDocSummary>) -> String {
+    let mut parts = vec![doc.slug.clone()];
+    let mut seen = HashSet::new();
+    let mut parent_id = doc.parent_id.as_deref();
+    while let Some(id) = parent_id {
+        if !seen.insert(id.to_string()) {
+            break;
+        }
+        let Some(parent) = docs_by_id.get(id) else {
+            break;
+        };
+        if parent.project_ident != doc.project_ident {
+            break;
+        }
+        parts.push(parent.slug.clone());
+        parent_id = parent.parent_id.as_deref();
+    }
+    parts.reverse();
+    format!("/{}", parts.join("/"))
+}
+
+fn api_doc_breadcrumbs(wiki_path: &str) -> Vec<String> {
+    wiki_path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn enrich_api_doc_summary(
+    mut doc: ApiDocSummary,
+    request_project_ident: &str,
+    docs_by_id: &HashMap<String, ApiDocSummary>,
+) -> Option<ApiDocSummary> {
+    let effective_rank = api_doc_effective_global_rank(&doc, docs_by_id);
+    let is_local = doc.project_ident == request_project_ident;
+    if !is_local && effective_rank.is_none() {
+        return None;
+    }
+    doc.owner_project = doc.project_ident.clone();
+    doc.scope = if is_local { "local" } else { "global" }.to_string();
+    doc.global_rank = effective_rank;
+    doc.wiki_path = api_doc_wiki_path(&doc, docs_by_id);
+    Some(doc)
+}
+
+fn api_doc_text_score(haystack: &str, needle: &str, weight: i64) -> i64 {
+    let haystack = haystack.to_ascii_lowercase();
+    let needle = needle.to_ascii_lowercase();
+    if needle.is_empty() || haystack.is_empty() {
+        return 0;
+    }
+    haystack.matches(&needle).count() as i64 * weight
+}
+
+fn api_doc_relevance_score(doc: &ApiDocSummary, query: Option<&str>) -> i64 {
+    let Some(query) = query.map(str::trim).filter(|value| !value.is_empty()) else {
+        return 0;
+    };
+    let mut score = 0;
+    score += api_doc_text_score(&doc.title, query, 10);
+    score += api_doc_text_score(&doc.app, query, 6);
+    score += api_doc_text_score(doc.summary.as_deref().unwrap_or(""), query, 5);
+    score += api_doc_text_score(&doc.kind, query, 3);
+    score += api_doc_text_score(&doc.source_format, query, 2);
+    score += api_doc_text_score(doc.source_ref.as_deref().unwrap_or(""), query, 2);
+    score += api_doc_text_score(doc.version.as_deref().unwrap_or(""), query, 2);
+    score += api_doc_text_score(&doc.labels.join("\n"), query, 3);
+    score += api_doc_text_score(&doc.content_search, query, 1);
+    score += api_doc_text_score(&doc.artifact_id, query, 2);
+    score += api_doc_text_score(doc.artifact_version_id.as_deref().unwrap_or(""), query, 2);
+    score += api_doc_text_score(&doc.linked_ids.join("\n"), query, 2);
+    score
+}
+
+fn api_doc_matches_filters(doc: &ApiDocSummary, filters: &ApiDocFilters<'_>) -> bool {
+    if let Some(scope) = filters
+        .scope
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "all")
+    {
+        if doc.scope != scope {
+            return false;
+        }
+    }
+    if let Some(app) = filters.app.map(str::trim).filter(|value| !value.is_empty()) {
+        if doc.app != app {
+            return false;
+        }
+    }
+    if let Some(kind) = filters
+        .kind
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if doc.kind != kind {
+            return false;
+        }
+    }
+    if let Some(label) = filters
+        .label
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !doc.labels.iter().any(|value| value == label) {
+            return false;
+        }
+    }
+    if filters
+        .query
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+        && api_doc_relevance_score(doc, filters.query) == 0
+    {
+        return false;
+    }
+    true
+}
+
 fn manifest_chunk_count(payload: Option<String>) -> Option<usize> {
     payload
         .as_deref()
@@ -7777,32 +8049,47 @@ fn api_doc_chunking_status_value(
 
 fn row_to_api_doc(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiDoc> {
     let content_json: String = row.get(10)?;
-    let failed_addresses = parse_newline_strings(row.get(20)?);
-    let manifest_chunk_count = manifest_chunk_count(row.get(17)?);
-    let current = row.get::<_, i64>(18)? as usize;
-    let stale = row.get::<_, i64>(19)? as usize;
-    let superseded = row.get::<_, i64>(22)? as usize;
+    let id: String = row.get(0)?;
+    let project_ident: String = row.get(1)?;
+    let title: String = row.get(3)?;
+    let parent_id: Option<String> = row.get(14)?;
+    let slug = clean_api_doc_slug(row.get::<_, Option<String>>(15)?.as_deref(), &title, &id);
+    let direct_global_rank = normalize_global_rank(row.get(17)?);
+    let failed_addresses = parse_newline_strings(row.get(25)?);
+    let manifest_chunk_count = manifest_chunk_count(row.get(22)?);
+    let current = row.get::<_, i64>(23)? as usize;
+    let stale = row.get::<_, i64>(24)? as usize;
+    let superseded = row.get::<_, i64>(27)? as usize;
     Ok(ApiDoc {
-        id: row.get(0)?,
-        project_ident: row.get(1)?,
+        id: id.clone(),
+        project_ident: project_ident.clone(),
+        owner_project: project_ident,
+        scope: "local".to_string(),
         app: row.get(2)?,
-        title: row.get(3)?,
+        title,
         summary: row.get(4)?,
         kind: row.get(5)?,
         source_format: row.get(6)?,
         source_ref: row.get(7)?,
         version: row.get(8)?,
         labels: parse_labels(row.get::<_, Option<String>>(9)?),
+        parent_id,
+        slug,
+        sort_order: row.get(16)?,
+        wiki_path: String::new(),
+        global_rank: direct_global_rank,
+        direct_global_rank,
+        global_descendants: row.get::<_, i64>(18)? != 0,
         content: parse_content_json(content_json),
         author: row.get(11)?,
         created_at: row.get(12)?,
         updated_at: row.get(13)?,
         artifact_id: row
-            .get::<_, Option<String>>(14)?
+            .get::<_, Option<String>>(19)?
             .unwrap_or_else(|| row.get(0).unwrap()),
-        artifact_version_id: row.get(15)?,
+        artifact_version_id: row.get(20)?,
         subkind: row
-            .get::<_, Option<String>>(16)?
+            .get::<_, Option<String>>(21)?
             .unwrap_or_else(|| API_DOC_SUBKIND.to_string()),
         manifest_chunk_count,
         chunking_status: api_doc_chunking_status_value(
@@ -7812,36 +8099,51 @@ fn row_to_api_doc(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiDoc> {
             superseded,
             &failed_addresses,
         ),
-        linked_ids: parse_newline_strings(row.get(21)?),
+        linked_ids: parse_newline_strings(row.get(26)?),
     })
 }
 
 fn row_to_api_doc_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiDocSummary> {
-    let failed_addresses = parse_newline_strings(row.get(19)?);
-    let manifest_chunk_count = manifest_chunk_count(row.get(16)?);
-    let current = row.get::<_, i64>(17)? as usize;
-    let stale = row.get::<_, i64>(18)? as usize;
-    let superseded = row.get::<_, i64>(21)? as usize;
+    let id: String = row.get(0)?;
+    let project_ident: String = row.get(1)?;
+    let title: String = row.get(3)?;
+    let parent_id: Option<String> = row.get(14)?;
+    let slug = clean_api_doc_slug(row.get::<_, Option<String>>(15)?.as_deref(), &title, &id);
+    let direct_global_rank = normalize_global_rank(row.get(17)?);
+    let failed_addresses = parse_newline_strings(row.get(25)?);
+    let manifest_chunk_count = manifest_chunk_count(row.get(22)?);
+    let current = row.get::<_, i64>(23)? as usize;
+    let stale = row.get::<_, i64>(24)? as usize;
+    let superseded = row.get::<_, i64>(27)? as usize;
     Ok(ApiDocSummary {
-        id: row.get(0)?,
-        project_ident: row.get(1)?,
+        id: id.clone(),
+        project_ident: project_ident.clone(),
+        owner_project: project_ident,
+        scope: "local".to_string(),
         app: row.get(2)?,
-        title: row.get(3)?,
+        title,
         summary: row.get(4)?,
         kind: row.get(5)?,
         source_format: row.get(6)?,
         source_ref: row.get(7)?,
         version: row.get(8)?,
         labels: parse_labels(row.get::<_, Option<String>>(9)?),
+        parent_id,
+        slug,
+        sort_order: row.get(16)?,
+        wiki_path: String::new(),
+        global_rank: direct_global_rank,
+        direct_global_rank,
+        global_descendants: row.get::<_, i64>(18)? != 0,
         author: row.get(10)?,
         created_at: row.get(11)?,
         updated_at: row.get(12)?,
         artifact_id: row
-            .get::<_, Option<String>>(13)?
+            .get::<_, Option<String>>(19)?
             .unwrap_or_else(|| row.get(0).unwrap()),
-        artifact_version_id: row.get(14)?,
+        artifact_version_id: row.get(20)?,
         subkind: row
-            .get::<_, Option<String>>(15)?
+            .get::<_, Option<String>>(21)?
             .unwrap_or_else(|| API_DOC_SUBKIND.to_string()),
         manifest_chunk_count,
         chunking_status: api_doc_chunking_status_value(
@@ -7851,7 +8153,8 @@ fn row_to_api_doc_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiDocSum
             superseded,
             &failed_addresses,
         ),
-        linked_ids: parse_newline_strings(row.get(20)?),
+        linked_ids: parse_newline_strings(row.get(26)?),
+        content_search: row.get(13)?,
     })
 }
 
@@ -7871,8 +8174,8 @@ const API_DOC_ARTIFACT_SELECT_COLS: &str = "a.artifact_id, a.accepted_version_id
     )),
     (SELECT COUNT(*) FROM artifact_chunks c WHERE c.artifact_id = d.id AND c.superseded_by_chunk_id IS NOT NULL)";
 
-const API_DOC_SELECT_COLS: &str = "d.id, d.project_ident, d.app, d.title, d.summary, d.kind, d.source_format, d.source_ref, d.version, d.labels, d.content_json, d.author, d.created_at, d.updated_at";
-const API_DOC_SUMMARY_SELECT_COLS: &str = "d.id, d.project_ident, d.app, d.title, d.summary, d.kind, d.source_format, d.source_ref, d.version, d.labels, d.author, d.created_at, d.updated_at";
+const API_DOC_SELECT_COLS: &str = "d.id, d.project_ident, d.app, d.title, d.summary, d.kind, d.source_format, d.source_ref, d.version, d.labels, d.content_json, d.author, d.created_at, d.updated_at, d.parent_id, d.slug, d.sort_order, d.global_rank, d.global_descendants";
+const API_DOC_SUMMARY_SELECT_COLS: &str = "d.id, d.project_ident, d.app, d.title, d.summary, d.kind, d.source_format, d.source_ref, d.version, d.labels, d.author, d.created_at, d.updated_at, d.content_json, d.parent_id, d.slug, d.sort_order, d.global_rank, d.global_descendants";
 const API_DOC_LOGICAL_COUNT_PROJECT_SQL: &str = "(SELECT COUNT(*) FROM (
     SELECT 1 FROM api_docs d
     WHERE d.project_ident = p.ident
@@ -7915,7 +8218,7 @@ fn api_doc_logical_key(app: &str, title: &str, kind: &str) -> String {
 }
 
 fn api_doc_summary_logical_key(doc: &ApiDocSummary) -> String {
-    api_doc_logical_key(&doc.app, &doc.title, &doc.kind)
+    api_doc_logical_key_for_parts(&doc.project_ident, &doc.app, &doc.title, &doc.kind)
 }
 
 fn find_api_doc_by_logical_key(
@@ -8120,6 +8423,11 @@ struct ApiDocArtifactVersionInput<'a> {
     version: Option<&'a str>,
     labels: &'a [String],
     content: &'a serde_json::Value,
+    parent_id: Option<&'a str>,
+    slug: &'a str,
+    sort_order: i64,
+    global_rank: Option<i64>,
+    global_descendants: bool,
     author: &'a str,
     created_at: i64,
 }
@@ -8194,6 +8502,13 @@ fn ensure_api_doc_artifact_version(
             "legacy_kind": input.kind,
             "subkind": API_DOC_SUBKIND,
             "source_ref": input.source_ref
+        },
+        "wiki": {
+            "parent_id": input.parent_id,
+            "slug": input.slug,
+            "sort_order": input.sort_order,
+            "global_rank": input.global_rank,
+            "global_descendants": input.global_descendants
         }
     });
     let content_json = serde_json::to_string(input.content)?;
@@ -8229,7 +8544,13 @@ fn ensure_api_doc_artifact_version(
             "labels": input.labels,
             "legacy_kind": input.kind,
             "source_format": input.source_format,
-            "source_ref": input.source_ref
+            "source_ref": input.source_ref,
+            "owner_project": input.project_ident,
+            "parent_id": input.parent_id,
+            "slug": input.slug,
+            "sort_order": input.sort_order,
+            "global_rank": input.global_rank,
+            "global_descendants": input.global_descendants
         });
         let result = create_artifact_chunk(
             conn,
@@ -8351,12 +8672,137 @@ fn ensure_existing_api_doc_artifacts(conn: &Connection, project_ident: &str) -> 
                 version: version.as_deref(),
                 labels: &labels,
                 content: &content,
+                parent_id: None,
+                slug: &api_doc_slug(&title, &id),
+                sort_order: 0,
+                global_rank: None,
+                global_descendants: false,
                 author: &author,
                 created_at,
             },
         )?;
     }
     Ok(())
+}
+
+fn ensure_all_api_doc_artifacts(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("SELECT DISTINCT project_ident FROM api_docs")?;
+    let projects = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    for project_ident in projects {
+        ensure_existing_api_doc_artifacts(conn, &project_ident)?;
+    }
+    Ok(())
+}
+
+fn load_all_api_doc_summaries(conn: &Connection) -> Result<Vec<ApiDocSummary>> {
+    let sql = format!(
+        "{} ORDER BY d.updated_at DESC, d.id DESC",
+        api_doc_select_sql(false)
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([], row_to_api_doc_summary)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn visible_api_doc_summaries(
+    conn: &Connection,
+    project_ident: &str,
+    filters: &ApiDocFilters<'_>,
+) -> Result<Vec<ApiDocSummary>> {
+    ensure_all_api_doc_artifacts(conn)?;
+    let all_docs = load_all_api_doc_summaries(conn)?;
+    let docs_by_id: HashMap<String, ApiDocSummary> = all_docs
+        .iter()
+        .map(|doc| (doc.id.clone(), doc.clone()))
+        .collect();
+    let mut latest_visible_by_key: HashMap<String, ApiDocSummary> = HashMap::new();
+    for doc in all_docs.iter().cloned() {
+        let Some(enriched) = enrich_api_doc_summary(doc, project_ident, &docs_by_id) else {
+            continue;
+        };
+        let key = api_doc_summary_logical_key(&enriched);
+        let replace = latest_visible_by_key
+            .get(&key)
+            .is_none_or(|existing| enriched.updated_at > existing.updated_at);
+        if replace {
+            latest_visible_by_key.insert(key, enriched);
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for doc in all_docs {
+        let Some(enriched) = enrich_api_doc_summary(doc, project_ident, &docs_by_id) else {
+            continue;
+        };
+        if !api_doc_matches_filters(&enriched, filters) {
+            continue;
+        }
+        let key = api_doc_summary_logical_key(&enriched);
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        out.push(latest_visible_by_key.get(&key).cloned().unwrap_or(enriched));
+    }
+
+    out.sort_by(|a, b| {
+        let a_global = a.scope == "global";
+        let b_global = b.scope == "global";
+        a_global
+            .cmp(&b_global)
+            .then_with(|| {
+                if a_global || b_global {
+                    a.global_rank
+                        .unwrap_or(i64::MAX)
+                        .cmp(&b.global_rank.unwrap_or(i64::MAX))
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .then_with(|| {
+                api_doc_relevance_score(b, filters.query)
+                    .cmp(&api_doc_relevance_score(a, filters.query))
+            })
+            .then_with(|| b.updated_at.cmp(&a.updated_at))
+            .then_with(|| a.owner_project.cmp(&b.owner_project))
+            .then_with(|| a.sort_order.cmp(&b.sort_order))
+            .then_with(|| a.title.cmp(&b.title))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    Ok(out)
+}
+
+fn get_api_doc_local(conn: &Connection, project_ident: &str, id: &str) -> Result<Option<ApiDoc>> {
+    ensure_existing_api_doc_artifacts(conn, project_ident)?;
+    let sql = format!(
+        "{} WHERE d.project_ident = ?1 AND d.id = ?2",
+        api_doc_select_sql(true)
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query_map(params![project_ident, id], row_to_api_doc)?;
+    let mut doc = match rows.next().transpose()? {
+        Some(doc) => doc,
+        None => return Ok(None),
+    };
+    let summaries = load_all_api_doc_summaries(conn)?;
+    let docs_by_id: HashMap<String, ApiDocSummary> = summaries
+        .iter()
+        .map(|summary| (summary.id.clone(), summary.clone()))
+        .collect();
+    if let Some(summary) = summaries.into_iter().find(|summary| summary.id == doc.id) {
+        if let Some(enriched) = enrich_api_doc_summary(summary, project_ident, &docs_by_id) {
+            doc.owner_project = enriched.owner_project;
+            doc.scope = enriched.scope;
+            doc.global_rank = enriched.global_rank;
+            doc.wiki_path = enriched.wiki_path;
+        }
+    }
+    Ok(Some(doc))
 }
 
 pub fn insert_api_doc(
@@ -8370,45 +8816,71 @@ pub fn insert_api_doc(
         let now = now_ms();
         let labels_json = serialize_string_array(doc.labels);
         let content_json = serde_json::to_string(doc.content)?;
+        let slug_value = doc
+            .slug
+            .map(|value| value.map(|slug| clean_api_doc_slug(Some(slug), doc.title, &existing_id)));
+        let mut assignments = vec![
+            crud_col("app", doc.app),
+            crud_col("title", doc.title),
+            crud_col("summary", doc.summary),
+            crud_col("kind", doc.kind),
+            crud_col("source_format", doc.source_format),
+            crud_col("source_ref", doc.source_ref),
+            crud_col("version", doc.version),
+            crud_col("labels", labels_json.as_deref()),
+            crud_col("content_json", content_json.as_str()),
+            crud_col("author", doc.author),
+            crud_col("updated_at", now),
+        ];
+        if let Some(parent_id) = doc.parent_id {
+            assignments.push(crud_col("parent_id", parent_id));
+        }
+        if let Some(slug) = slug_value.as_ref() {
+            assignments.push(crud_col("slug", slug.as_deref()));
+        }
+        if let Some(sort_order) = doc.sort_order {
+            assignments.push(crud_col("sort_order", sort_order));
+        }
+        if let Some(global_rank) = doc.global_rank {
+            assignments.push(crud_col("global_rank", global_rank));
+        }
+        if let Some(global_descendants) = doc.global_descendants {
+            assignments.push(crud_col("global_descendants", global_descendants));
+        }
         crud(conn).update(
             "api_docs",
-            &[
-                crud_col("app", doc.app),
-                crud_col("title", doc.title),
-                crud_col("summary", doc.summary),
-                crud_col("kind", doc.kind),
-                crud_col("source_format", doc.source_format),
-                crud_col("source_ref", doc.source_ref),
-                crud_col("version", doc.version),
-                crud_col("labels", labels_json.as_deref()),
-                crud_col("content_json", content_json.as_str()),
-                crud_col("author", doc.author),
-                crud_col("updated_at", now),
-            ],
+            &assignments,
             &[
                 crud_eq("project_ident", project_ident),
                 crud_eq("id", existing_id.as_str()),
             ],
         )?;
+        let updated = get_api_doc_local(conn, project_ident, &existing_id)?
+            .ok_or_else(|| anyhow::anyhow!("updated api doc not found"))?;
         ensure_api_doc_artifact_version(
             conn,
             &ApiDocArtifactVersionInput {
                 id: &existing_id,
                 project_ident,
-                app: doc.app,
-                title: doc.title,
-                summary: doc.summary,
-                kind: doc.kind,
-                source_format: doc.source_format,
-                source_ref: doc.source_ref,
-                version: doc.version,
-                labels: doc.labels,
-                content: doc.content,
+                app: &updated.app,
+                title: &updated.title,
+                summary: updated.summary.as_deref(),
+                kind: &updated.kind,
+                source_format: &updated.source_format,
+                source_ref: updated.source_ref.as_deref(),
+                version: updated.version.as_deref(),
+                labels: &updated.labels,
+                content: &updated.content,
+                parent_id: updated.parent_id.as_deref(),
+                slug: &updated.slug,
+                sort_order: updated.sort_order,
+                global_rank: updated.direct_global_rank,
+                global_descendants: updated.global_descendants,
                 author: doc.author,
                 created_at: now,
             },
         )?;
-        return get_api_doc(conn, project_ident, &existing_id)?
+        return get_api_doc_local(conn, project_ident, &existing_id)?
             .ok_or_else(|| anyhow::anyhow!("updated api doc not found"));
     }
 
@@ -8416,6 +8888,15 @@ pub fn insert_api_doc(
     let now = now_ms();
     let labels_json = serialize_string_array(doc.labels);
     let content_json = serde_json::to_string(doc.content)?;
+    let slug_value = doc
+        .slug
+        .and_then(|value| value)
+        .map(|slug| clean_api_doc_slug(Some(slug), doc.title, &id))
+        .unwrap_or_else(|| clean_api_doc_slug(None, doc.title, &id));
+    let parent_id = doc.parent_id.and_then(|value| value);
+    let sort_order = doc.sort_order.unwrap_or(0);
+    let global_rank = doc.global_rank.and_then(|value| value);
+    let global_descendants = doc.global_descendants.unwrap_or(false);
     crud(conn).insert(
         "api_docs",
         &[
@@ -8433,6 +8914,11 @@ pub fn insert_api_doc(
             crud_col("author", doc.author),
             crud_col("created_at", now),
             crud_col("updated_at", now),
+            crud_col("parent_id", parent_id),
+            crud_col("slug", slug_value.as_str()),
+            crud_col("sort_order", sort_order),
+            crud_col("global_rank", global_rank),
+            crud_col("global_descendants", global_descendants),
         ],
     )?;
     ensure_api_doc_artifact_version(
@@ -8449,11 +8935,16 @@ pub fn insert_api_doc(
             version: doc.version,
             labels: doc.labels,
             content: doc.content,
+            parent_id,
+            slug: &slug_value,
+            sort_order,
+            global_rank,
+            global_descendants,
             author: doc.author,
             created_at: now,
         },
     )?;
-    get_api_doc(conn, project_ident, &id)?
+    get_api_doc_local(conn, project_ident, &id)?
         .ok_or_else(|| anyhow::anyhow!("inserted api doc not found"))
 }
 
@@ -8462,87 +8953,34 @@ pub fn list_api_docs(
     project_ident: &str,
     filters: &ApiDocFilters<'_>,
 ) -> Result<Vec<ApiDocSummary>> {
-    ensure_existing_api_doc_artifacts(conn, project_ident)?;
-    let mut sql = format!("{} WHERE d.project_ident = ?1", api_doc_select_sql(false));
-    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(project_ident.to_string())];
-
-    if let Some(app) = filters.app.map(str::trim).filter(|v| !v.is_empty()) {
-        binds.push(Box::new(app.to_string()));
-        sql.push_str(&format!(" AND d.app = ?{}", binds.len()));
-    }
-    if let Some(kind) = filters.kind.map(str::trim).filter(|v| !v.is_empty()) {
-        binds.push(Box::new(kind.to_string()));
-        sql.push_str(&format!(" AND d.kind = ?{}", binds.len()));
-    }
-    if let Some(label) = filters.label.map(str::trim).filter(|v| !v.is_empty()) {
-        binds.push(Box::new(format!("%\"{label}\"%")));
-        sql.push_str(&format!(
-            " AND COALESCE(d.labels, '') LIKE ?{}",
-            binds.len()
-        ));
-    }
-    if let Some(q) = filters.query.map(str::trim).filter(|v| !v.is_empty()) {
-        binds.push(Box::new(format!("%{q}%")));
-        let ph = binds.len();
-        sql.push_str(&format!(
-            " AND (d.id LIKE ?{ph}
-                   OR d.app LIKE ?{ph}
-                   OR d.title LIKE ?{ph}
-                   OR COALESCE(d.summary, '') LIKE ?{ph}
-                   OR d.kind LIKE ?{ph}
-                   OR d.source_format LIKE ?{ph}
-                   OR COALESCE(d.source_ref, '') LIKE ?{ph}
-                   OR COALESCE(d.version, '') LIKE ?{ph}
-                   OR COALESCE(d.labels, '') LIKE ?{ph}
-                   OR d.content_json LIKE ?{ph}
-                   OR COALESCE(a.artifact_id, '') LIKE ?{ph}
-                   OR COALESCE(a.accepted_version_id, '') LIKE ?{ph}
-                   OR EXISTS (
-                       SELECT 1 FROM artifact_links l
-                       WHERE (l.source_id = d.id OR l.target_id = d.id)
-                         AND (l.source_id LIKE ?{ph}
-                              OR l.target_id LIKE ?{ph}
-                              OR COALESCE(l.source_version_id, '') LIKE ?{ph}
-                              OR COALESCE(l.target_version_id, '') LIKE ?{ph}
-                              OR l.link_type LIKE ?{ph})
-                   ))"
-        ));
-    }
-    sql.push_str(" ORDER BY d.updated_at DESC, d.app ASC, d.title ASC");
-
-    let params_vec: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt
-        .query_map(params_vec.as_slice(), row_to_api_doc_summary)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut seen = HashSet::new();
-    let mut deduped = Vec::new();
-    for row in rows {
-        let key = api_doc_summary_logical_key(&row);
-        if seen.insert(key) {
-            let latest = latest_api_doc_summary_for_key(conn, project_ident, &row)?;
-            deduped.push(latest.unwrap_or(row));
-        }
-    }
-    deduped.sort_by(|a, b| {
-        b.updated_at
-            .cmp(&a.updated_at)
-            .then_with(|| a.app.cmp(&b.app))
-            .then_with(|| a.title.cmp(&b.title))
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    Ok(deduped)
+    visible_api_doc_summaries(conn, project_ident, filters)
 }
 
 pub fn get_api_doc(conn: &Connection, project_ident: &str, id: &str) -> Result<Option<ApiDoc>> {
-    ensure_existing_api_doc_artifacts(conn, project_ident)?;
-    let sql = format!(
-        "{} WHERE d.project_ident = ?1 AND d.id = ?2",
-        api_doc_select_sql(true)
-    );
+    ensure_all_api_doc_artifacts(conn)?;
+    let sql = format!("{} WHERE d.id = ?1", api_doc_select_sql(true));
     let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query_map(params![project_ident, id], row_to_api_doc)?;
-    Ok(rows.next().transpose()?)
+    let mut rows = stmt.query_map(params![id], row_to_api_doc)?;
+    let mut doc = match rows.next().transpose()? {
+        Some(doc) => doc,
+        None => return Ok(None),
+    };
+    let summaries = load_all_api_doc_summaries(conn)?;
+    let docs_by_id: HashMap<String, ApiDocSummary> = summaries
+        .iter()
+        .map(|summary| (summary.id.clone(), summary.clone()))
+        .collect();
+    let Some(summary) = summaries.into_iter().find(|summary| summary.id == doc.id) else {
+        return Ok(None);
+    };
+    let Some(enriched) = enrich_api_doc_summary(summary, project_ident, &docs_by_id) else {
+        return Ok(None);
+    };
+    doc.owner_project = enriched.owner_project;
+    doc.scope = enriched.scope;
+    doc.global_rank = enriched.global_rank;
+    doc.wiki_path = enriched.wiki_path;
+    Ok(Some(doc))
 }
 
 pub fn list_api_doc_versions(
@@ -8555,13 +8993,19 @@ pub fn list_api_doc_versions(
         Some(doc) => doc,
         None => return Ok(Vec::new()),
     };
-    let logical_docs =
-        api_doc_summaries_for_logical_key(conn, project_ident, &base.app, &base.title, &base.kind)?;
+    let owner_project = base.owner_project.clone();
+    let logical_docs = api_doc_summaries_for_logical_key(
+        conn,
+        &owner_project,
+        &base.app,
+        &base.title,
+        &base.kind,
+    )?;
     let latest_doc_id = logical_docs.first().map(|doc| doc.id.clone());
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for doc in logical_docs {
-        for version in list_artifact_versions(conn, project_ident, &doc.artifact_id)? {
+        for version in list_artifact_versions(conn, &owner_project, &doc.artifact_id)? {
             if !seen.insert(version.artifact_version_id.clone()) {
                 continue;
             }
@@ -8593,7 +9037,7 @@ pub fn update_api_doc(
     id: &str,
     upd: &ApiDocUpdate<'_>,
 ) -> Result<Option<ApiDoc>> {
-    let existing = match get_api_doc(conn, project_ident, id)? {
+    let existing = match get_api_doc_local(conn, project_ident, id)? {
         Some(doc) => doc,
         None => {
             return Ok(None);
@@ -8627,12 +9071,30 @@ pub fn update_api_doc(
     if let Some(labels) = upd.labels {
         assignments.push(crud_col("labels", serialize_string_array(labels)));
     }
+    if let Some(parent_id) = upd.parent_id {
+        assignments.push(crud_col("parent_id", parent_id));
+    }
+    let slug_value = upd
+        .slug
+        .map(|value| value.map(|slug| clean_api_doc_slug(Some(slug), existing.title.as_str(), id)));
+    if let Some(slug) = slug_value.as_ref() {
+        assignments.push(crud_col("slug", slug.as_deref()));
+    }
+    if let Some(sort_order) = upd.sort_order {
+        assignments.push(crud_col("sort_order", sort_order));
+    }
+    if let Some(global_rank) = upd.global_rank {
+        assignments.push(crud_col("global_rank", global_rank));
+    }
+    if let Some(global_descendants) = upd.global_descendants {
+        assignments.push(crud_col("global_descendants", global_descendants));
+    }
     if let Some(content) = upd.content {
         assignments.push(crud_col("content_json", serde_json::to_string(content)?));
     }
 
     if assignments.is_empty() {
-        return get_api_doc(conn, project_ident, id);
+        return get_api_doc_local(conn, project_ident, id);
     }
     assignments.push(crud_col("updated_at", now));
     crud(conn).update(
@@ -8640,7 +9102,7 @@ pub fn update_api_doc(
         &assignments,
         &[crud_eq("project_ident", project_ident), crud_eq("id", id)],
     )?;
-    let updated = get_api_doc(conn, project_ident, id)?
+    let updated = get_api_doc_local(conn, project_ident, id)?
         .ok_or_else(|| anyhow::anyhow!("updated api doc not found"))?;
     ensure_api_doc_artifact_version(
         conn,
@@ -8656,11 +9118,16 @@ pub fn update_api_doc(
             version: updated.version.as_deref(),
             labels: &updated.labels,
             content: &updated.content,
+            parent_id: updated.parent_id.as_deref(),
+            slug: &updated.slug,
+            sort_order: updated.sort_order,
+            global_rank: updated.direct_global_rank,
+            global_descendants: updated.global_descendants,
             author: &existing.author,
             created_at: now,
         },
     )?;
-    get_api_doc(conn, project_ident, id)
+    get_api_doc_local(conn, project_ident, id)
 }
 
 pub fn delete_api_doc(conn: &Connection, project_ident: &str, id: &str) -> Result<bool> {
@@ -8806,6 +9273,10 @@ pub fn list_api_doc_chunks(
             chunks.push(ApiDocChunkRecord {
                 doc_id: doc.id.clone(),
                 project_ident: doc.project_ident.clone(),
+                owner_project: doc.owner_project.clone(),
+                scope: doc.scope.clone(),
+                global_rank: doc.global_rank,
+                wiki_path: doc.wiki_path.clone(),
                 app: doc.app.clone(),
                 title: doc.title.clone(),
                 chunk_type: chunk_kind.unwrap_or_else(|| child_address.clone()),
@@ -8830,6 +9301,42 @@ pub fn list_api_doc_chunks(
         }
     }
 
+    chunks.sort_by(|a, b| {
+        let a_global = a.scope == "global";
+        let b_global = b.scope == "global";
+        let chunk_score = |chunk: &ApiDocChunkRecord| -> i64 {
+            let Some(query) = filters
+                .query
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return 0;
+            };
+            api_doc_text_score(&chunk.title, query, 10)
+                + api_doc_text_score(&chunk.app, query, 6)
+                + api_doc_text_score(&chunk.chunk_type, query, 5)
+                + api_doc_text_score(&chunk.text, query, 1)
+                + api_doc_text_score(&chunk.labels.join("\n"), query, 3)
+        };
+        a_global
+            .cmp(&b_global)
+            .then_with(|| {
+                if a_global || b_global {
+                    a.global_rank
+                        .unwrap_or(i64::MAX)
+                        .cmp(&b.global_rank.unwrap_or(i64::MAX))
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .then_with(|| chunk_score(b).cmp(&chunk_score(a)))
+            .then_with(|| b.updated_at.cmp(&a.updated_at))
+            .then_with(|| a.owner_project.cmp(&b.owner_project))
+            .then_with(|| a.wiki_path.cmp(&b.wiki_path))
+            .then_with(|| a.child_address.cmp(&b.child_address))
+            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+    });
+
     if status.status != "partial" {
         status.status = if !status.failed_addresses.is_empty() {
             "partial".to_string()
@@ -8850,6 +9357,83 @@ pub fn list_api_doc_chunks(
         retrieval_scope,
         include_history,
     })
+}
+
+fn sort_api_doc_hierarchy_nodes(nodes: &mut [ApiDocHierarchyNode]) {
+    nodes.sort_by(|a, b| {
+        let a_global = a.scope == "global";
+        let b_global = b.scope == "global";
+        a_global
+            .cmp(&b_global)
+            .then_with(|| {
+                if a_global || b_global {
+                    a.global_rank
+                        .unwrap_or(i64::MAX)
+                        .cmp(&b.global_rank.unwrap_or(i64::MAX))
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .then_with(|| a.owner_project.cmp(&b.owner_project))
+            .then_with(|| a.sort_order.cmp(&b.sort_order))
+            .then_with(|| a.title.cmp(&b.title))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
+fn attach_api_doc_hierarchy_children(
+    parent_id: Option<String>,
+    by_parent: &mut HashMap<Option<String>, Vec<ApiDocHierarchyNode>>,
+) -> Vec<ApiDocHierarchyNode> {
+    let mut nodes = by_parent.remove(&parent_id).unwrap_or_default();
+    sort_api_doc_hierarchy_nodes(&mut nodes);
+    for node in &mut nodes {
+        node.children = attach_api_doc_hierarchy_children(Some(node.id.clone()), by_parent);
+    }
+    nodes
+}
+
+pub fn api_doc_hierarchy(
+    conn: &Connection,
+    project_ident: &str,
+    filters: &ApiDocFilters<'_>,
+) -> Result<Vec<ApiDocHierarchyNode>> {
+    let docs = visible_api_doc_summaries(conn, project_ident, filters)?;
+    let visible_ids: HashSet<String> = docs.iter().map(|doc| doc.id.clone()).collect();
+    let mut by_parent: HashMap<Option<String>, Vec<ApiDocHierarchyNode>> = HashMap::new();
+    for doc in docs {
+        let parent_key = doc
+            .parent_id
+            .as_ref()
+            .filter(|parent_id| visible_ids.contains(parent_id.as_str()))
+            .cloned();
+        by_parent
+            .entry(parent_key)
+            .or_default()
+            .push(ApiDocHierarchyNode {
+                id: doc.id,
+                node_type: "page".to_string(),
+                owner_project: doc.owner_project,
+                scope: doc.scope,
+                app: doc.app,
+                title: doc.title,
+                summary: doc.summary,
+                kind: doc.kind,
+                labels: doc.labels,
+                parent_id: doc.parent_id,
+                slug: doc.slug,
+                sort_order: doc.sort_order,
+                breadcrumbs: api_doc_breadcrumbs(&doc.wiki_path),
+                wiki_path: doc.wiki_path,
+                global_rank: doc.global_rank,
+                direct_global_rank: doc.direct_global_rank,
+                global_descendants: doc.global_descendants,
+                artifact_id: doc.artifact_id,
+                artifact_version_id: doc.artifact_version_id,
+                children: Vec::new(),
+            });
+    }
+    Ok(attach_api_doc_hierarchy_children(None, &mut by_parent))
 }
 
 pub fn list_pattern_comments(
@@ -10339,6 +10923,11 @@ mod tests {
                 source_ref: Some(".agent/api/billing.yaml"),
                 version: Some("2026-04-28"),
                 labels: &["billing".into(), "invoices".into()],
+                parent_id: None,
+                slug: None,
+                sort_order: None,
+                global_rank: None,
+                global_descendants: None,
                 content: &content,
                 author: "tester",
             },
@@ -10404,6 +10993,11 @@ mod tests {
                 source_ref: Some(".agent/api/billing.yaml"),
                 version: Some("2026-04-28"),
                 labels: &["billing".into(), "invoices".into()],
+                parent_id: None,
+                slug: None,
+                sort_order: None,
+                global_rank: None,
+                global_descendants: None,
                 content: &content_v1,
                 author: "tester",
             },
@@ -10427,6 +11021,11 @@ mod tests {
                 source_ref: Some(".agent/api/billing-renamed.yaml"),
                 version: Some("2026-05-01"),
                 labels: &["billing".into(), "credit-memos".into()],
+                parent_id: None,
+                slug: None,
+                sort_order: None,
+                global_rank: None,
+                global_descendants: None,
                 content: &content_v2,
                 author: "tester-2",
             },
@@ -10561,6 +11160,179 @@ mod tests {
 
         assert_eq!(list_project_stats(&conn).unwrap()[0].api_doc_count, 1);
         assert_eq!(get_dashboard_data(&conn).unwrap().api_doc_count, 1);
+    }
+
+    #[test]
+    fn api_docs_include_global_ranked_docs_and_inherited_hierarchy_visibility() {
+        let conn = test_conn();
+        for ident in ["app", "platform", "security"] {
+            insert_project(&conn, &test_project(ident)).unwrap();
+        }
+
+        let local = insert_api_doc(
+            &conn,
+            "app",
+            &ApiDocInsert {
+                app: "app-api",
+                title: "App API context",
+                summary: Some("shared ranking local context"),
+                kind: "agent_context",
+                source_format: "agent_context",
+                source_ref: None,
+                version: None,
+                labels: &["local".into()],
+                parent_id: None,
+                slug: Some(Some("app")),
+                sort_order: Some(10),
+                global_rank: None,
+                global_descendants: None,
+                content: &serde_json::json!({"purpose": "shared ranking local"}),
+                author: "tester",
+            },
+        )
+        .unwrap();
+
+        let platform_root = insert_api_doc(
+            &conn,
+            "platform",
+            &ApiDocInsert {
+                app: "platform-api",
+                title: "Platform",
+                summary: Some("shared ranking platform root"),
+                kind: "agent_context",
+                source_format: "agent_context",
+                source_ref: None,
+                version: None,
+                labels: &["platform".into()],
+                parent_id: None,
+                slug: Some(Some("platform")),
+                sort_order: Some(0),
+                global_rank: Some(Some(2)),
+                global_descendants: Some(true),
+                content: &serde_json::json!({"purpose": "shared ranking platform root"}),
+                author: "tester",
+            },
+        )
+        .unwrap();
+
+        let platform_child = insert_api_doc(
+            &conn,
+            "platform",
+            &ApiDocInsert {
+                app: "platform-api",
+                title: "Platform Child",
+                summary: Some("inherited child page"),
+                kind: "agent_context",
+                source_format: "agent_context",
+                source_ref: None,
+                version: None,
+                labels: &["platform-child".into()],
+                parent_id: Some(Some(platform_root.id.as_str())),
+                slug: Some(Some("child")),
+                sort_order: Some(1),
+                global_rank: None,
+                global_descendants: None,
+                content: &serde_json::json!({"purpose": "inherited child shared ranking"}),
+                author: "tester",
+            },
+        )
+        .unwrap();
+
+        let security = insert_api_doc(
+            &conn,
+            "security",
+            &ApiDocInsert {
+                app: "security-api",
+                title: "Security Guide",
+                summary: Some("shared ranking security"),
+                kind: "agent_context",
+                source_format: "agent_context",
+                source_ref: None,
+                version: None,
+                labels: &["security".into()],
+                parent_id: None,
+                slug: Some(Some("security-guide")),
+                sort_order: Some(0),
+                global_rank: Some(Some(1)),
+                global_descendants: Some(false),
+                content: &serde_json::json!({"purpose": "shared ranking security"}),
+                author: "tester",
+            },
+        )
+        .unwrap();
+
+        let docs = list_api_docs(
+            &conn,
+            "app",
+            &ApiDocFilters {
+                query: Some("shared ranking"),
+                ..ApiDocFilters::default()
+            },
+        )
+        .unwrap();
+        let ids = docs.iter().map(|doc| doc.id.as_str()).collect::<Vec<_>>();
+        assert_eq!(ids[0], local.id.as_str());
+        let security_pos = ids
+            .iter()
+            .position(|id| *id == security.id.as_str())
+            .unwrap();
+        let platform_root_pos = ids
+            .iter()
+            .position(|id| *id == platform_root.id.as_str())
+            .unwrap();
+        let platform_child_pos = ids
+            .iter()
+            .position(|id| *id == platform_child.id.as_str())
+            .unwrap();
+        assert!(security_pos < platform_root_pos);
+        assert!(security_pos < platform_child_pos);
+
+        let child_summary = docs.iter().find(|doc| doc.id == platform_child.id).unwrap();
+        assert_eq!(child_summary.scope, "global");
+        assert_eq!(child_summary.owner_project, "platform");
+        assert_eq!(child_summary.global_rank, Some(2));
+        assert_eq!(child_summary.direct_global_rank, None);
+        assert_eq!(child_summary.wiki_path, "/platform/child");
+
+        let fetched_global = get_api_doc(&conn, "app", &platform_child.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched_global.scope, "global");
+        assert_eq!(fetched_global.owner_project, "platform");
+        assert_eq!(fetched_global.global_rank, Some(2));
+        assert_eq!(fetched_global.wiki_path, "/platform/child");
+
+        let hierarchy = api_doc_hierarchy(&conn, "app", &ApiDocFilters::default()).unwrap();
+        let platform_node = hierarchy
+            .iter()
+            .find(|node| node.id == platform_root.id)
+            .unwrap();
+        assert_eq!(platform_node.scope, "global");
+        assert_eq!(platform_node.global_rank, Some(2));
+        assert_eq!(platform_node.children.len(), 1);
+        assert_eq!(platform_node.children[0].id, platform_child.id);
+        assert_eq!(platform_node.children[0].wiki_path, "/platform/child");
+
+        let chunks = list_api_doc_chunks(
+            &conn,
+            "app",
+            &ApiDocFilters {
+                query: Some("inherited child"),
+                ..ApiDocFilters::default()
+            },
+            false,
+        )
+        .unwrap();
+        assert!(!chunks.chunks.is_empty());
+        assert!(chunks
+            .chunks
+            .iter()
+            .all(|chunk| chunk.doc_id == platform_child.id));
+        let child_chunk = &chunks.chunks[0];
+        assert_eq!(child_chunk.scope, "global");
+        assert_eq!(child_chunk.owner_project, "platform");
+        assert_eq!(child_chunk.global_rank, Some(2));
+        assert_eq!(child_chunk.wiki_path, "/platform/child");
     }
 
     #[test]
@@ -11113,6 +11885,11 @@ mod tests {
                 source_ref: Some(".agent/api/billing.yaml"),
                 version: Some("2026-04-28"),
                 labels: &["billing".into(), "invoices".into()],
+                parent_id: None,
+                slug: None,
+                sort_order: None,
+                global_rank: None,
+                global_descendants: None,
                 content: &content_v1,
                 author: "tester",
             },
@@ -11276,6 +12053,11 @@ mod tests {
                 source_ref: Some(".agent/api/docs.yaml"),
                 version: None,
                 labels: &["docs".into()],
+                parent_id: None,
+                slug: None,
+                sort_order: None,
+                global_rank: None,
+                global_descendants: None,
                 content: &serde_json::json!({"purpose": "links to project resources"}),
                 author: "tester",
             },
@@ -11449,6 +12231,11 @@ mod tests {
                 source_ref: None,
                 version: None,
                 labels: &[],
+                parent_id: None,
+                slug: None,
+                sort_order: None,
+                global_rank: None,
+                global_descendants: None,
                 content: &serde_json::json!({"purpose": "x"}),
                 author: "tester",
             },
@@ -12251,6 +13038,11 @@ mod tests {
                 source_ref: None,
                 version: None,
                 labels: &[],
+                parent_id: None,
+                slug: None,
+                sort_order: None,
+                global_rank: None,
+                global_descendants: None,
                 content: &serde_json::json!({"purpose": "linked fixture"}),
                 author: "repo-agent",
             },
