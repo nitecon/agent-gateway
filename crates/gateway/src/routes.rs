@@ -10827,6 +10827,7 @@ mod tests {
         (status, value)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_ui_doc(
         conn: &rusqlite::Connection,
         project_ident: &str,

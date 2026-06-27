@@ -8082,9 +8082,7 @@ fn api_doc_effective_global_rank(
         if !seen.insert(id.to_string()) {
             return None;
         }
-        let Some(parent) = docs_by_id.get(id) else {
-            return None;
-        };
+        let parent = docs_by_id.get(id)?;
         if parent.project_ident != doc.project_ident {
             return None;
         }
