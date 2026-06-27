@@ -1,5 +1,14 @@
 use sha2::{Digest, Sha256};
 
+/// Normalize an existing project identifier supplied by a client.
+///
+/// Registration still uses [`sanitize_ident`] because it may receive a path or
+/// repository URL. Existing project references are already identifiers, so they
+/// are only trimmed and lowercased.
+pub fn normalize_project_ident(raw: &str) -> String {
+    raw.trim().to_lowercase()
+}
+
 /// Sanitize an arbitrary project identity string into a valid Discord channel name.
 ///
 /// Discord channel rules: lowercase letters, digits, hyphens, underscores;
@@ -84,6 +93,11 @@ mod tests {
         // trailing '!' becomes '-', which is then stripped by step 6
         assert_eq!(sanitize_ident("My Project!"), "my-project");
         assert_eq!(sanitize_ident("hello world"), "hello-world");
+    }
+
+    #[test]
+    fn normalizes_existing_project_ident_to_lowercase() {
+        assert_eq!(normalize_project_ident("  My-Project_1  "), "my-project_1");
     }
 
     #[test]

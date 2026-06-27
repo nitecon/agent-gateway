@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use crate::projects::normalize_project_ident;
 use anyhow::{bail, Context, Result};
 use rusqlite::{
     params,
@@ -742,6 +743,128 @@ fn validate_identifier(identifier: &str) -> Result<()> {
     Ok(())
 }
 
+fn normalize_optional_lowercase(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(normalize_project_ident)
+}
+
+fn validate_lowercase_project_column(conn: &Connection, table: &str, column: &str) -> Result<()> {
+    validate_identifier(table)?;
+    validate_identifier(column)?;
+    let sql = format!("SELECT {column} FROM {table} WHERE {column} IS NOT NULL");
+    let mut stmt = conn.prepare(&sql)?;
+    let values = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for value in values {
+        let normalized = normalize_project_ident(&value);
+        if value != normalized {
+            bail!(
+                "{table}.{column} contains non-lowercase project value '{value}' (expected '{normalized}')"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_project_casing(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT ident, repo_provider, repo_namespace, repo_name, repo_full_name
+         FROM projects",
+    )?;
+    let projects = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut project_idents = HashMap::new();
+    let mut repo_mappings = HashMap::new();
+    for (ident, repo_provider, repo_namespace, repo_name, repo_full_name) in projects {
+        let normalized_ident = normalize_project_ident(&ident);
+        if let Some(previous) = project_idents.insert(normalized_ident.clone(), ident.clone()) {
+            if previous != ident {
+                bail!("projects '{previous}' and '{ident}' both normalize to '{normalized_ident}'");
+            }
+        }
+        if ident != normalized_ident {
+            bail!("projects.ident '{ident}' must be lowercase '{normalized_ident}'");
+        }
+
+        for (field, value) in [
+            ("repo_provider", repo_provider.as_deref()),
+            ("repo_namespace", repo_namespace.as_deref()),
+            ("repo_name", repo_name.as_deref()),
+            ("repo_full_name", repo_full_name.as_deref()),
+        ] {
+            if let Some(value) = value {
+                let normalized = normalize_project_ident(value);
+                if value != normalized {
+                    bail!(
+                        "projects.{field} for project '{ident}' must be lowercase '{normalized}'"
+                    );
+                }
+            }
+        }
+
+        if let Some(repo_full_name) = repo_full_name.as_deref() {
+            let provider_key = repo_provider
+                .as_deref()
+                .map(normalize_project_ident)
+                .unwrap_or_default();
+            let repo_key = normalize_project_ident(repo_full_name);
+            if let Some(previous) =
+                repo_mappings.insert((provider_key.clone(), repo_key.clone()), ident.clone())
+            {
+                if previous != ident {
+                    bail!(
+                        "projects '{previous}' and '{ident}' are mapped to the same repository '{repo_key}' for provider '{provider_key}'"
+                    );
+                }
+            }
+        }
+    }
+
+    for (table, column) in [
+        ("cursors", "project_ident"),
+        ("messages", "project_ident"),
+        ("agents", "project_ident"),
+        ("agent_confirmations", "project_ident"),
+        ("tasks", "project_ident"),
+        ("tasks", "delegated_to_project_ident"),
+        ("task_delegations", "source_project_ident"),
+        ("task_delegations", "target_project_ident"),
+        ("api_docs", "project_ident"),
+        ("gateway_memories", "project_ident"),
+        ("gateway_memory_client_links", "project_ident"),
+        ("artifacts", "project_ident"),
+    ] {
+        validate_lowercase_project_column(conn, table, column)?;
+    }
+
+    Ok(())
+}
+
+fn ensure_project_uniqueness_indexes(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_ident_nocase
+            ON projects(ident COLLATE NOCASE);
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_repo_mapping_nocase
+            ON projects(repo_provider COLLATE NOCASE, repo_full_name COLLATE NOCASE)
+            WHERE repo_provider IS NOT NULL AND repo_full_name IS NOT NULL;",
+    )
+    .context("create project case-insensitive uniqueness indexes")?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Project {
     pub ident: String,
@@ -1141,6 +1264,8 @@ fn apply_schema(conn: &Connection) -> Result<()> {
     )?;
 
     apply_artifact_substrate_schema(conn)?;
+    validate_project_casing(conn)?;
+    ensure_project_uniqueness_indexes(conn)?;
 
     Ok(())
 }
@@ -3243,6 +3368,7 @@ fn artifact_actor_upsert(
 fn artifact_insert(conn: &Connection, input: &ArtifactInsert<'_>) -> Result<String> {
     let id = new_uuid();
     let now = now_ms();
+    let project_ident = normalize_project_ident(input.project_ident);
     let implementation_state = if input.kind == "spec" {
         "not_started"
     } else {
@@ -3252,7 +3378,7 @@ fn artifact_insert(conn: &Connection, input: &ArtifactInsert<'_>) -> Result<Stri
         "artifacts",
         &[
             crud_col("artifact_id", id.as_str()),
-            crud_col("project_ident", input.project_ident),
+            crud_col("project_ident", project_ident.as_str()),
             crud_col("kind", input.kind),
             crud_col("subkind", input.subkind),
             crud_col("title", input.title),
@@ -3788,8 +3914,9 @@ fn require_artifact_project(
     project_ident: &str,
     artifact_id: &str,
 ) -> Result<()> {
+    let project_ident = normalize_project_ident(project_ident);
     let found = artifact_project_ident(conn, artifact_id)?;
-    if found.as_deref() != Some(project_ident) {
+    if found.as_deref() != Some(project_ident.as_str()) {
         anyhow::bail!("artifact not found in project");
     }
     Ok(())
@@ -3836,6 +3963,7 @@ fn artifact_quota_count(
     project_ident: &str,
     counter: QuotaCounter,
 ) -> Result<u64> {
+    let project_ident = normalize_project_ident(project_ident);
     let sql: String = match counter {
         QuotaCounter::Artifact => {
             "SELECT COUNT(*) FROM artifacts WHERE project_ident = ?1 AND lifecycle_state != 'archived'"
@@ -3874,7 +4002,7 @@ fn artifact_quota_count(
     let count: i64 = if counter == QuotaCounter::WriteRpm {
         conn.query_row(&sql, [], |r| r.get(0))?
     } else {
-        conn.query_row(&sql, params![project_ident], |r| r.get(0))?
+        conn.query_row(&sql, params![project_ident.as_str()], |r| r.get(0))?
     };
     Ok(count as u64)
 }
@@ -4099,7 +4227,8 @@ pub fn update_artifact(
     update: &ArtifactUpdate<'_>,
     envelope: &ArtifactOperationsEnvelope,
 ) -> Result<Option<ArtifactSummary>> {
-    require_artifact_project(conn, project_ident, artifact_id)?;
+    let project_ident = normalize_project_ident(project_ident);
+    require_artifact_project(conn, &project_ident, artifact_id)?;
     if let Some(labels) = update.labels {
         check_labels(labels, envelope)?;
     }
@@ -4126,14 +4255,14 @@ pub fn update_artifact(
         "artifacts",
         &assignments,
         &[
-            crud_eq("project_ident", project_ident),
+            crud_eq("project_ident", project_ident.as_str()),
             crud_eq("artifact_id", artifact_id),
         ],
     )?;
     if changed == 0 {
         return Ok(None);
     }
-    get_artifact_summary(conn, project_ident, artifact_id)
+    get_artifact_summary(conn, &project_ident, artifact_id)
 }
 
 pub fn list_artifacts(
@@ -4141,10 +4270,11 @@ pub fn list_artifacts(
     project_ident: &str,
     filters: &ArtifactFilters<'_>,
 ) -> Result<Vec<ArtifactSummary>> {
+    let project_ident = normalize_project_ident(project_ident);
     let mut query = ArtifactQueryBuilder::new(format!(
         "SELECT {ARTIFACT_SUMMARY_SELECT_COLS} FROM artifacts a WHERE a.project_ident = ?1"
     ))
-    .with_bind(project_ident.to_string());
+    .with_bind(project_ident);
 
     query.and_trimmed_exact("a.kind", filters.kind);
     query.and_trimmed_exact("a.subkind", filters.subkind);
@@ -4201,12 +4331,16 @@ pub fn get_artifact_summary(
     project_ident: &str,
     artifact_id: &str,
 ) -> Result<Option<ArtifactSummary>> {
+    let project_ident = normalize_project_ident(project_ident);
     let sql = format!(
         "SELECT {ARTIFACT_SUMMARY_SELECT_COLS} FROM artifacts
          WHERE project_ident = ?1 AND artifact_id = ?2"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query_map(params![project_ident, artifact_id], row_to_artifact_summary)?;
+    let mut rows = stmt.query_map(
+        params![project_ident.as_str(), artifact_id],
+        row_to_artifact_summary,
+    )?;
     Ok(rows.next().transpose()?)
 }
 
@@ -4891,6 +5025,7 @@ pub fn list_artifact_links(
     project_ident: &str,
     filters: &ArtifactLinkFilters<'_>,
 ) -> Result<Vec<ArtifactLink>> {
+    let project_ident = normalize_project_ident(project_ident);
     // Project-scoped visibility is shared with the link quota counter via
     // `artifact_link_visibility_clause`; downstream T007 routes and T017
     // authorization checks should compose with that helper rather than
@@ -4899,7 +5034,7 @@ pub fn list_artifact_links(
         "SELECT {ARTIFACT_LINK_SELECT_COLS} FROM artifact_links l WHERE {}",
         artifact_link_visibility_clause("l", 1),
     ))
-    .with_bind(project_ident.to_string());
+    .with_bind(project_ident);
     query.and_trimmed_exact("l.link_type", filters.link_type);
     query.and_trimmed_exact("l.source_kind", filters.source_kind);
     query.and_trimmed_exact("l.source_id", filters.source_id);
@@ -5275,12 +5410,13 @@ pub fn set_theme(conn: &Connection, theme: &str) -> Result<()> {
 // ── Projects ─────────────────────────────────────────────────────────────────
 
 pub fn get_project(conn: &Connection, ident: &str) -> Result<Option<Project>> {
+    let ident = normalize_project_ident(ident);
     let mut stmt = conn.prepare_cached(
         "SELECT ident, channel_name, room_id, last_msg_id, created_at,
                 repo_provider, repo_namespace, repo_name, repo_full_name
          FROM projects WHERE ident = ?1",
     )?;
-    let mut rows = stmt.query_map(params![ident], row_to_project)?;
+    let mut rows = stmt.query_map(params![ident.as_str()], row_to_project)?;
     Ok(rows.next().transpose()?)
 }
 
@@ -5300,25 +5436,42 @@ pub fn get_project_by_room(
 }
 
 pub fn insert_project(conn: &Connection, p: &Project) -> Result<()> {
+    let ident = normalize_project_ident(&p.ident);
+    let repo_provider = normalize_optional_lowercase(p.repo_provider.as_deref());
+    let repo_namespace = normalize_optional_lowercase(p.repo_namespace.as_deref());
+    let repo_name = normalize_optional_lowercase(p.repo_name.as_deref());
+    let repo_full_name =
+        normalize_optional_lowercase(p.repo_full_name.as_deref()).or_else(|| {
+            match (repo_namespace.as_deref(), repo_name.as_deref()) {
+                (Some(namespace), Some(repo_name)) => Some(format!("{namespace}/{repo_name}")),
+                _ => None,
+            }
+        });
+    ensure_repo_mapping_available(
+        conn,
+        &ident,
+        repo_provider.as_deref(),
+        repo_full_name.as_deref(),
+    )?;
     crud(conn).insert_do_nothing(
         "projects",
         &[
-            crud_col("ident", p.ident.as_str()),
+            crud_col("ident", ident.as_str()),
             crud_col("channel_name", p.channel_name.as_str()),
             crud_col("room_id", p.room_id.as_str()),
             crud_col("last_msg_id", p.last_msg_id.as_deref()),
             crud_col("created_at", p.created_at),
-            crud_col("repo_provider", p.repo_provider.as_deref()),
-            crud_col("repo_namespace", p.repo_namespace.as_deref()),
-            crud_col("repo_name", p.repo_name.as_deref()),
-            crud_col("repo_full_name", p.repo_full_name.as_deref()),
+            crud_col("repo_provider", repo_provider.as_deref()),
+            crud_col("repo_namespace", repo_namespace.as_deref()),
+            crud_col("repo_name", repo_name.as_deref()),
+            crud_col("repo_full_name", repo_full_name.as_deref()),
         ],
         &["ident"],
     )?;
     crud(conn).insert_do_nothing(
         "cursors",
         &[
-            crud_col("project_ident", p.ident.as_str()),
+            crud_col("project_ident", ident.as_str()),
             crud_col("last_read_id", 0_i64),
             crud_col("updated_at", p.created_at),
         ],
@@ -5343,10 +5496,11 @@ pub fn all_projects(conn: &Connection) -> Result<Vec<Project>> {
 }
 
 pub fn update_last_msg_id(conn: &Connection, ident: &str, msg_id: &str) -> Result<()> {
+    let ident = normalize_project_ident(ident);
     crud(conn).update(
         "projects",
         &[crud_col("last_msg_id", msg_id)],
-        &[crud_eq("ident", ident)],
+        &[crud_eq("ident", ident.as_str())],
     )?;
     Ok(())
 }
@@ -5365,6 +5519,36 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     })
 }
 
+fn ensure_repo_mapping_available(
+    conn: &Connection,
+    ident: &str,
+    provider: Option<&str>,
+    repo_full_name: Option<&str>,
+) -> Result<()> {
+    let Some(repo_full_name) = repo_full_name else {
+        return Ok(());
+    };
+    let provider = provider.unwrap_or("");
+    let conflict: Option<String> = conn
+        .query_row(
+            "SELECT ident
+             FROM projects
+             WHERE ident != ?1
+               AND COALESCE(repo_provider, '') = ?2
+               AND repo_full_name = ?3
+             LIMIT 1",
+            params![ident, provider, repo_full_name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(conflict) = conflict {
+        bail!(
+            "repository '{repo_full_name}' for provider '{provider}' is already mapped to project '{conflict}'"
+        );
+    }
+    Ok(())
+}
+
 pub fn update_project_repo_mapping(
     conn: &Connection,
     ident: &str,
@@ -5372,25 +5556,27 @@ pub fn update_project_repo_mapping(
     namespace: Option<&str>,
     repo_name: Option<&str>,
 ) -> Result<Option<Project>> {
-    let provider = provider.map(str::trim).filter(|s| !s.is_empty());
-    let namespace = namespace.map(str::trim).filter(|s| !s.is_empty());
-    let repo_name = repo_name.map(str::trim).filter(|s| !s.is_empty());
-    let repo_full_name = match (namespace, repo_name) {
+    let ident = normalize_project_ident(ident);
+    let provider = normalize_optional_lowercase(provider);
+    let namespace = normalize_optional_lowercase(namespace);
+    let repo_name = normalize_optional_lowercase(repo_name);
+    let repo_full_name = match (namespace.as_deref(), repo_name.as_deref()) {
         (Some(ns), Some(repo)) => Some(format!("{ns}/{repo}")),
         _ => None,
     };
+    ensure_repo_mapping_available(conn, &ident, provider.as_deref(), repo_full_name.as_deref())?;
 
     crud(conn).update(
         "projects",
         &[
-            crud_col("repo_provider", provider),
-            crud_col("repo_namespace", namespace),
-            crud_col("repo_name", repo_name),
-            crud_col("repo_full_name", repo_full_name),
+            crud_col("repo_provider", provider.as_deref()),
+            crud_col("repo_namespace", namespace.as_deref()),
+            crud_col("repo_name", repo_name.as_deref()),
+            crud_col("repo_full_name", repo_full_name.as_deref()),
         ],
-        &[crud_eq("ident", ident)],
+        &[crud_eq("ident", ident.as_str())],
     )?;
-    get_project(conn, ident)
+    get_project(conn, &ident)
 }
 
 pub fn bulk_fill_missing_repo_mappings(
@@ -5398,11 +5584,12 @@ pub fn bulk_fill_missing_repo_mappings(
     provider: &str,
     namespace: &str,
 ) -> Result<usize> {
-    let provider = provider.trim();
-    let namespace = namespace.trim();
-    if provider.is_empty() || namespace.is_empty() {
+    let Some(provider) = normalize_optional_lowercase(Some(provider)) else {
         return Ok(0);
-    }
+    };
+    let Some(namespace) = normalize_optional_lowercase(Some(namespace)) else {
+        return Ok(0);
+    };
 
     let projects = all_projects(conn)?;
     let mut changed = 0;
@@ -5411,13 +5598,19 @@ pub fn bulk_fill_missing_repo_mappings(
         .filter(|project| project.repo_full_name.as_deref().unwrap_or("").is_empty())
     {
         let repo_full_name = format!("{namespace}/{}", project.ident);
+        ensure_repo_mapping_available(
+            conn,
+            &project.ident,
+            Some(&provider),
+            Some(&repo_full_name),
+        )?;
         changed += crud(conn).update(
             "projects",
             &[
-                crud_col("repo_provider", provider),
-                crud_col("repo_namespace", namespace),
+                crud_col("repo_provider", provider.as_str()),
+                crud_col("repo_namespace", namespace.as_str()),
                 crud_col("repo_name", project.ident.as_str()),
-                crud_col("repo_full_name", repo_full_name),
+                crud_col("repo_full_name", repo_full_name.as_str()),
             ],
             &[crud_eq("ident", project.ident.as_str())],
         )?;
@@ -5428,6 +5621,7 @@ pub fn bulk_fill_missing_repo_mappings(
 // ── Messages ─────────────────────────────────────────────────────────────────
 
 pub fn insert_message(conn: &Connection, m: &Message) -> Result<i64> {
+    let project_ident = normalize_project_ident(&m.project_ident);
     let confirmed_at = if m.source == "agent" || (m.source == "system" && !m.deliver_to_agents) {
         Some(now_ms())
     } else {
@@ -5436,7 +5630,7 @@ pub fn insert_message(conn: &Connection, m: &Message) -> Result<i64> {
     crud(conn).insert(
         "messages",
         &[
-            crud_col("project_ident", m.project_ident.as_str()),
+            crud_col("project_ident", project_ident.as_str()),
             crud_col("source", m.source.as_str()),
             crud_col("external_message_id", m.external_message_id.as_deref()),
             crud_col("content", m.content.as_str()),
@@ -5460,7 +5654,7 @@ pub fn insert_message(conn: &Connection, m: &Message) -> Result<i64> {
                 "agent_confirmations",
                 &[
                     crud_col("agent_id", aid.as_str()),
-                    crud_col("project_ident", m.project_ident.as_str()),
+                    crud_col("project_ident", project_ident.as_str()),
                     crud_col("message_id", msg_id),
                     crud_col("confirmed_at", now_ms()),
                 ],
@@ -5477,13 +5671,14 @@ pub fn message_external_id_exists(
     project_ident: &str,
     external_message_id: &str,
 ) -> Result<bool> {
+    let project_ident = normalize_project_ident(project_ident);
     let exists: i64 = conn.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM messages
             WHERE project_ident = ?1
               AND external_message_id = ?2
         )",
-        params![project_ident, external_message_id],
+        params![project_ident.as_str(), external_message_id],
         |row| row.get(0),
     )?;
     Ok(exists != 0)
@@ -5491,10 +5686,11 @@ pub fn message_external_id_exists(
 
 /// Lazily register an agent for a project.
 pub fn upsert_agent(conn: &Connection, project_ident: &str, agent_id: &str) -> Result<()> {
+    let project_ident = normalize_project_ident(project_ident);
     crud(conn).insert_do_nothing(
         "agents",
         &[
-            crud_col("project_ident", project_ident),
+            crud_col("project_ident", project_ident.as_str()),
             crud_col("agent_id", agent_id),
             crud_col("registered_at", now_ms()),
         ],
@@ -5509,6 +5705,7 @@ pub fn get_unconfirmed_for_agent(
     ident: &str,
     agent_id: &str,
 ) -> Result<Vec<Message>> {
+    let ident = normalize_project_ident(ident);
     let mut stmt = conn.prepare_cached(
         "SELECT m.id, m.project_ident, m.source, m.external_message_id,
                 m.content, m.sent_at, m.confirmed_at,
@@ -5526,7 +5723,7 @@ pub fn get_unconfirmed_for_agent(
          ORDER BY m.id ASC",
     )?;
     let collected = stmt
-        .query_map(params![ident, agent_id], row_to_message)?
+        .query_map(params![ident.as_str(), agent_id], row_to_message)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(collected)
 }
@@ -5538,11 +5735,12 @@ pub fn confirm_message_for_agent(
     agent_id: &str,
     msg_id: i64,
 ) -> Result<bool> {
+    let project_ident = normalize_project_ident(project_ident);
     let n = crud(conn).insert_do_nothing(
         "agent_confirmations",
         &[
             crud_col("agent_id", agent_id),
-            crud_col("project_ident", project_ident),
+            crud_col("project_ident", project_ident.as_str()),
             crud_col("message_id", msg_id),
             crud_col("confirmed_at", now_ms()),
         ],
@@ -5557,13 +5755,14 @@ pub fn get_message_by_id(
     project_ident: &str,
     msg_id: i64,
 ) -> Result<Option<Message>> {
+    let project_ident = normalize_project_ident(project_ident);
     let mut stmt = conn.prepare_cached(
         "SELECT id, project_ident, source, external_message_id, content, sent_at, confirmed_at,
                 parent_message_id, agent_id, message_type, subject, hostname, event_at, deliver_to_agents
          FROM messages
          WHERE id = ?1 AND project_ident = ?2",
     )?;
-    let mut rows = stmt.query_map(params![msg_id, project_ident], row_to_message)?;
+    let mut rows = stmt.query_map(params![msg_id, project_ident.as_str()], row_to_message)?;
     Ok(rows.next().transpose()?)
 }
 
@@ -5639,7 +5838,7 @@ pub const GLOBAL_MEMORY_IDENT: &str = "__global__";
 /// and project enumerations use it to filter the reserved row out of
 /// human-facing listings.
 pub fn is_global_memory_ident(ident: &str) -> bool {
-    ident == GLOBAL_MEMORY_IDENT
+    normalize_project_ident(ident) == GLOBAL_MEMORY_IDENT
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -5888,6 +6087,7 @@ fn validate_memory_scope(
         }
     }
     if let Some(item_project) = clean_optional(&item.project_ident) {
+        let item_project = normalize_project_ident(&item_project);
         if item_project != project_ident {
             return Err(format!(
                 "memory project_ident '{}' does not match route project '{}'",
@@ -5912,22 +6112,24 @@ fn resolve_memory_content_hash(
 }
 
 fn next_memory_revision(conn: &Connection, project_ident: &str) -> Result<i64> {
+    let project_ident = normalize_project_ident(project_ident);
     let current: i64 = conn.query_row(
         "SELECT COALESCE(MAX(server_revision), 0)
          FROM gateway_memories
          WHERE project_ident = ?1",
-        [project_ident],
+        [project_ident.as_str()],
         |r| r.get(0),
     )?;
     Ok(current + 1)
 }
 
 pub fn memory_project_revision(conn: &Connection, project_ident: &str) -> Result<i64> {
+    let project_ident = normalize_project_ident(project_ident);
     let current: i64 = conn.query_row(
         "SELECT COALESCE(MAX(server_revision), 0)
          FROM gateway_memories
          WHERE project_ident = ?1",
-        [project_ident],
+        [project_ident.as_str()],
         |r| r.get(0),
     )?;
     Ok(current)
@@ -6600,7 +6802,8 @@ pub fn push_project_memories(
     source: &MemoryPushSource,
     memories: &[MemoryPushItem],
 ) -> Result<MemoryPushResponse> {
-    let is_global = is_global_memory_ident(project_ident);
+    let project_ident = normalize_project_ident(project_ident);
+    let is_global = is_global_memory_ident(&project_ident);
     if is_global {
         // Materialize the reserved project row on demand so the
         // `gateway_memories.project_ident` foreign key holds. Idempotent — never
@@ -6612,15 +6815,15 @@ pub fn push_project_memories(
     for item in memories {
         results.push(push_one_memory(
             conn,
-            project_ident,
+            &project_ident,
             source,
             item,
             is_global,
         )?);
     }
     Ok(MemoryPushResponse {
-        project_ident: project_ident.to_string(),
-        server_revision: memory_project_revision(conn, project_ident)?,
+        project_ident: project_ident.clone(),
+        server_revision: memory_project_revision(conn, &project_ident)?,
         results,
     })
 }
@@ -6679,9 +6882,10 @@ pub fn list_project_memories(
     project_ident: &str,
     filters: &MemoryFilters<'_>,
 ) -> Result<Vec<MemoryRecord>> {
+    let project_ident = normalize_project_ident(project_ident);
     let mut sql =
         format!("SELECT {MEMORY_SELECT_COLS} FROM gateway_memories WHERE project_ident = ?1");
-    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(project_ident.to_string())];
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(project_ident.clone())];
 
     if !filters.include_tombstones {
         sql.push_str(" AND tombstoned_at IS NULL");
@@ -6734,10 +6938,11 @@ pub fn search_project_memories(
     project_ident: &str,
     filters: &MemoryFilters<'_>,
 ) -> Result<MemorySearchResponse> {
+    let project_ident = normalize_project_ident(project_ident);
     Ok(MemorySearchResponse {
-        project_ident: project_ident.to_string(),
-        server_revision: memory_project_revision(conn, project_ident)?,
-        memories: list_project_memories(conn, project_ident, filters)?,
+        project_ident: project_ident.clone(),
+        server_revision: memory_project_revision(conn, &project_ident)?,
+        memories: list_project_memories(conn, &project_ident, filters)?,
     })
 }
 
@@ -6749,6 +6954,7 @@ pub fn pull_project_memories(
     include_tombstones: bool,
     page_size: Option<usize>,
 ) -> Result<MemoryPullResponse> {
+    let project_ident = normalize_project_ident(project_ident);
     let since_revision = since_revision.unwrap_or(0).max(0);
     let limit = normalized_memory_limit(page_size);
     let mut sql = format!(
@@ -6765,7 +6971,7 @@ pub fn pull_project_memories(
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt
         .query_map(
-            params![project_ident, since_revision, fetch_limit],
+            params![project_ident.as_str(), since_revision, fetch_limit],
             row_to_memory_record,
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -6801,7 +7007,7 @@ pub fn pull_project_memories(
 
     let mut conflicts = Vec::new();
     for known in known {
-        if let Some(record) = get_memory_record(conn, project_ident, &known.gateway_memory_id)? {
+        if let Some(record) = get_memory_record(conn, &project_ident, &known.gateway_memory_id)? {
             if record.server_revision > known.server_revision {
                 conflicts.push(MemoryConflict {
                     gateway_memory_id: record.id,
@@ -6816,8 +7022,8 @@ pub fn pull_project_memories(
     }
 
     Ok(MemoryPullResponse {
-        project_ident: project_ident.to_string(),
-        server_revision: memory_project_revision(conn, project_ident)?,
+        project_ident: project_ident.clone(),
+        server_revision: memory_project_revision(conn, &project_ident)?,
         since_revision,
         next_since_revision,
         has_more,
@@ -8436,6 +8642,7 @@ fn ensure_api_doc_artifact_version(
     conn: &Connection,
     input: &ApiDocArtifactVersionInput<'_>,
 ) -> Result<String> {
+    let project_ident = normalize_project_ident(input.project_ident);
     let actor_id = api_doc_actor(conn, input.author)?;
     let artifact_labels = api_doc_artifact_labels(input.labels);
     let labels_json = serialize_string_array(&artifact_labels);
@@ -8451,7 +8658,7 @@ fn ensure_api_doc_artifact_version(
             "artifacts",
             &[
                 crud_col("artifact_id", input.id),
-                crud_col("project_ident", input.project_ident),
+                crud_col("project_ident", project_ident.as_str()),
                 crud_col("kind", API_DOC_ARTIFACT_KIND),
                 crud_col("subkind", API_DOC_SUBKIND),
                 crud_col("title", input.title),
@@ -8613,6 +8820,7 @@ fn supersede_api_doc_parent_chunks(
 }
 
 fn ensure_existing_api_doc_artifacts(conn: &Connection, project_ident: &str) -> Result<()> {
+    let project_ident = normalize_project_ident(project_ident);
     let mut stmt = conn.prepare(
         "SELECT d.id, d.project_ident, d.app, d.title, d.summary, d.kind,
                 d.source_format, d.source_ref, d.version, d.labels, d.content_json,
@@ -8622,7 +8830,7 @@ fn ensure_existing_api_doc_artifacts(conn: &Connection, project_ident: &str) -> 
          WHERE d.project_ident = ?1 AND a.artifact_id IS NULL",
     )?;
     let rows = stmt
-        .query_map(params![project_ident], |row| {
+        .query_map(params![project_ident.as_str()], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -8714,6 +8922,7 @@ fn visible_api_doc_summaries(
     project_ident: &str,
     filters: &ApiDocFilters<'_>,
 ) -> Result<Vec<ApiDocSummary>> {
+    let project_ident = normalize_project_ident(project_ident);
     ensure_all_api_doc_artifacts(conn)?;
     let all_docs = load_all_api_doc_summaries(conn)?;
     let docs_by_id: HashMap<String, ApiDocSummary> = all_docs
@@ -8722,7 +8931,7 @@ fn visible_api_doc_summaries(
         .collect();
     let mut latest_visible_by_key: HashMap<String, ApiDocSummary> = HashMap::new();
     for doc in all_docs.iter().cloned() {
-        let Some(enriched) = enrich_api_doc_summary(doc, project_ident, &docs_by_id) else {
+        let Some(enriched) = enrich_api_doc_summary(doc, &project_ident, &docs_by_id) else {
             continue;
         };
         let key = api_doc_summary_logical_key(&enriched);
@@ -8737,7 +8946,7 @@ fn visible_api_doc_summaries(
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for doc in all_docs {
-        let Some(enriched) = enrich_api_doc_summary(doc, project_ident, &docs_by_id) else {
+        let Some(enriched) = enrich_api_doc_summary(doc, &project_ident, &docs_by_id) else {
             continue;
         };
         if !api_doc_matches_filters(&enriched, filters) {
@@ -8778,13 +8987,14 @@ fn visible_api_doc_summaries(
 }
 
 fn get_api_doc_local(conn: &Connection, project_ident: &str, id: &str) -> Result<Option<ApiDoc>> {
-    ensure_existing_api_doc_artifacts(conn, project_ident)?;
+    let project_ident = normalize_project_ident(project_ident);
+    ensure_existing_api_doc_artifacts(conn, &project_ident)?;
     let sql = format!(
         "{} WHERE d.project_ident = ?1 AND d.id = ?2",
         api_doc_select_sql(true)
     );
     let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query_map(params![project_ident, id], row_to_api_doc)?;
+    let mut rows = stmt.query_map(params![project_ident.as_str(), id], row_to_api_doc)?;
     let mut doc = match rows.next().transpose()? {
         Some(doc) => doc,
         None => return Ok(None),
@@ -8795,7 +9005,7 @@ fn get_api_doc_local(conn: &Connection, project_ident: &str, id: &str) -> Result
         .map(|summary| (summary.id.clone(), summary.clone()))
         .collect();
     if let Some(summary) = summaries.into_iter().find(|summary| summary.id == doc.id) {
-        if let Some(enriched) = enrich_api_doc_summary(summary, project_ident, &docs_by_id) {
+        if let Some(enriched) = enrich_api_doc_summary(summary, &project_ident, &docs_by_id) {
             doc.owner_project = enriched.owner_project;
             doc.scope = enriched.scope;
             doc.global_rank = enriched.global_rank;
@@ -8810,8 +9020,9 @@ pub fn insert_api_doc(
     project_ident: &str,
     doc: &ApiDocInsert<'_>,
 ) -> Result<ApiDoc> {
+    let project_ident = normalize_project_ident(project_ident);
     if let Some(existing_id) =
-        find_api_doc_by_logical_key(conn, project_ident, doc.app, doc.title, doc.kind)?
+        find_api_doc_by_logical_key(conn, &project_ident, doc.app, doc.title, doc.kind)?
     {
         let now = now_ms();
         let labels_json = serialize_string_array(doc.labels);
@@ -8851,17 +9062,17 @@ pub fn insert_api_doc(
             "api_docs",
             &assignments,
             &[
-                crud_eq("project_ident", project_ident),
+                crud_eq("project_ident", project_ident.as_str()),
                 crud_eq("id", existing_id.as_str()),
             ],
         )?;
-        let updated = get_api_doc_local(conn, project_ident, &existing_id)?
+        let updated = get_api_doc_local(conn, &project_ident, &existing_id)?
             .ok_or_else(|| anyhow::anyhow!("updated api doc not found"))?;
         ensure_api_doc_artifact_version(
             conn,
             &ApiDocArtifactVersionInput {
                 id: &existing_id,
-                project_ident,
+                project_ident: &project_ident,
                 app: &updated.app,
                 title: &updated.title,
                 summary: updated.summary.as_deref(),
@@ -8880,7 +9091,7 @@ pub fn insert_api_doc(
                 created_at: now,
             },
         )?;
-        return get_api_doc_local(conn, project_ident, &existing_id)?
+        return get_api_doc_local(conn, &project_ident, &existing_id)?
             .ok_or_else(|| anyhow::anyhow!("updated api doc not found"));
     }
 
@@ -8901,7 +9112,7 @@ pub fn insert_api_doc(
         "api_docs",
         &[
             crud_col("id", id.as_str()),
-            crud_col("project_ident", project_ident),
+            crud_col("project_ident", project_ident.as_str()),
             crud_col("app", doc.app),
             crud_col("title", doc.title),
             crud_col("summary", doc.summary),
@@ -8925,7 +9136,7 @@ pub fn insert_api_doc(
         conn,
         &ApiDocArtifactVersionInput {
             id: &id,
-            project_ident,
+            project_ident: &project_ident,
             app: doc.app,
             title: doc.title,
             summary: doc.summary,
@@ -8944,7 +9155,7 @@ pub fn insert_api_doc(
             created_at: now,
         },
     )?;
-    get_api_doc_local(conn, project_ident, &id)?
+    get_api_doc_local(conn, &project_ident, &id)?
         .ok_or_else(|| anyhow::anyhow!("inserted api doc not found"))
 }
 
@@ -8953,10 +9164,12 @@ pub fn list_api_docs(
     project_ident: &str,
     filters: &ApiDocFilters<'_>,
 ) -> Result<Vec<ApiDocSummary>> {
-    visible_api_doc_summaries(conn, project_ident, filters)
+    let project_ident = normalize_project_ident(project_ident);
+    visible_api_doc_summaries(conn, &project_ident, filters)
 }
 
 pub fn get_api_doc(conn: &Connection, project_ident: &str, id: &str) -> Result<Option<ApiDoc>> {
+    let project_ident = normalize_project_ident(project_ident);
     ensure_all_api_doc_artifacts(conn)?;
     let sql = format!("{} WHERE d.id = ?1", api_doc_select_sql(true));
     let mut stmt = conn.prepare(&sql)?;
@@ -8973,7 +9186,7 @@ pub fn get_api_doc(conn: &Connection, project_ident: &str, id: &str) -> Result<O
     let Some(summary) = summaries.into_iter().find(|summary| summary.id == doc.id) else {
         return Ok(None);
     };
-    let Some(enriched) = enrich_api_doc_summary(summary, project_ident, &docs_by_id) else {
+    let Some(enriched) = enrich_api_doc_summary(summary, &project_ident, &docs_by_id) else {
         return Ok(None);
     };
     doc.owner_project = enriched.owner_project;
@@ -8988,8 +9201,9 @@ pub fn list_api_doc_versions(
     project_ident: &str,
     id: &str,
 ) -> Result<Vec<ApiDocVersionSummary>> {
-    ensure_existing_api_doc_artifacts(conn, project_ident)?;
-    let base = match get_api_doc(conn, project_ident, id)? {
+    let project_ident = normalize_project_ident(project_ident);
+    ensure_existing_api_doc_artifacts(conn, &project_ident)?;
+    let base = match get_api_doc(conn, &project_ident, id)? {
         Some(doc) => doc,
         None => return Ok(Vec::new()),
     };
@@ -9037,7 +9251,8 @@ pub fn update_api_doc(
     id: &str,
     upd: &ApiDocUpdate<'_>,
 ) -> Result<Option<ApiDoc>> {
-    let existing = match get_api_doc_local(conn, project_ident, id)? {
+    let project_ident = normalize_project_ident(project_ident);
+    let existing = match get_api_doc_local(conn, &project_ident, id)? {
         Some(doc) => doc,
         None => {
             return Ok(None);
@@ -9094,21 +9309,24 @@ pub fn update_api_doc(
     }
 
     if assignments.is_empty() {
-        return get_api_doc_local(conn, project_ident, id);
+        return get_api_doc_local(conn, &project_ident, id);
     }
     assignments.push(crud_col("updated_at", now));
     crud(conn).update(
         "api_docs",
         &assignments,
-        &[crud_eq("project_ident", project_ident), crud_eq("id", id)],
+        &[
+            crud_eq("project_ident", project_ident.as_str()),
+            crud_eq("id", id),
+        ],
     )?;
-    let updated = get_api_doc_local(conn, project_ident, id)?
+    let updated = get_api_doc_local(conn, &project_ident, id)?
         .ok_or_else(|| anyhow::anyhow!("updated api doc not found"))?;
     ensure_api_doc_artifact_version(
         conn,
         &ApiDocArtifactVersionInput {
             id,
-            project_ident,
+            project_ident: &project_ident,
             app: &updated.app,
             title: &updated.title,
             summary: updated.summary.as_deref(),
@@ -9127,13 +9345,17 @@ pub fn update_api_doc(
             created_at: now,
         },
     )?;
-    get_api_doc_local(conn, project_ident, id)
+    get_api_doc_local(conn, &project_ident, id)
 }
 
 pub fn delete_api_doc(conn: &Connection, project_ident: &str, id: &str) -> Result<bool> {
+    let project_ident = normalize_project_ident(project_ident);
     let n = crud(conn).delete(
         "api_docs",
-        &[crud_eq("project_ident", project_ident), crud_eq("id", id)],
+        &[
+            crud_eq("project_ident", project_ident.as_str()),
+            crud_eq("id", id),
+        ],
     )?;
     if n > 0 {
         crud(conn).update(
@@ -9143,7 +9365,7 @@ pub fn delete_api_doc(conn: &Connection, project_ident: &str, id: &str) -> Resul
                 crud_col("updated_at", now_ms()),
             ],
             &[
-                crud_eq("project_ident", project_ident),
+                crud_eq("project_ident", project_ident.as_str()),
                 crud_eq("artifact_id", id),
             ],
         )?;
@@ -9157,8 +9379,9 @@ pub fn list_api_doc_chunks(
     filters: &ApiDocFilters<'_>,
     include_history: bool,
 ) -> Result<ApiDocChunkList> {
-    ensure_existing_api_doc_artifacts(conn, project_ident)?;
-    let docs = list_api_docs(conn, project_ident, filters)?;
+    let project_ident = normalize_project_ident(project_ident);
+    ensure_existing_api_doc_artifacts(conn, &project_ident)?;
+    let docs = list_api_docs(conn, &project_ident, filters)?;
     let retrieval_scope = if include_history {
         "history"
     } else {
@@ -9398,7 +9621,8 @@ pub fn api_doc_hierarchy(
     project_ident: &str,
     filters: &ApiDocFilters<'_>,
 ) -> Result<Vec<ApiDocHierarchyNode>> {
-    let docs = visible_api_doc_summaries(conn, project_ident, filters)?;
+    let project_ident = normalize_project_ident(project_ident);
+    let docs = visible_api_doc_summaries(conn, &project_ident, filters)?;
     let visible_ids: HashSet<String> = docs.iter().map(|doc| doc.id.clone()).collect();
     let mut by_parent: HashMap<Option<String>, Vec<ApiDocHierarchyNode>> = HashMap::new();
     for doc in docs {
@@ -9545,6 +9769,7 @@ const TASK_SELECT_COLS: &str =
 /// appended so the next agent knows to verify prior progress. Runs in a single
 /// transaction.
 pub fn reclaim_stale_tasks(conn: &Connection, project_ident: &str) -> Result<usize> {
+    let project_ident = normalize_project_ident(project_ident);
     let now = now_ms();
     let cutoff = now - TASK_RECLAIM_MS;
 
@@ -9559,7 +9784,9 @@ pub fn reclaim_stale_tasks(conn: &Connection, project_ident: &str) -> Result<usi
                AND updated_at < ?2",
         )?;
         let rows = stmt
-            .query_map(params![project_ident, cutoff], |r| r.get::<_, String>(0))?
+            .query_map(params![project_ident.as_str(), cutoff], |r| {
+                r.get::<_, String>(0)
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
@@ -9614,6 +9841,7 @@ pub fn insert_task(
     hostname: Option<&str>,
     reporter: &str,
 ) -> Result<Task> {
+    let project_ident = normalize_project_ident(project_ident);
     let id = new_uuid();
     let now = now_ms();
     let labels_json = serialize_string_array(labels);
@@ -9621,7 +9849,7 @@ pub fn insert_task(
     let rank: i64 = conn.query_row(
         "SELECT COALESCE(MAX(rank), 0) + 1 FROM tasks
          WHERE project_ident = ?1 AND status = 'todo'",
-        params![project_ident],
+        params![project_ident.as_str()],
         |r| r.get(0),
     )?;
 
@@ -9629,7 +9857,7 @@ pub fn insert_task(
         "tasks",
         &[
             crud_col("id", id.as_str()),
-            crud_col("project_ident", project_ident),
+            crud_col("project_ident", project_ident.as_str()),
             crud_col("title", title),
             crud_col("description", description),
             crud_col("details", details),
@@ -9651,7 +9879,7 @@ pub fn insert_task(
 
     Ok(Task {
         id,
-        project_ident: project_ident.to_string(),
+        project_ident,
         title: title.to_string(),
         description: description.map(str::to_string),
         details: details.map(str::to_string),
@@ -9672,9 +9900,11 @@ pub fn insert_task(
 }
 
 pub fn insert_delegated_task(conn: &Connection, task: &DelegatedTaskInsert<'_>) -> Result<Task> {
+    let project_ident = normalize_project_ident(task.project_ident);
+    let target_project_ident = normalize_project_ident(task.target_project_ident);
     let mut inserted = insert_task(
         conn,
-        task.project_ident,
+        &project_ident,
         task.title,
         task.description,
         task.details,
@@ -9686,16 +9916,16 @@ pub fn insert_delegated_task(conn: &Connection, task: &DelegatedTaskInsert<'_>) 
         "tasks",
         &[
             crud_col("kind", "delegated"),
-            crud_col("delegated_to_project_ident", task.target_project_ident),
+            crud_col("delegated_to_project_ident", target_project_ident.as_str()),
             crud_col("delegated_to_task_id", task.target_task_id),
         ],
         &[
             crud_eq("id", inserted.id.as_str()),
-            crud_eq("project_ident", task.project_ident),
+            crud_eq("project_ident", project_ident.as_str()),
         ],
     )?;
     inserted.kind = "delegated".to_string();
-    inserted.delegated_to_project_ident = Some(task.target_project_ident.to_string());
+    inserted.delegated_to_project_ident = Some(target_project_ident);
     inserted.delegated_to_task_id = Some(task.target_task_id.to_string());
     Ok(inserted)
 }
@@ -9710,6 +9940,7 @@ pub fn list_tasks(
     statuses: &[String],
     include_stale_done: bool,
 ) -> Result<Vec<TaskSummary>> {
+    let project_ident = normalize_project_ident(project_ident);
     if statuses.is_empty() {
         return Ok(Vec::new());
     }
@@ -9756,7 +9987,7 @@ pub fn list_tasks(
 
     // Bind params: project_ident, statuses..., [done_cutoff]
     let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(statuses.len() + 2);
-    bound.push(Box::new(project_ident.to_string()));
+    bound.push(Box::new(project_ident));
     for s in statuses {
         bound.push(Box::new(s.clone()));
     }
@@ -9797,11 +10028,12 @@ pub fn get_task_detail(
     project_ident: &str,
     task_id: &str,
 ) -> Result<Option<TaskDetail>> {
+    let project_ident = normalize_project_ident(project_ident);
     let task = {
         let sql =
             format!("SELECT {TASK_SELECT_COLS} FROM tasks WHERE id = ?1 AND project_ident = ?2");
         let mut stmt = conn.prepare(&sql)?;
-        let mut rows = stmt.query_map(params![task_id, project_ident], row_to_task)?;
+        let mut rows = stmt.query_map(params![task_id, project_ident.as_str()], row_to_task)?;
         match rows.next() {
             Some(r) => r?,
             None => return Ok(None),
@@ -9845,6 +10077,7 @@ pub fn find_task_by_spec_source(
     source_spec_version_id: &str,
     manifest_item_id: &str,
 ) -> Result<Option<Task>> {
+    let project_ident = normalize_project_ident(project_ident);
     let sql = format!(
         "SELECT {TASK_SELECT_COLS} FROM tasks
          WHERE project_ident = ?1
@@ -9860,7 +10093,7 @@ pub fn find_task_by_spec_source(
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query_map(
         params![
-            project_ident,
+            project_ident.as_str(),
             source_artifact_pattern,
             source_version_pattern,
             manifest_item_pattern,
@@ -9883,6 +10116,7 @@ pub fn update_task(
     upd: &TaskUpdate<'_>,
     actor_agent_id: Option<&str>,
 ) -> Result<Option<Task>> {
+    let project_ident = normalize_project_ident(project_ident);
     // Validate requested status early.
     if let Some(s) = upd.status {
         if s != "todo" && s != "in_progress" && s != "done" {
@@ -9895,7 +10129,7 @@ pub fn update_task(
         let sql =
             format!("SELECT {TASK_SELECT_COLS} FROM tasks WHERE id = ?1 AND project_ident = ?2");
         let mut stmt = conn.prepare(&sql)?;
-        let mut rows = stmt.query_map(params![task_id, project_ident], row_to_task)?;
+        let mut rows = stmt.query_map(params![task_id, project_ident.as_str()], row_to_task)?;
         match rows.next() {
             Some(r) => r?,
             None => return Ok(None),
@@ -9998,7 +10232,7 @@ pub fn update_task(
         &assignments,
         &[
             crud_eq("id", task_id),
-            crud_eq("project_ident", project_ident),
+            crud_eq("project_ident", project_ident.as_str()),
         ],
     )?;
     if n == 0 {
@@ -10008,7 +10242,7 @@ pub fn update_task(
     // Re-read the row to return a fully-consistent Task.
     let sql = format!("SELECT {TASK_SELECT_COLS} FROM tasks WHERE id = ?1 AND project_ident = ?2");
     let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query_map(params![task_id, project_ident], row_to_task)?;
+    let mut rows = stmt.query_map(params![task_id, project_ident.as_str()], row_to_task)?;
     Ok(rows.next().transpose()?)
 }
 
@@ -10082,15 +10316,17 @@ pub fn insert_task_delegation(
     requester_agent_id: Option<&str>,
     requester_hostname: Option<&str>,
 ) -> Result<TaskDelegation> {
+    let source_project_ident = normalize_project_ident(source_project_ident);
+    let target_project_ident = normalize_project_ident(target_project_ident);
     let id = new_uuid();
     let now = now_ms();
     crud(conn).insert(
         "task_delegations",
         &[
             crud_col("id", id.as_str()),
-            crud_col("source_project_ident", source_project_ident),
+            crud_col("source_project_ident", source_project_ident.as_str()),
             crud_col("source_task_id", source_task_id),
-            crud_col("target_project_ident", target_project_ident),
+            crud_col("target_project_ident", target_project_ident.as_str()),
             crud_col("target_task_id", target_task_id),
             crud_col("requester_agent_id", requester_agent_id),
             crud_col("requester_hostname", requester_hostname),
@@ -10101,9 +10337,9 @@ pub fn insert_task_delegation(
     )?;
     Ok(TaskDelegation {
         id,
-        source_project_ident: source_project_ident.to_string(),
+        source_project_ident,
         source_task_id: source_task_id.to_string(),
-        target_project_ident: target_project_ident.to_string(),
+        target_project_ident,
         target_task_id: target_task_id.to_string(),
         requester_agent_id: requester_agent_id.map(str::to_string),
         requester_hostname: requester_hostname.map(str::to_string),
@@ -10118,6 +10354,7 @@ pub fn get_delegation_by_source(
     project_ident: &str,
     task_id: &str,
 ) -> Result<Option<TaskDelegation>> {
+    let project_ident = normalize_project_ident(project_ident);
     let mut stmt = conn.prepare_cached(
         "SELECT id, source_project_ident, source_task_id, target_project_ident,
                 target_task_id, requester_agent_id, requester_hostname, created_at,
@@ -10126,7 +10363,7 @@ pub fn get_delegation_by_source(
          WHERE source_project_ident = ?1 AND source_task_id = ?2",
     )?;
     let delegation = stmt
-        .query_map(params![project_ident, task_id], row_to_delegation)?
+        .query_map(params![project_ident.as_str(), task_id], row_to_delegation)?
         .next()
         .transpose()?;
     Ok(delegation)
@@ -10137,6 +10374,7 @@ pub fn get_delegation_by_target(
     project_ident: &str,
     task_id: &str,
 ) -> Result<Option<TaskDelegation>> {
+    let project_ident = normalize_project_ident(project_ident);
     let mut stmt = conn.prepare_cached(
         "SELECT id, source_project_ident, source_task_id, target_project_ident,
                 target_task_id, requester_agent_id, requester_hostname, created_at,
@@ -10145,7 +10383,7 @@ pub fn get_delegation_by_target(
          WHERE target_project_ident = ?1 AND target_task_id = ?2",
     )?;
     let delegation = stmt
-        .query_map(params![project_ident, task_id], row_to_delegation)?
+        .query_map(params![project_ident.as_str(), task_id], row_to_delegation)?
         .next()
         .transpose()?;
     Ok(delegation)
@@ -10183,11 +10421,12 @@ pub fn mark_delegation_complete(
 /// Delete a task (and its comments via ON DELETE CASCADE) scoped to a project.
 /// Returns true if a row was removed.
 pub fn delete_task(conn: &Connection, project_ident: &str, task_id: &str) -> Result<bool> {
+    let project_ident = normalize_project_ident(project_ident);
     let n = crud(conn).delete(
         "tasks",
         &[
             crud_eq("id", task_id),
-            crud_eq("project_ident", project_ident),
+            crud_eq("project_ident", project_ident.as_str()),
         ],
     )?;
     Ok(n > 0)
@@ -10219,6 +10458,7 @@ pub fn reorder_tasks_in_column(
     order: &[String],
     actor_agent_id: Option<&str>,
 ) -> Result<()> {
+    let project_ident = normalize_project_ident(project_ident);
     if target_status != "todo" && target_status != "in_progress" && target_status != "done" {
         anyhow::bail!("invalid status '{target_status}': must be todo|in_progress|done");
     }
@@ -10237,7 +10477,7 @@ pub fn reorder_tasks_in_column(
                 "SELECT status, owner_agent_id, started_at, done_at
                  FROM tasks WHERE id = ?1 AND project_ident = ?2",
             )?;
-            let mut rows = stmt.query_map(params![task_id, project_ident], |r| {
+            let mut rows = stmt.query_map(params![task_id, project_ident.as_str()], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, Option<String>>(1)?,
@@ -10312,7 +10552,7 @@ pub fn reorder_tasks_in_column(
             ],
             &[
                 crud_eq("id", task_id.as_str()),
-                crud_eq("project_ident", project_ident),
+                crud_eq("project_ident", project_ident.as_str()),
             ],
         )?;
     }
@@ -10496,6 +10736,83 @@ mod tests {
             repo_name: None,
             repo_full_name: None,
         }
+    }
+
+    #[test]
+    fn project_insert_and_lookup_normalize_ident_to_lowercase() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("DemoProject")).unwrap();
+
+        let project = get_project(&conn, "DEMOPROJECT").unwrap().unwrap();
+        assert_eq!(project.ident, "demoproject");
+        assert_eq!(all_projects(&conn).unwrap()[0].ident, "demoproject");
+
+        let cursor_ident: String = conn
+            .query_row("SELECT project_ident FROM cursors", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cursor_ident, "demoproject");
+    }
+
+    #[test]
+    fn project_repo_mapping_normalizes_and_rejects_casefolded_duplicates() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("alpha")).unwrap();
+        insert_project(&conn, &test_project("beta")).unwrap();
+
+        let project = update_project_repo_mapping(
+            &conn,
+            "ALPHA",
+            Some("GitHub"),
+            Some("NiteCon"),
+            Some("Agent-Gateway"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(project.repo_provider.as_deref(), Some("github"));
+        assert_eq!(project.repo_namespace.as_deref(), Some("nitecon"));
+        assert_eq!(project.repo_name.as_deref(), Some("agent-gateway"));
+        assert_eq!(
+            project.repo_full_name.as_deref(),
+            Some("nitecon/agent-gateway")
+        );
+
+        let err = update_project_repo_mapping(
+            &conn,
+            "beta",
+            Some("github"),
+            Some("NITECON"),
+            Some("agent-gateway"),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("already mapped"));
+    }
+
+    #[test]
+    fn project_casing_validation_rejects_legacy_mixed_case_rows() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO projects (ident, channel_name, room_id, created_at)
+             VALUES ('MixedCase', 'test', 'room-mixed', 1)",
+            [],
+        )
+        .unwrap();
+
+        let err = validate_project_casing(&conn).unwrap_err();
+        assert!(format!("{err:#}").contains("projects.ident 'MixedCase' must be lowercase"));
+    }
+
+    #[test]
+    fn message_insert_normalizes_project_ident() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("demo")).unwrap();
+        let id = insert_message(
+            &conn,
+            &test_message("DEMO", "agent", "hello", Some("agent-a")),
+        )
+        .unwrap();
+
+        let message = get_message_by_id(&conn, "Demo", id).unwrap().unwrap();
+        assert_eq!(message.project_ident, "demo");
     }
 
     fn test_message(ident: &str, source: &str, content: &str, agent_id: Option<&str>) -> Message {

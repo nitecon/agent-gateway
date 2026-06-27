@@ -14,7 +14,7 @@ use tracing::error;
 use crate::{
     channel::OutboundMessage,
     db::{self, now_ms, Message, Project},
-    projects::sanitize_ident,
+    projects::{normalize_project_ident, sanitize_ident},
     AppState,
 };
 
@@ -554,12 +554,14 @@ fn require_artifact_authorization(
         });
     }
 
+    let expected_project = normalize_project_ident(project_ident);
     let authorized_project = headers
         .get("x-agent-project")
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
-        .filter(|v| !v.is_empty());
-    if authorized_project != Some(project_ident) {
+        .filter(|v| !v.is_empty())
+        .map(normalize_project_ident);
+    if authorized_project.as_deref() != Some(expected_project.as_str()) {
         return Err(AppError(
             StatusCode::FORBIDDEN,
             "artifact_authorization_forbidden: missing or mismatched x-agent-project".to_string(),
@@ -8868,7 +8870,8 @@ pub async fn delegate_task_handler(
     Path(source_ident): Path<String>,
     Json(req): Json<DelegateTaskRequest>,
 ) -> Result<Json<DelegationResponse>> {
-    let target_ident = req.target_project_ident.trim().to_string();
+    let source_ident = normalize_project_ident(&source_ident);
+    let target_ident = normalize_project_ident(&req.target_project_ident);
     let title = req.title.trim().to_string();
     if target_ident.is_empty() || title.is_empty() {
         return Err(AppError(
@@ -11740,7 +11743,7 @@ mod tests {
 
         let response = create_artifact_handler(
             State(state.clone()),
-            Path("demo".to_string()),
+            Path("Demo".to_string()),
             authorized_headers("auth-create", "artifact.write"),
             Json(CreateArtifactRequest {
                 kind: "spec".to_string(),
@@ -11775,12 +11778,13 @@ mod tests {
 
         let fetched = get_artifact_handler(
             State(state),
-            Path(("demo".to_string(), artifact_id)),
+            Path(("DEMO".to_string(), artifact_id)),
             read_headers("artifact.read"),
         )
         .await
         .unwrap();
         assert_eq!(fetched.0.data.artifact.title, "Authorized");
+        assert_eq!(fetched.0.data.artifact.project_ident, "demo");
     }
 
     #[tokio::test]
