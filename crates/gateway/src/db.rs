@@ -5900,10 +5900,32 @@ pub struct MemoryPushItem {
     pub client_updated_at: Option<i64>,
     #[serde(default)]
     pub provenance: Option<serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_tombstone_flag")]
     pub tombstone: bool,
     #[serde(default)]
     pub deleted: bool,
+}
+
+/// Older memory CLI builds serialize `tombstone` as an object
+/// (`{"deleted": true, "deleted_at": ..., "reason": ...}`) rather than the
+/// boolean wire format; accept both so their forget pushes don't 400.
+fn deserialize_tombstone_flag<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(false),
+        Some(serde_json::Value::Bool(flag)) => Ok(flag),
+        Some(serde_json::Value::Object(map)) => Ok(map
+            .get("deleted")
+            .map(|deleted| deleted.as_bool().unwrap_or(true))
+            .unwrap_or(true)),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "expected tombstone boolean or object, got {other}"
+        ))),
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -11805,6 +11827,72 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rejected.results[0].action, "rejected");
+    }
+
+    #[test]
+    fn memory_push_accepts_boolean_and_object_tombstone_shapes() {
+        // The memory CLI's forget path has serialized `tombstone` both as a
+        // boolean and (in some builds) as `{"deleted": true, ...}`; both must
+        // deserialize instead of 400ing the whole push.
+        let bool_item: MemoryPushItem =
+            serde_json::from_str(r#"{"gateway_memory_id": "gw-1", "tombstone": true}"#).unwrap();
+        assert!(bool_item.tombstone);
+
+        let object_item: MemoryPushItem = serde_json::from_str(
+            r#"{
+                "gateway_memory_id": "gw-1",
+                "base_gateway_revision": 1,
+                "tombstone": {
+                    "deleted": true,
+                    "deleted_at": 1751662800000,
+                    "reason": "memory forget"
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(object_item.tombstone);
+
+        let live_item: MemoryPushItem =
+            serde_json::from_str(r#"{"content": "keep me", "tombstone": false}"#).unwrap();
+        assert!(!live_item.tombstone);
+        let absent_item: MemoryPushItem = serde_json::from_str(r#"{"content": "keep me"}"#).unwrap();
+        assert!(!absent_item.tombstone);
+
+        // Round trip: create a memory, then tombstone it with the object shape.
+        let conn = test_conn();
+        insert_project(&conn, &test_project("proj")).unwrap();
+        let source = MemoryPushSource {
+            agent_id: Some("agent-a".to_string()),
+            hostname: Some("host-a".to_string()),
+            client_id: Some("client-a".to_string()),
+            client_version: Some("1.0.0".to_string()),
+        };
+        let created = push_project_memories(
+            &conn,
+            "proj",
+            &source,
+            &[MemoryPushItem {
+                local_memory_id: Some("local-1".to_string()),
+                content: Some("obsolete memory body".to_string()),
+                memory_type: Some("project".to_string()),
+                ..MemoryPushItem::default()
+            }],
+        )
+        .unwrap();
+        let memory_id = created.results[0].gateway_memory_id.clone().unwrap();
+
+        let tombstoned = push_project_memories(
+            &conn,
+            "proj",
+            &source,
+            &[MemoryPushItem {
+                gateway_memory_id: Some(memory_id),
+                base_gateway_revision: Some(1),
+                ..object_item
+            }],
+        )
+        .unwrap();
+        assert_eq!(tombstoned.results[0].action, "tombstoned");
     }
 
     #[test]
