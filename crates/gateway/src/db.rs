@@ -11855,7 +11855,8 @@ mod tests {
         let live_item: MemoryPushItem =
             serde_json::from_str(r#"{"content": "keep me", "tombstone": false}"#).unwrap();
         assert!(!live_item.tombstone);
-        let absent_item: MemoryPushItem = serde_json::from_str(r#"{"content": "keep me"}"#).unwrap();
+        let absent_item: MemoryPushItem =
+            serde_json::from_str(r#"{"content": "keep me"}"#).unwrap();
         assert!(!absent_item.tombstone);
 
         // Round trip: create a memory, then tombstone it with the object shape.
