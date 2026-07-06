@@ -3,15 +3,15 @@ use async_trait::async_trait;
 use serenity::{
     all::{
         ChannelId, ChannelType, Context as SerenityCtx, CreateChannel, CreateEmbed,
-        CreateEmbedAuthor, CreateMessage, EventHandler, GatewayIntents, GetMessages, GuildChannel,
-        GuildId, Message, MessageId, MessageReference, MessageReferenceKind, Ready, Timestamp,
-        UserId,
+        CreateEmbedAuthor, CreateMessage, Embed, EventHandler, GatewayIntents, GetMessages,
+        GuildChannel, GuildId, Message, MessageId, MessageReference, MessageReferenceKind, Ready,
+        Timestamp, UserId,
     },
     Client,
 };
 use std::{
     collections::HashMap,
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -58,6 +58,67 @@ fn build_embed(msg: &OutboundMessage) -> CreateEmbed {
     embed
 }
 
+fn is_gateway_authored(author_id: u64, bot_id: Option<u64>) -> bool {
+    bot_id == Some(author_id)
+}
+
+fn push_trimmed_part(parts: &mut Vec<String>, value: &str) {
+    let trimmed = value.trim();
+    if !trimmed.is_empty() {
+        parts.push(trimmed.to_string());
+    }
+}
+
+fn render_embed(embed: &Embed) -> Option<String> {
+    let mut parts = Vec::new();
+
+    if let Some(author) = &embed.author {
+        push_trimmed_part(&mut parts, &author.name);
+    }
+    if let Some(title) = &embed.title {
+        push_trimmed_part(&mut parts, title);
+    }
+    if let Some(description) = &embed.description {
+        push_trimmed_part(&mut parts, description);
+    }
+
+    for field in &embed.fields {
+        let name = field.name.trim();
+        let value = field.value.trim();
+        match (name.is_empty(), value.is_empty()) {
+            (true, true) => {}
+            (true, false) => parts.push(value.to_string()),
+            (false, true) => parts.push(name.to_string()),
+            (false, false) => parts.push(format!("{name}: {value}")),
+        }
+    }
+
+    if let Some(footer) = &embed.footer {
+        push_trimmed_part(&mut parts, &footer.text);
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
+fn discord_message_content_from_parts(content: &str, embeds: &[Embed]) -> String {
+    let mut parts = Vec::new();
+    push_trimmed_part(&mut parts, content);
+    for embed in embeds {
+        if let Some(rendered) = render_embed(embed) {
+            parts.push(rendered);
+        }
+    }
+    parts.join("\n\n")
+}
+
+fn discord_message_content(msg: &Message) -> String {
+    discord_message_content_from_parts(&msg.content, &msg.embeds)
+}
+
 // ── Config ────────────────────────────────────────────────────────────────────
 
 pub struct DiscordConfig {
@@ -69,22 +130,25 @@ pub struct DiscordConfig {
 // ── Plugin ────────────────────────────────────────────────────────────────────
 
 /// Rooms known to this plugin: Discord channel ID (u64) → last seen message ID.
-type RoomMap = Mutex<HashMap<u64, Option<String>>>;
+type RoomMap = Arc<Mutex<HashMap<u64, Option<String>>>>;
 
 pub struct DiscordPlugin {
     config: DiscordConfig,
     /// channel_id → Option<last_msg_id>  (populated via register_room, persisted in DB)
     rooms: RoomMap,
     /// Set after start() is called; used for REST operations.
-    http: OnceLock<std::sync::Arc<serenity::http::Http>>,
+    http: OnceLock<Arc<serenity::http::Http>>,
+    /// Set by the gateway ready event; used to avoid forwarding our own posts.
+    bot_id: Arc<OnceLock<UserId>>,
 }
 
 impl DiscordPlugin {
     pub fn new(config: DiscordConfig) -> Self {
         Self {
             config,
-            rooms: Mutex::new(HashMap::new()),
+            rooms: Arc::new(Mutex::new(HashMap::new())),
             http: OnceLock::new(),
+            bot_id: Arc::new(OnceLock::new()),
         }
     }
 
@@ -96,7 +160,7 @@ impl DiscordPlugin {
         self.config.category_id.map(ChannelId::new)
     }
 
-    fn http(&self) -> &std::sync::Arc<serenity::http::Http> {
+    fn http(&self) -> &Arc<serenity::http::Http> {
         self.http
             .get()
             .expect("DiscordPlugin::start() must be called before HTTP operations")
@@ -122,13 +186,10 @@ impl ChannelPlugin for DiscordPlugin {
     }
 
     async fn start(&self, tx: mpsc::Sender<PluginEvent>) -> Result<()> {
-        // Snapshot rooms for the handler (clone is cheap — small map).
-        let rooms_snapshot = self.rooms.lock().unwrap().clone();
-
         let handler = DiscordHandler {
-            rooms: std::sync::Arc::new(Mutex::new(rooms_snapshot)),
+            rooms: self.rooms.clone(),
             tx,
-            bot_id: OnceLock::new(),
+            bot_id: self.bot_id.clone(),
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES
@@ -276,11 +337,19 @@ impl ChannelPlugin for DiscordPlugin {
 
         Ok(msgs
             .into_iter()
-            .filter(|m| !m.author.bot)
-            .map(|m| InboundMessage {
-                id: m.id.to_string(),
-                content: m.content,
-                sender: m.author.name,
+            .filter(|m| {
+                !is_gateway_authored(
+                    m.author.id.get(),
+                    self.bot_id.get().map(|bot_id| bot_id.get()),
+                )
+            })
+            .map(|m| {
+                let content = discord_message_content(&m);
+                InboundMessage {
+                    id: m.id.to_string(),
+                    content,
+                    sender: m.author.name,
+                }
             })
             .collect())
     }
@@ -289,10 +358,10 @@ impl ChannelPlugin for DiscordPlugin {
 // ── Event handler ─────────────────────────────────────────────────────────────
 
 struct DiscordHandler {
-    /// Local copy of the room map for this gateway session.
-    rooms: std::sync::Arc<Mutex<HashMap<u64, Option<String>>>>,
+    /// Shared room map for this gateway session.
+    rooms: RoomMap,
     tx: mpsc::Sender<PluginEvent>,
-    bot_id: OnceLock<UserId>,
+    bot_id: Arc<OnceLock<UserId>>,
 }
 
 #[async_trait]
@@ -304,6 +373,8 @@ impl EventHandler for DiscordHandler {
         // Clone room map before any await so we never hold the guard across one.
         let rooms: Vec<(u64, Option<String>)> =
             self.rooms.lock().unwrap().clone().into_iter().collect();
+
+        let bot_id = self.bot_id.get().map(|id| id.get());
 
         // ── Backfill missed messages ──────────────────────────────────────────
         for (channel_id, last_msg_id) in &rooms {
@@ -321,13 +392,17 @@ impl EventHandler for DiscordHandler {
                 .await
             {
                 Ok(msgs) => {
-                    for msg in msgs.into_iter().filter(|m| !m.author.bot) {
+                    for msg in msgs
+                        .into_iter()
+                        .filter(|m| !is_gateway_authored(m.author.id.get(), bot_id))
+                    {
+                        let content = discord_message_content(&msg);
                         let event = PluginEvent::Message {
                             channel_name: "discord".into(),
                             room_id: channel_id.to_string(),
                             message: InboundMessage {
                                 id: msg.id.to_string(),
-                                content: msg.content,
+                                content,
                                 sender: msg.author.name,
                             },
                         };
@@ -342,7 +417,10 @@ impl EventHandler for DiscordHandler {
     }
 
     async fn message(&self, ctx: SerenityCtx, msg: Message) {
-        if msg.author.bot {
+        if is_gateway_authored(
+            msg.author.id.get(),
+            self.bot_id.get().map(|bot_id| bot_id.get()),
+        ) {
             return;
         }
 
@@ -373,12 +451,13 @@ impl EventHandler for DiscordHandler {
             return;
         }
 
+        let content = discord_message_content(&msg);
         let event = PluginEvent::Message {
             channel_name: "discord".into(),
             room_id: channel_id.to_string(),
             message: InboundMessage {
                 id: msg.id.to_string(),
-                content: msg.content,
+                content,
                 sender: msg.author.name,
             },
         };
@@ -386,5 +465,51 @@ impl EventHandler for DiscordHandler {
         if let Err(e) = self.tx.send(event).await {
             error!("failed to forward Discord message to inbound processor: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn gateway_authored_filter_only_matches_self() {
+        assert!(is_gateway_authored(42, Some(42)));
+        assert!(!is_gateway_authored(7, Some(42)));
+        assert!(!is_gateway_authored(42, None));
+    }
+
+    #[test]
+    fn discord_message_content_uses_embed_when_body_is_empty() {
+        let embed: Embed = serde_json::from_value(json!({
+            "author": {"name": "Alertmanager"},
+            "title": "FIRING KubeDaemonSetMisScheduled",
+            "description": "1 Pods of DaemonSet rook-ceph/nodeplugin are running where they are not supposed to run.",
+            "fields": [
+                {"name": "severity", "value": "warning", "inline": true}
+            ],
+            "footer": {"text": "cluster monitoring"}
+        }))
+        .unwrap();
+
+        assert_eq!(
+            discord_message_content_from_parts("", &[embed]),
+            "Alertmanager\nFIRING KubeDaemonSetMisScheduled\n1 Pods of DaemonSet rook-ceph/nodeplugin are running where they are not supposed to run.\nseverity: warning\ncluster monitoring"
+        );
+    }
+
+    #[test]
+    fn discord_message_content_preserves_body_and_embed() {
+        let embed: Embed = serde_json::from_value(json!({
+            "title": "Alert details",
+            "description": "failure rate is 8.333%"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            discord_message_content_from_parts("[FIRING]", &[embed]),
+            "[FIRING]\n\nAlert details\nfailure rate is 8.333%"
+        );
     }
 }
