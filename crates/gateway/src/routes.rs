@@ -9820,6 +9820,230 @@ pub async fn new_task_page(
     Ok(Html(html))
 }
 
+// ── GET /task-link/:task_ref (dedicated task detail) ─────────────────────────
+
+/// Resolve an agent-friendly task UUID prefix across projects and render its
+/// complete task detail view. Ambiguous prefixes are rejected so a short link
+/// can never silently show or mutate the wrong task.
+pub async fn task_link_page(
+    State(state): State<AppState>,
+    Path(task_ref): Path<String>,
+) -> Result<Html<String>> {
+    let task_ref = task_ref.to_ascii_lowercase();
+    if task_ref.len() < 8
+        || task_ref.len() > 36
+        || !task_ref.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+    {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "task reference must be 8-36 hexadecimal/UUID characters".into(),
+        ));
+    }
+
+    let db_handle = state.db.clone();
+    let (matches, theme) = spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = db_handle.lock().unwrap();
+        Ok((
+            db::find_tasks_by_id_prefix(&conn, &task_ref, 2)?,
+            db::get_theme(&conn)?,
+        ))
+    })
+    .await??;
+
+    let task = match matches.as_slice() {
+        [] => {
+            return Err(AppError(
+                StatusCode::NOT_FOUND,
+                "no task matches that reference".into(),
+            ));
+        }
+        [task] => task.clone(),
+        _ => {
+            return Err(AppError(
+                StatusCode::CONFLICT,
+                "task reference is ambiguous; use more of the task ID".into(),
+            ));
+        }
+    };
+
+    let db_handle = state.db.clone();
+    let project_ident = task.project_ident.clone();
+    let task_id = task.id.clone();
+    let detail = spawn_blocking(move || -> anyhow::Result<Option<db::TaskDetail>> {
+        let conn = db_handle.lock().unwrap();
+        db::reclaim_stale_tasks(&conn, &project_ident)?;
+        db::get_task_detail(&conn, &project_ident, &task_id)
+    })
+    .await??
+    .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "task no longer exists".into()))?;
+
+    Ok(Html(render_task_link_page(&detail, &theme, &state.api_key)))
+}
+
+fn render_task_link_page(detail: &db::TaskDetail, theme: &str, api_key: &str) -> String {
+    let task = &detail.task;
+    let page_title = format!("Task — {}", task.title);
+    let ident_path = path_segment(&task.project_ident);
+    let task_path = path_segment(&task.id);
+    let api_url_attr = he(&format!("/v1/projects/{ident_path}/tasks/{task_path}"));
+    let labels = if task.labels.is_empty() {
+        "<span class=\"nd-text-muted\">None</span>".to_string()
+    } else {
+        task.labels
+            .iter()
+            .map(|label| format!("<span class=\"nd-badge nd-mr-sm\">{}</span>", he(label)))
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let delegation = match (
+        task.delegated_to_project_ident.as_deref(),
+        task.delegated_to_task_id.as_deref(),
+    ) {
+        (Some(project), Some(target_id)) => format!(
+            r#"<div><dt>Delegated to</dt><dd>{project} · <a href="/task-link/{target}">{target}</a></dd></div>"#,
+            project = he(project),
+            target = he(target_id),
+        ),
+        _ => String::new(),
+    };
+    let comments = detail
+        .comments
+        .iter()
+        .map(|comment| {
+            format!(
+                r#"<article class="task-link-comment nd-mb-md">
+  <div class="nd-text-muted nd-text-sm">{author} ({author_type}) · {created_at}</div>
+  <div class="task-link-copy">{content}</div>
+</article>"#,
+                author = he(&comment.author),
+                author_type = he(&comment.author_type),
+                created_at = he(&format_epoch_ms(comment.created_at)),
+                content = he(&comment.content),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let content = format!(
+        r##"<div class="nd-flex nd-gap-sm nd-mb-md">
+  <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident_path}/tasks">← Project tasks</a>
+  <a class="nd-btn-ghost nd-btn-sm" href="/tasks">All projects</a>
+</div>
+
+<section class="nd-card nd-mb-lg">
+  <div class="nd-card-body">
+    <div class="nd-flex nd-justify-between nd-gap-md task-link-heading">
+      <div>
+        <p class="nd-text-muted nd-text-sm nd-mb-sm">Task</p>
+        <h2 id="task-link-title" data-nd-bind="{api_url}" data-nd-field="title">{title}</h2>
+      </div>
+      <span id="task-link-status" class="nd-badge" data-nd-bind="{api_url}" data-nd-field="status">{status}</span>
+    </div>
+
+    <dl class="task-link-facts nd-mt-lg nd-mb-lg">
+      <div><dt>Project</dt><dd><a href="/projects/{ident_path}/tasks">{ident}</a></dd></div>
+      <div><dt>Task ID</dt><dd><code>{task_id}</code></dd></div>
+      <div><dt>Status</dt><dd data-nd-bind="{api_url}" data-nd-field="status">{status}</dd></div>
+      <div><dt>Rank</dt><dd data-nd-bind="{api_url}" data-nd-field="rank">{rank}</dd></div>
+      <div><dt>Owner</dt><dd data-nd-bind="{api_url}" data-nd-field="owner_agent_id">{owner}</dd></div>
+      <div><dt>Reporter</dt><dd>{reporter}</dd></div>
+      <div><dt>Kind</dt><dd>{kind}</dd></div>
+      <div><dt>Created</dt><dd>{created_at}</dd></div>
+      <div><dt>Updated</dt><dd>{updated_at}</dd></div>
+      {delegation}
+    </dl>
+
+    <h3>Description</h3>
+    <div id="task-link-description" class="task-link-copy nd-mb-lg" data-nd-bind="{api_url}" data-nd-field="description">{description}</div>
+
+    <h3>Specification</h3>
+    <pre id="task-link-specification" class="task-link-copy nd-text-sm" data-nd-bind="{api_url}" data-nd-field="specification">{specification}</pre>
+
+    <h3 class="nd-mt-lg">Labels</h3>
+    <div>{labels}</div>
+
+    <div class="nd-flex nd-gap-sm nd-mt-lg task-link-actions">
+      <button type="button" class="nd-btn-primary nd-btn-sm"
+              data-nd-action="PATCH {api_url}" data-nd-body='{{"status":"in_progress"}}'
+              data-nd-success="refresh:#task-link-title,refresh:#task-link-status,refresh:#task-link-description,refresh:#task-link-specification">Claim</button>
+      <button type="button" class="nd-btn-secondary nd-btn-sm"
+              data-nd-action="PATCH {api_url}" data-nd-body='{{"status":"todo"}}'
+              data-nd-success="refresh:#task-link-title,refresh:#task-link-status,refresh:#task-link-description,refresh:#task-link-specification">Release</button>
+      <button type="button" class="nd-btn-primary nd-btn-sm"
+              data-nd-action="PATCH {api_url}" data-nd-body='{{"status":"done"}}'
+              data-nd-success="refresh:#task-link-title,refresh:#task-link-status,refresh:#task-link-description,refresh:#task-link-specification">Done</button>
+      <button type="button" class="nd-btn-secondary nd-btn-sm"
+              data-nd-action="PATCH {api_url}" data-nd-body='{{"status":"todo"}}'
+              data-nd-success="refresh:#task-link-title,refresh:#task-link-status,refresh:#task-link-description,refresh:#task-link-specification">Reopen</button>
+    </div>
+  </div>
+</section>
+
+<section class="nd-card">
+  <div class="nd-card-header"><strong>Comments</strong></div>
+  <div class="nd-card-body">
+    <div id="task-link-comments" data-nd-bind="{api_url}" data-nd-select="comments" data-nd-template="task-link-comment-template">
+      <template id="task-link-comment-template">
+        <article class="task-link-comment nd-mb-md">
+          <div class="nd-text-muted nd-text-sm">{{{{author}}}} ({{{{author_type}}}})</div>
+          <div class="task-link-copy">{{{{content}}}}</div>
+        </article>
+      </template>
+      {comments}
+      <template data-nd-empty><p class="nd-text-muted nd-text-sm">No comments yet.</p></template>
+    </div>
+
+    <form class="nd-mt-lg" data-nd-action="POST {api_url}/comments" data-nd-success="refresh:#task-link-comments,reset">
+      <div class="nd-form-group">
+        <label for="task-link-comment">Add a comment</label>
+        <textarea id="task-link-comment" name="content" rows="4" required></textarea>
+      </div>
+      <button type="submit" class="nd-btn-primary nd-btn-sm">Comment</button>
+    </form>
+  </div>
+</section>"##,
+        ident_path = ident_path,
+        api_url = api_url_attr,
+        title = he(&task.title),
+        status = he(&task.status),
+        ident = he(&task.project_ident),
+        task_id = he(&task.id),
+        rank = task.rank,
+        owner = he(task.owner_agent_id.as_deref().unwrap_or("Unassigned")),
+        reporter = he(&task.reporter),
+        kind = he(&task.kind),
+        created_at = he(&format_epoch_ms(task.created_at)),
+        updated_at = he(&format_epoch_ms(task.updated_at)),
+        delegation = delegation,
+        description = he(task.description.as_deref().unwrap_or("")),
+        specification = he(task.details.as_deref().unwrap_or("")),
+        labels = labels,
+        comments = comments,
+    );
+
+    format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
+        head = control_panel_head(
+            &page_title,
+            theme,
+            r#"<style>
+.task-link-heading { align-items: flex-start; }
+.task-link-heading h2 { overflow-wrap: anywhere; }
+.task-link-facts { display: grid; gap: 0.75rem; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); }
+.task-link-facts div { min-width: 0; }
+.task-link-facts dt { color: var(--nd-text-muted); font-size: 0.875rem; }
+.task-link-facts dd { margin: 0.2rem 0 0; overflow-wrap: anywhere; }
+.task-link-copy { overflow-wrap: anywhere; white-space: pre-wrap; }
+.task-link-actions { flex-wrap: wrap; }
+.task-link-comment + .task-link-comment { border-top: 1px solid var(--nd-border-color); padding-top: 1rem; }
+</style>"#,
+        ),
+        open = control_panel_open(&page_title, "tasks"),
+        content = content,
+        close = control_panel_close(api_key),
+    )
+}
+
 // ── GET /projects/:ident/tasks (board) ───────────────────────────────────────
 
 /// Render the three-column task board for a single project.
@@ -10722,6 +10946,42 @@ mod tests {
         assert_eq!(value["details"], "Long handoff spec");
         assert_eq!(value["specification"], "Long handoff spec");
         assert!(value["actions"].is_array());
+    }
+
+    #[test]
+    fn task_link_page_renders_detail_actions_and_comments_safely() {
+        let mut task = sample_task();
+        task.id = "019f770c-0000-7000-8000-000000000001".into();
+        task.title = "Direct <task>".into();
+        task.labels = vec!["needs-review".into()];
+        let detail = db::TaskDetail {
+            task,
+            comments: vec![db::TaskComment {
+                id: "comment-1".into(),
+                task_id: "019f770c-0000-7000-8000-000000000001".into(),
+                author: "user".into(),
+                author_type: "user".into(),
+                content: "Please check <this>".into(),
+                created_at: 1,
+            }],
+        };
+
+        let html = render_task_link_page(&detail, "dark", "secret");
+
+        assert!(html.contains("Direct &lt;task&gt;"));
+        assert!(html.contains("demo-project"));
+        assert!(html.contains("019f770c-0000-7000-8000-000000000001"));
+        assert!(html.contains("Short context"));
+        assert!(html.contains("Long handoff spec"));
+        assert!(html.contains("needs-review"));
+        assert!(html.contains("Please check &lt;this&gt;"));
+        assert!(html.contains("data-nd-action=\"PATCH /v1/projects/demo-project/tasks/019f770c-0000-7000-8000-000000000001\""));
+        assert!(html.contains("data-nd-action=\"POST /v1/projects/demo-project/tasks/019f770c-0000-7000-8000-000000000001/comments\""));
+        assert!(html.contains(">Claim</button>"));
+        assert!(html.contains(">Release</button>"));
+        assert!(html.contains(">Done</button>"));
+        assert!(html.contains(">Reopen</button>"));
+        assert!(!html.contains("Please check <this>"));
     }
 
     #[test]

@@ -10082,6 +10082,34 @@ pub fn get_task_detail(
     Ok(Some(TaskDetail { task, comments }))
 }
 
+/// Resolve a task ID prefix across all projects.
+///
+/// Direct task links deliberately use a project-independent ID so agents can
+/// paste the first eight UUID characters into communications without also
+/// knowing the control-panel project route. Callers should request at least
+/// two results and reject ambiguous prefixes rather than choosing one.
+pub fn find_tasks_by_id_prefix(
+    conn: &Connection,
+    task_id_prefix: &str,
+    limit: usize,
+) -> Result<Vec<Task>> {
+    if task_id_prefix.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let sql = format!(
+        "SELECT {TASK_SELECT_COLS} FROM tasks
+         WHERE substr(id, 1, length(?1)) = ?1
+         ORDER BY id ASC
+         LIMIT ?2"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params![task_id_prefix, limit as i64], row_to_task)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// Compatibility lookup for T009 generated spec tasks.
 ///
 /// The current task schema has no dedicated source tuple columns. The spec
@@ -11043,6 +11071,36 @@ mod tests {
                 .id,
             delegation.id
         );
+    }
+
+    #[test]
+    fn task_id_prefix_lookup_detects_cross_project_ambiguity() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("alpha")).unwrap();
+        insert_project(&conn, &test_project("bravo")).unwrap();
+
+        let alpha = insert_task(&conn, "alpha", "First", None, None, &[], None, "tester").unwrap();
+        let bravo = insert_task(&conn, "bravo", "Second", None, None, &[], None, "tester").unwrap();
+        conn.execute(
+            "UPDATE tasks SET id = '019f770c-0000-7000-8000-000000000001' WHERE id = ?1",
+            params![alpha.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET id = '019f770c-0000-7000-8000-000000000002' WHERE id = ?1",
+            params![bravo.id],
+        )
+        .unwrap();
+
+        let ambiguous = find_tasks_by_id_prefix(&conn, "019f770c", 2).unwrap();
+        assert_eq!(ambiguous.len(), 2);
+        assert_eq!(ambiguous[0].project_ident, "alpha");
+        assert_eq!(ambiguous[1].project_ident, "bravo");
+
+        let exact =
+            find_tasks_by_id_prefix(&conn, "019f770c-0000-7000-8000-000000000002", 2).unwrap();
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].title, "Second");
     }
 
     #[test]

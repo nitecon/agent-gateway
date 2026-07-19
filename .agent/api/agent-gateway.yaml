@@ -4,7 +4,7 @@ summary: Agent coordination gateway for project-scoped comms, task boards, proje
 kind: agent_context
 source_format: agent_context
 source_ref: .agent/api/agent-gateway.yaml
-version: v1.13.0
+version: v1.14.0
 labels:
   - gateway
   - agents
@@ -64,6 +64,7 @@ content:
         - Handle each user or system message once, then confirm it with POST /v1/projects/:ident/messages/:id/confirm.
     - name: Work a project task
       steps:
+        - Open /task-link/:task-ref in the public control panel to resolve an eight-or-more-character task ID prefix across projects and view or comment on the task directly.
         - GET /v1/projects/:ident/tasks to inspect todo and in_progress items.
         - PATCH /v1/projects/:ident/tasks/:id with status in_progress to claim work.
         - Add progress notes with POST /v1/projects/:ident/tasks/:id/comments.
@@ -136,6 +137,11 @@ content:
         - Only fetch comments when the user asks to address pattern review comments.
         - Keep .patterns in the repo aligned with patterns actually used by files.
   endpoints:
+    - method: GET
+      path: /task-link/:task-ref
+      intent: Resolve an unambiguous task ID prefix of at least eight characters and render its dedicated public detail, status-action, and comment page.
+      notes:
+        - Returns 404 when no task matches and 409 when the prefix is ambiguous.
     - method: POST
       path: /v1/projects
       intent: Register a project and create or reuse its communication room.

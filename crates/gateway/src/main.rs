@@ -673,6 +673,7 @@ async fn main() -> Result<()> {
             get(routes::api_doc_detail_page),
         )
         .route("/tasks", get(routes::tasks_picker))
+        .route("/task-link/{task_ref}", get(routes::task_link_page))
         .route("/projects/{ident}/tasks", get(routes::tasks_board))
         .route("/projects/{ident}/tasks/new", get(routes::new_task_page))
         .route("/patterns", get(routes::patterns_page))
