@@ -6582,12 +6582,29 @@ fn push_one_memory(
         match get_memory_record(conn, project_ident, id)? {
             Some(record) => Some(record),
             None => {
+                // Tombstones are delete intents, so an absent target already
+                // satisfies the requested end state. Treat retries and stale
+                // client mappings idempotently without minting a replacement
+                // record or advancing the project revision. Non-delete writes
+                // must still reject an unknown explicit gateway ID below.
+                if tombstone {
+                    return Ok(MemoryPushResult {
+                        action: "tombstoned".to_string(),
+                        local_memory_id,
+                        client_id,
+                        gateway_memory_id,
+                        server_revision: Some(memory_project_revision(conn, project_ident)?),
+                        content_hash: clean_optional(&item.content_hash),
+                        conflict: None,
+                        error: None,
+                    });
+                }
                 return Ok(rejected_memory_result(
                     "gateway_memory_id was not found for this project".to_string(),
                     client_id,
                     local_memory_id,
                     gateway_memory_id,
-                ))
+                ));
             }
         }
     } else if let (Some(client_id), Some(local_memory_id)) =
@@ -11952,6 +11969,82 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tombstoned.results[0].action, "tombstoned");
+    }
+
+    #[test]
+    fn memory_tombstone_for_missing_gateway_id_is_idempotent() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("proj")).unwrap();
+        let source = MemoryPushSource {
+            client_id: Some("client-a".to_string()),
+            ..MemoryPushSource::default()
+        };
+
+        // Establish a non-zero project revision and prove the no-op tombstone
+        // does not advance it or create a replacement memory.
+        let created = push_project_memories(
+            &conn,
+            "proj",
+            &source,
+            &[MemoryPushItem {
+                local_memory_id: Some("live-local".to_string()),
+                content: Some("live memory".to_string()),
+                memory_type: Some("project".to_string()),
+                ..MemoryPushItem::default()
+            }],
+        )
+        .unwrap();
+        assert_eq!(created.server_revision, 1);
+
+        let missing_tombstone = MemoryPushItem {
+            local_memory_id: Some("missing-local".to_string()),
+            gateway_memory_id: Some("already-absent".to_string()),
+            base_gateway_revision: Some(99),
+            content_hash: Some("local-content-hash".to_string()),
+            tombstone: true,
+            ..MemoryPushItem::default()
+        };
+
+        for _ in 0..2 {
+            let response = push_project_memories(
+                &conn,
+                "proj",
+                &source,
+                std::slice::from_ref(&missing_tombstone),
+            )
+            .unwrap();
+            let result = &response.results[0];
+            assert_eq!(result.action, "tombstoned");
+            assert_eq!(result.gateway_memory_id.as_deref(), Some("already-absent"));
+            assert_eq!(result.local_memory_id.as_deref(), Some("missing-local"));
+            assert_eq!(result.server_revision, Some(1));
+            assert_eq!(result.content_hash.as_deref(), Some("local-content-hash"));
+            assert!(result.error.is_none());
+            assert_eq!(response.server_revision, 1);
+        }
+
+        let live = list_project_memories(&conn, "proj", &MemoryFilters::default()).unwrap();
+        assert_eq!(live.len(), 1);
+
+        // Unknown IDs remain invalid for ordinary writes; idempotency applies
+        // only to delete/tombstone intent.
+        let rejected = push_project_memories(
+            &conn,
+            "proj",
+            &source,
+            &[MemoryPushItem {
+                gateway_memory_id: Some("still-absent".to_string()),
+                content: Some("must not create through an unknown explicit id".to_string()),
+                memory_type: Some("project".to_string()),
+                ..MemoryPushItem::default()
+            }],
+        )
+        .unwrap();
+        assert_eq!(rejected.results[0].action, "rejected");
+        assert_eq!(
+            rejected.results[0].error.as_deref(),
+            Some("gateway_memory_id was not found for this project")
+        );
     }
 
     #[test]
