@@ -493,7 +493,7 @@ hosts. Pages never embed the API key.
 | `/projects` | Project registry: kind (repo/adhoc), channel room, open inbox items, tasks, last activity, archive/restore. Filter by state and kind. |
 | `/projects/:ident` | Project overview: inbox counts, in-progress tasks, recent artifacts, links, agents, activity. |
 | `/projects/:ident/inbox` | Threaded conversation view: filter by author kind (conversation, humans, agents, alerts, system) and state; read a thread; reply from the browser (posted to the channel and to every agent's unread queue); resolve one or many threads. |
-| `/projects/:ident/tasks` | Kanban board; `/tasks` is the cross-project list and `/projects/:ident/tasks/:id` the task detail. `/task-link/:prefix` redirects to the detail page. |
+| `/projects/:ident/tasks` | Kanban board (todo / in progress / done, drag-and-drop). `/tasks` shows the same board with a project switcher, and `/projects/:ident/tasks/:id` is the task detail. `/task-link/:prefix` redirects to the detail page. |
 | `/projects/:ident/artifacts`, `/documentation`, `/memories` | Existing artifact, documentation, and memory views inside the project tab strip. |
 | `/projects/:ident/settings` | Identity, repository mapping, channel room, external links (CI, runbooks), archive. |
 | `/patterns`, `/skills`, `/commands`, `/agents` | Library pages (unchanged). |

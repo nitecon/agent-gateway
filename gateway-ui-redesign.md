@@ -313,7 +313,9 @@ Keep the board. Add:
   thread, delegation status, and linked artifacts. `/task-link/{ref}` redirects
   there.
 - Cross-project task list at `/tasks` with the same columns, replacing the
-  project picker table.
+  project picker table. **Reverted after release:** the owner wants `/tasks`
+  to stay a three-column drag-and-drop board, so it now renders the board
+  with a project switcher instead of a list.
 
 ### Artifacts, Memories, Library
 

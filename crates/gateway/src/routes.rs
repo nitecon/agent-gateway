@@ -9736,7 +9736,51 @@ pub async fn tasks_board(
     // defense in depth.
     let ident_attr = he(&project.ident);
     let page_title = format!("Tasks — {}", project.ident);
+    let toolbar = r#"    <a class="nd-btn-ghost nd-btn-sm" href="/tasks">← All projects</a>"#;
+    let content = tasks_board_content(&ident_attr, toolbar);
 
+    let html = format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
+        head = control_panel_head(&page_title, &theme, TASKS_BOARD_HEAD_EXTRA),
+        open = control_panel_open_project(&page_title, &ident, "tasks"),
+        content = content,
+        close = control_panel_close(),
+    );
+    Ok(Html(html))
+}
+
+/// `<head>` extras shared by every page that renders the task board: the
+/// `selectedTaskId` store var for the detail modal plus card CSS.
+pub(crate) const TASKS_BOARD_HEAD_EXTRA: &str = r#"<meta name="var:selectedTaskId" content="">
+<style>
+.task-card-button {
+  display: block;
+  max-width: 100%;
+  min-width: 0;
+  white-space: normal;
+}
+.task-card-title {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.task-card-meta {
+  margin: 0.375rem 0 0 1.25rem;
+  padding: 0;
+  white-space: normal;
+}
+.task-kind-delegated {
+  border-left: 4px solid #b45309;
+}
+.task-kind-delegated .task-card-title {
+  color: #92400e;
+}
+</style>"#;
+
+/// The three-column drag-and-drop board plus the task detail modal for one
+/// project. `ident_attr` must already be HTML-escaped; `toolbar` is trusted
+/// markup rendered to the left of the "+ New task" button (the project page
+/// passes a back link, `/tasks` passes the project switcher).
+pub(crate) fn tasks_board_content(ident_attr: &str, toolbar: &str) -> String {
     // Layout: `.nd-row` gives each `.nd-col-*` 0.5rem of inner padding on
     // both sides (Bootstrap-style gutter). For the cards to have visible
     // space BETWEEN them, the card must live *inside* the col wrapper — if
@@ -9758,10 +9802,9 @@ pub async fn tasks_board(
     // single HTTP fetch. `#task-modal-meta` MUST be in the refresh list —
     // it is `data-nd-defer` and holds the description + specification, so
     // without the explicit refresh those fields stay blank on first open.
-    let content = format!(
+    format!(
         r##"  <div class="nd-flex nd-gap-md nd-mb-md">
-    <a class="nd-btn-ghost nd-btn-sm" href="/tasks">← All projects</a>
-    <a class="nd-btn-ghost nd-btn-sm" href="/tasks?project={ident}">List view</a>
+{toolbar}
     <a class="nd-btn-primary nd-btn-sm" href="/projects/{ident}/tasks/new">+ New task</a>
   </div>
 
@@ -9930,43 +9973,8 @@ pub async fn tasks_board(
     </div>
   </dialog>"##,
         ident = ident_attr,
-    );
-
-    let html = format!(
-        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
-        head = control_panel_head(
-            &page_title,
-            &theme,
-            r#"<meta name="var:selectedTaskId" content="">
-<style>
-.task-card-button {
-  display: block;
-  max-width: 100%;
-  min-width: 0;
-  white-space: normal;
-}
-.task-card-title {
-  overflow-wrap: anywhere;
-  white-space: normal;
-}
-.task-card-meta {
-  margin: 0.375rem 0 0 1.25rem;
-  padding: 0;
-  white-space: normal;
-}
-.task-kind-delegated {
-  border-left: 4px solid #b45309;
-}
-.task-kind-delegated .task-card-title {
-  color: #92400e;
-}
-</style>"#,
-        ),
-        open = control_panel_open_project(&page_title, &ident, "tasks"),
-        content = content,
-        close = control_panel_close(),
-    );
-    Ok(Html(html))
+        toolbar = toolbar,
+    )
 }
 
 // ── Login / logout / users ───────────────────────────────────────────────────
@@ -13495,5 +13503,54 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+    }
+
+    /// `/tasks` is the drag-and-drop board (not a list): three sortable
+    /// columns for the selected project plus a project switcher, and the
+    /// per-project route renders the same columns.
+    #[tokio::test]
+    async fn tasks_index_renders_board_with_project_switcher() {
+        let state = test_state();
+        let page = crate::ui::tasks::tasks_index_page(
+            State(state.clone()),
+            Query(crate::ui::tasks::TasksQuery::default()),
+        )
+        .await
+        .unwrap();
+        let html = page.0;
+        for col in ["todo", "in_progress", "done"] {
+            assert!(
+                html.contains(&format!(
+                    r#"data-nd-sortable="POST /v1/projects/demo/tasks/reorder?status={col}""#
+                )),
+                "missing sortable column {col}: {html}"
+            );
+        }
+        assert_eq!(html.matches(r#"data-nd-sortable-group="tasks""#).count(), 3);
+        assert!(html.contains(r#"<option value="demo" selected>"#));
+        assert!(
+            !html.contains("status=open"),
+            "no fourth 'open' status: {html}"
+        );
+
+        // Unknown project falls back to the default board instead of 404.
+        let page = crate::ui::tasks::tasks_index_page(
+            State(state.clone()),
+            Query(crate::ui::tasks::TasksQuery {
+                project: Some("nope".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(page.0.contains(r#"<option value="demo" selected>"#));
+
+        let board = tasks_board(State(state), Path("demo".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            board.0.matches(r#"data-nd-sortable-group="tasks""#).count(),
+            3
+        );
+        assert!(board.0.contains(r#"href="/tasks">← All projects</a>"#));
     }
 }
