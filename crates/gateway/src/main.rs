@@ -768,10 +768,15 @@ async fn main() -> Result<()> {
             "/projects/{ident}/api-docs/{id}",
             get(routes::api_doc_detail_page),
         )
-        .route("/tasks", get(routes::tasks_picker))
-        .route("/task-link/{task_ref}", get(routes::task_link_page))
+        .route("/tasks", get(ui::tasks::tasks_index_page))
+        .route("/activity", get(ui::activity::activity_page))
+        .route("/task-link/{task_ref}", get(ui::tasks::task_link_redirect))
         .route("/projects/{ident}/tasks", get(routes::tasks_board))
         .route("/projects/{ident}/tasks/new", get(routes::new_task_page))
+        .route(
+            "/projects/{ident}/tasks/{task_id}",
+            get(ui::tasks::task_detail_page),
+        )
         .route("/patterns", get(routes::patterns_page))
         .route("/patterns/{id}", get(routes::pattern_detail_page))
         .route("/skills", get(routes::skills_page))

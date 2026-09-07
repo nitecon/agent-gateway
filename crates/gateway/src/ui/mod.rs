@@ -6,11 +6,13 @@
 //! the same shell through [`shell::control_panel_open`] so the navigation is
 //! defined once.
 
+pub mod activity;
 pub mod home;
 pub mod inbox;
 pub mod projects;
 pub mod settings;
 pub mod shell;
+pub mod tasks;
 
 pub use shell::{
     control_panel_close, control_panel_head, control_panel_open, control_panel_open_project, he,

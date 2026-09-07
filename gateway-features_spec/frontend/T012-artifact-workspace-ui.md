@@ -3,7 +3,7 @@
 **Team:** frontend
 **Phase:** 4
 **Depends on:** T007, T009, T010, T011
-**Status:** todo
+**Status:** done (workspace, detail with diff/manifest/review sections, and navigation shipped; anchors `#diff`, `#manifest`, `#reviews`, `#versions` address the named views; see `gateway-ui-redesign.md` for the shell)
 
 ## Scope
 

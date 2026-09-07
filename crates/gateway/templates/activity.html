@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="gw-filters">
+  <span class="nd-text-xs nd-text-muted">Project:</span>
+  <a href="/activity"{% if project_filter.is_empty() %} class="gw-filter-active"{% endif %}>All</a>
+  {% for p in projects %}
+  <a href="/activity?project={{ p }}"{% if project_filter.as_str() == p.as_str() %} class="gw-filter-active"{% endif %}>{{ p }}</a>
+  {% endfor %}
+</div>
+
+<section class="nd-mb-lg">
+  <strong class="nd-mb-sm" style="display:block">Agents seen in the last 24 hours</strong>
+  {% if agents.is_empty() %}
+  <div class="nd-card"><div class="nd-card-body gw-empty">No agent activity in the last 24 hours.</div></div>
+  {% else %}
+  <div class="nd-card"><div class="nd-card-body nd-p-0">
+    <table class="nd-table nd-table-hover">
+      <thead><tr><th>Agent</th><th>Host</th><th>Project</th><th>Working on</th><th>Last message</th><th>Last seen</th></tr></thead>
+      <tbody>
+        {% for a in agents %}
+        <tr>
+          <td><strong>{{ a.agent_id }}</strong></td>
+          <td class="nd-text-xs nd-text-muted">{% if let Some(host) = a.hostname %}{{ host }}{% endif %}</td>
+          <td><a href="/projects/{{ a.project_ident }}">{{ a.project_ident }}</a></td>
+          <td>{% if let Some(t) = a.task_title %}<a href="{{ a.task_href }}">{{ t }}</a>{% else %}<span class="gw-muted">—</span>{% endif %}</td>
+          <td class="nd-text-xs">{% if let Some(m) = a.last_message %}{{ m }}{% endif %}</td>
+          <td class="nd-text-xs nd-text-muted">{{ a.age }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div></div>
+  {% endif %}
+</section>
+
+<section class="nd-card">
+  <div class="nd-card-header"><strong>Events</strong> <span class="nd-text-xs nd-text-muted">latest {{ activity.len() }}</span></div>
+  <div class="nd-card-body nd-p-0">
+    <table class="nd-table nd-table-hover">
+      <thead><tr><th>When</th><th>Project</th><th>What</th><th>State</th><th>Who</th></tr></thead>
+      <tbody>
+        {% for ev in activity %}
+        <tr>
+          <td class="nd-text-muted nd-text-xs" title="{{ ev.when }}">{{ ev.age }}</td>
+          <td><a href="/projects/{{ ev.project_ident }}">{{ ev.project_ident }}</a></td>
+          <td><span class="gw-chip">{{ ev.kind }}</span> <a href="{{ ev.href }}">{{ ev.summary }}</a></td>
+          <td class="nd-text-xs">{{ ev.state }}</td>
+          <td class="nd-text-xs nd-text-muted">{% if let Some(actor) = ev.actor %}{{ actor }}{% endif %}</td>
+        </tr>
+        {% endfor %}
+        {% if activity.is_empty() %}<tr><td colspan="5" class="gw-empty">No events recorded.</td></tr>{% endif %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

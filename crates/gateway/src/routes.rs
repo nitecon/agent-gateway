@@ -7657,7 +7657,7 @@ pub async fn artifact_detail_page(
         if current.artifact_version_id != accepted.artifact_version_id {
             let diff = simple_diff(&body_text(accepted), &body_text(current));
             format!(
-                r#"<section class="nd-card nd-mt-lg"><div class="nd-card-header"><strong>Accepted to current diff</strong></div><div class="nd-card-body"><pre><code>{}</code></pre></div></section>"#,
+                r#"<section class="nd-card nd-mt-lg" id="diff"><div class="nd-card-header"><strong>Accepted to current diff</strong></div><div class="nd-card-body"><pre><code>{}</code></pre></div></section>"#,
                 he(&diff)
             )
         } else {
@@ -7690,7 +7690,7 @@ pub async fn artifact_detail_page(
                     .collect::<Vec<_>>()
                     .join("\n");
                 format!(
-                    r#"<section class="nd-card nd-mt-lg"><div class="nd-card-header"><strong>Spec manifest</strong></div><div class="nd-card-body nd-p-0"><table class="nd-table nd-table-hover"><thead><tr><th>Stable item</th><th>Phase</th><th>Team</th><th>Status</th><th>Title</th><th>Deps</th><th>Gateway task</th></tr></thead><tbody>{rows}</tbody></table></div></section>"#,
+                    r#"<section class="nd-card nd-mt-lg" id="manifest"><div class="nd-card-header"><strong>Spec manifest</strong></div><div class="nd-card-body nd-p-0"><table class="nd-table nd-table-hover"><thead><tr><th>Stable item</th><th>Phase</th><th>Team</th><th>Status</th><th>Title</th><th>Deps</th><th>Gateway task</th></tr></thead><tbody>{rows}</tbody></table></div></section>"#,
                     rows = rows,
                 )
             })
@@ -7719,7 +7719,7 @@ pub async fn artifact_detail_page(
             .collect::<Vec<_>>()
             .join("\n");
         format!(
-            r#"<section class="nd-card nd-mt-lg"><div class="nd-card-header"><strong>Review rounds</strong></div><div class="nd-card-body nd-p-0"><table class="nd-table nd-table-hover"><thead><tr><th>Phase</th><th>Role</th><th>Workflow run</th><th>Read set</th><th>Contribution</th></tr></thead><tbody>{rows}</tbody></table></div></section>"#
+            r#"<section class="nd-card nd-mt-lg" id="reviews"><div class="nd-card-header"><strong>Review rounds</strong></div><div class="nd-card-body nd-p-0"><table class="nd-table nd-table-hover"><thead><tr><th>Phase</th><th>Role</th><th>Workflow run</th><th>Read set</th><th>Contribution</th></tr></thead><tbody>{rows}</tbody></table></div></section>"#
         )
     } else {
         String::new()
@@ -7782,9 +7782,9 @@ pub async fn artifact_detail_page(
   {review_section}
   {docs_section}
 
-  <section class="nd-card nd-mt-lg"><div class="nd-card-header"><strong>Version history</strong></div><div class="nd-card-body nd-p-0"><table class="nd-table nd-table-hover"><thead><tr><th>Version</th><th>Label</th><th>State</th><th>Format</th><th>Parent</th><th>Body bytes</th></tr></thead><tbody>{version_rows}</tbody></table></div></section>
+  <section class="nd-card nd-mt-lg" id="versions"><div class="nd-card-header"><strong>Version history</strong></div><div class="nd-card-body nd-p-0"><table class="nd-table nd-table-hover"><thead><tr><th>Version</th><th>Label</th><th>State</th><th>Format</th><th>Parent</th><th>Body bytes</th></tr></thead><tbody>{version_rows}</tbody></table></div></section>
   <section class="nd-card nd-mt-lg"><div class="nd-card-header"><strong>Contributions</strong></div><div class="nd-card-body nd-p-0"><table class="nd-table nd-table-hover"><thead><tr><th>Kind</th><th>Phase</th><th>Role</th><th>Target</th><th>Body</th></tr></thead><tbody>{contribution_rows}</tbody></table></div></section>
-  <section class="nd-card nd-mt-lg"><div class="nd-card-header"><strong>Comments</strong></div><div class="nd-card-body nd-p-0"><table class="nd-table nd-table-hover"><thead><tr><th>State</th><th>Target</th><th>Child</th><th>Body</th></tr></thead><tbody>{comment_rows}</tbody></table></div></section>
+  <section class="nd-card nd-mt-lg" id="comments"><div class="nd-card-header"><strong>Comments</strong></div><div class="nd-card-body nd-p-0"><table class="nd-table nd-table-hover"><thead><tr><th>State</th><th>Target</th><th>Child</th><th>Body</th></tr></thead><tbody>{comment_rows}</tbody></table></div></section>
   <section class="nd-card nd-mt-lg"><div class="nd-card-header"><strong>Links</strong></div><div class="nd-card-body nd-p-0"><table class="nd-table nd-table-hover"><thead><tr><th>Type</th><th>Source</th><th>Target</th><th>Source version</th><th>Target version</th></tr></thead><tbody>{link_rows}</tbody></table></div></section>"#,
         ident = ident_attr,
         title = he(&artifact.title),
@@ -9456,65 +9456,6 @@ pub async fn pattern_detail_page(
 
 /// Render the project picker with task counts so `/tasks` stays focused on
 /// task-board navigation rather than dashboard message metadata.
-pub async fn tasks_picker(State(state): State<AppState>) -> Result<Html<String>> {
-    let db = state.db.clone();
-    let (theme, projects) = spawn_blocking(move || -> anyhow::Result<_> {
-        let conn = db.lock().unwrap();
-        Ok((db::get_theme(&conn)?, db::list_project_task_stats(&conn)?))
-    })
-    .await??;
-
-    let rows = if projects.is_empty() {
-        r#"<tr><td colspan="4" class="nd-text-muted">No projects registered yet.</td></tr>"#
-            .to_string()
-    } else {
-        projects
-            .iter()
-            .map(|p| {
-                format!(
-                    r#"<tr>
-  <td><a class="nd-btn-ghost nd-text-left" href="/projects/{ident}/tasks"><strong>{ident}</strong></a></td>
-  <td>{todo}</td>
-  <td>{in_progress}</td>
-  <td>{done}</td>
-</tr>"#,
-                    ident = he(&p.ident),
-                    todo = p.todo_count,
-                    in_progress = p.in_progress_count,
-                    done = p.done_count,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-
-    let content = format!(
-        r##"  <section class="nd-card">
-    <div class="nd-card-header"><strong>Projects</strong></div>
-    <div class="nd-card-body nd-p-0">
-      <table class="nd-table nd-table-hover">
-        <thead>
-          <tr><th>Project</th><th>Todo</th><th>In progress</th><th>Complete</th></tr>
-        </thead>
-        <tbody>
-          {rows}
-        </tbody>
-      </table>
-    </div>
-  </section>"##,
-        rows = rows,
-    );
-
-    let html = format!(
-        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
-        head = control_panel_head("agent-gateway — Tasks", &theme, ""),
-        open = control_panel_open("Tasks", "tasks"),
-        content = content,
-        close = control_panel_close(),
-    );
-    Ok(Html(html))
-}
-
 pub async fn new_task_page(
     State(state): State<AppState>,
     Path(ident): Path<String>,
@@ -9585,62 +9526,7 @@ pub async fn new_task_page(
 /// Resolve an agent-friendly task UUID prefix across projects and render its
 /// complete task detail view. Ambiguous prefixes are rejected so a short link
 /// can never silently show or mutate the wrong task.
-pub async fn task_link_page(
-    State(state): State<AppState>,
-    Path(task_ref): Path<String>,
-) -> Result<Html<String>> {
-    let task_ref = task_ref.to_ascii_lowercase();
-    if task_ref.len() < 8
-        || task_ref.len() > 36
-        || !task_ref.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
-    {
-        return Err(AppError(
-            StatusCode::BAD_REQUEST,
-            "task reference must be 8-36 hexadecimal/UUID characters".into(),
-        ));
-    }
-
-    let db_handle = state.db.clone();
-    let (matches, theme) = spawn_blocking(move || -> anyhow::Result<_> {
-        let conn = db_handle.lock().unwrap();
-        Ok((
-            db::find_tasks_by_id_prefix(&conn, &task_ref, 2)?,
-            db::get_theme(&conn)?,
-        ))
-    })
-    .await??;
-
-    let task = match matches.as_slice() {
-        [] => {
-            return Err(AppError(
-                StatusCode::NOT_FOUND,
-                "no task matches that reference".into(),
-            ));
-        }
-        [task] => task.clone(),
-        _ => {
-            return Err(AppError(
-                StatusCode::CONFLICT,
-                "task reference is ambiguous; use more of the task ID".into(),
-            ));
-        }
-    };
-
-    let db_handle = state.db.clone();
-    let project_ident = task.project_ident.clone();
-    let task_id = task.id.clone();
-    let detail = spawn_blocking(move || -> anyhow::Result<Option<db::TaskDetail>> {
-        let conn = db_handle.lock().unwrap();
-        db::reclaim_stale_tasks(&conn, &project_ident)?;
-        db::get_task_detail(&conn, &project_ident, &task_id)
-    })
-    .await??
-    .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "task no longer exists".into()))?;
-
-    Ok(Html(render_task_link_page(&detail, &theme)))
-}
-
-fn render_task_link_page(detail: &db::TaskDetail, theme: &str) -> String {
+pub(crate) fn render_task_link_page(detail: &db::TaskDetail, theme: &str) -> String {
     let task = &detail.task;
     let page_title = format!("Task — {}", task.title);
     let ident_path = path_segment(&task.project_ident);
@@ -9863,6 +9749,7 @@ pub async fn tasks_board(
     let content = format!(
         r##"  <div class="nd-flex nd-gap-md nd-mb-md">
     <a class="nd-btn-ghost nd-btn-sm" href="/tasks">← All projects</a>
+    <a class="nd-btn-ghost nd-btn-sm" href="/tasks?project={ident}">List view</a>
     <a class="nd-btn-primary nd-btn-sm" href="/projects/{ident}/tasks/new">+ New task</a>
   </div>
 
