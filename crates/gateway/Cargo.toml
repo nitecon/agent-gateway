@@ -36,3 +36,4 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 updater = { path = "../updater" }
 uuid = { version = "1", features = ["v7"] }
 askama = "0.14"
+argon2 = "0.5"

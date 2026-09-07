@@ -27,6 +27,11 @@ document.addEventListener('nd:theme-change', (e) => {
   }).catch(() => {});
 });
 (() => {
+  // ── Signed-in name from the readable gw_user cookie.
+  const who = document.getElementById('gw-whoami');
+  const m = document.cookie.match(/(?:^|;\s*)gw_user=([^;]*)/);
+  if (who && m && m[1]) who.textContent = decodeURIComponent(m[1].replace(/\+/g, ' '));
+
   // ── Live refresh: pages opt in with <meta name="gw-live" content="seconds">.
   const live = document.querySelector('meta[name="gw-live"]');
   if (live) {

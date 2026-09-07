@@ -3921,6 +3921,9 @@ pub struct BulkResolveRequest {
 }
 
 fn resolver_identity(headers: &HeaderMap) -> String {
+    if let Some(user) = crate::ui_auth::request_user(headers) {
+        return format!("user:{}", user.username);
+    }
     match headers.get("x-agent-id").and_then(|v| v.to_str().ok()) {
         Some(agent) if !agent.is_empty() => format!("agent:{agent}"),
         _ => "user".to_string(),
@@ -4111,9 +4114,11 @@ fn value_as_bool(v: &Value) -> bool {
 /// project room is attempted afterwards and reported in the response.
 pub async fn post_human_message(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(ident): Path<String>,
     Json(req): Json<HumanMessageRequest>,
 ) -> Result<Json<HumanMessageResponse>> {
+    let session_user = crate::ui_auth::request_user(&headers);
     let content = req.content.trim().to_string();
     if content.is_empty() {
         return Err(AppError(
@@ -4131,6 +4136,11 @@ pub async fn post_human_message(
         .author
         .map(|a| a.trim().to_string())
         .filter(|a| !a.is_empty())
+        .or_else(|| session_user.as_ref().map(|u| u.display_name.clone()))
+        .unwrap_or_else(|| "user".to_string());
+    let resolved_by = session_user
+        .as_ref()
+        .map(|u| format!("user:{}", u.username))
         .unwrap_or_else(|| "user".to_string());
 
     // Store first.
@@ -4181,7 +4191,7 @@ pub async fn post_human_message(
         )?;
         if resolve_after {
             if let Some(root) = parent.as_ref() {
-                db::resolve_message(&conn, &project.ident, root.id, "user")?;
+                db::resolve_message(&conn, &project.ident, root.id, &resolved_by)?;
             }
         }
         Ok((project, parent, message_id))
@@ -8495,7 +8505,9 @@ fn resolve_identity(explicit: Option<String>, headers: &HeaderMap) -> String {
     }
     let hdr = extract_agent_id(headers);
     if hdr == "_default" {
-        "user".to_string()
+        crate::ui_auth::request_user(headers)
+            .map(|u| u.username)
+            .unwrap_or_else(|| "user".to_string())
     } else {
         hdr
     }
@@ -9957,7 +9969,7 @@ pub async fn tasks_board(
     Ok(Html(html))
 }
 
-// ── Login / logout ───────────────────────────────────────────────────────────
+// ── Login / logout / users ───────────────────────────────────────────────────
 
 /// Percent-encode a string for use inside a query-string value.
 pub(crate) fn url_encode(input: &str) -> String {
@@ -9991,11 +10003,23 @@ pub struct LoginQuery {
 
 #[derive(Deserialize)]
 pub struct LoginForm {
-    pub key: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
     pub next: Option<String>,
+    /// Bootstrap-only fields: creating the first admin requires the API key.
+    pub api_key: Option<String>,
+    pub display_name: Option<String>,
 }
 
-fn render_login_page(theme: &str, next: &str, error: Option<&str>) -> String {
+const LOGIN_ERRORS: &[(&str, &str)] = &[
+    ("1", "That username and password were not accepted."),
+    ("key", "The API key was not accepted."),
+    ("weak", "Passwords must be at least 8 characters."),
+    ("name", "That username is not valid or is already taken."),
+    ("disabled", "That account is disabled."),
+];
+
+fn render_login_page(theme: &str, next: &str, error: Option<&str>, bootstrap: bool) -> String {
     let head = control_panel_head("agent-gateway — Sign in", theme, "");
     let error_html = match error {
         Some(msg) => format!(
@@ -10003,6 +10027,37 @@ fn render_login_page(theme: &str, next: &str, error: Option<&str>) -> String {
             he(msg)
         ),
         None => String::new(),
+    };
+    let body = if bootstrap {
+        format!(
+            r#"<p class="nd-text-muted nd-text-sm nd-mb-md">No accounts exist yet. Create the first administrator. The gateway API key proves you operate this gateway.</p>
+      {error_html}
+      <form method="post" action="/login" class="nd-stack nd-gap-sm">
+        <input type="hidden" name="next" value="{next}">
+        <label class="nd-label" for="login-username">Username</label>
+        <input class="nd-input" id="login-username" name="username" autocomplete="username" autofocus required>
+        <label class="nd-label" for="login-display">Display name</label>
+        <input class="nd-input" id="login-display" name="display_name" autocomplete="name">
+        <label class="nd-label" for="login-password">Password (8+ characters)</label>
+        <input class="nd-input" id="login-password" name="password" type="password" autocomplete="new-password" minlength="8" required>
+        <label class="nd-label" for="login-key">Gateway API key</label>
+        <input class="nd-input" id="login-key" name="api_key" type="password" autocomplete="off" required>
+        <button class="nd-btn-primary nd-mt-sm" type="submit">Create administrator</button>
+      </form>"#
+        )
+    } else {
+        format!(
+            r#"<p class="nd-text-muted nd-text-sm nd-mb-md">Sign in to the control panel.</p>
+      {error_html}
+      <form method="post" action="/login" class="nd-stack nd-gap-sm">
+        <input type="hidden" name="next" value="{next}">
+        <label class="nd-label" for="login-username">Username</label>
+        <input class="nd-input" id="login-username" name="username" autocomplete="username" autofocus required>
+        <label class="nd-label" for="login-password">Password</label>
+        <input class="nd-input" id="login-password" name="password" type="password" autocomplete="current-password" required>
+        <button class="nd-btn-primary nd-mt-sm" type="submit">Sign in</button>
+      </form>"#
+        )
     };
     format!(
         r#"<!doctype html>
@@ -10015,23 +10070,40 @@ fn render_login_page(theme: &str, next: &str, error: Option<&str>) -> String {
   <div class="nd-card">
     <div class="nd-card-header"><strong>agent-gateway</strong></div>
     <div class="nd-card-body">
-      <p class="nd-text-muted nd-text-sm nd-mb-md">Enter the gateway API key to open the control panel.</p>
-      {error_html}
-      <form method="post" action="/login" class="nd-stack nd-gap-sm">
-        <input type="hidden" name="next" value="{next}">
-        <label class="nd-label" for="login-key">API key</label>
-        <input class="nd-input" id="login-key" name="key" type="password" autocomplete="current-password" autofocus required>
-        <button class="nd-btn-primary nd-mt-sm" type="submit">Sign in</button>
-      </form>
+      {body}
     </div>
   </div>
 </main>
 </body>
 </html>"#,
         head = head,
-        error_html = error_html,
-        next = he(next),
+        body = body.replace("{next}", &he(next)),
     )
+}
+
+fn login_error_redirect(code: &str, next: &str) -> Response {
+    let target = format!("/login?error={code}&next={}", url_encode(next));
+    axum::response::Redirect::to(&target).into_response()
+}
+
+fn attach_session(
+    mut response: Response,
+    state: &AppState,
+    headers: &HeaderMap,
+    user: &db::User,
+) -> Result<Response> {
+    let expires = now_ms() + crate::ui_auth::SESSION_TTL_MS;
+    let token = crate::ui_auth::session_token(&state.api_key, user, expires);
+    for cookie in crate::ui_auth::set_cookie_headers(
+        &token,
+        &user.display_name,
+        crate::ui_auth::request_is_https(headers),
+    ) {
+        response
+            .headers_mut()
+            .append(header::SET_COOKIE, HeaderValue::from_str(&cookie)?);
+    }
+    Ok(response)
 }
 
 /// GET /login
@@ -10042,13 +10114,24 @@ pub async fn login_page(
     if !state.ui_auth_enabled {
         return Ok(axum::response::Redirect::to("/").into_response());
     }
-    let theme = load_theme(&state).await;
+    let db = state.db.clone();
+    let (theme, user_count) = spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = db.lock().unwrap();
+        Ok((db::get_theme(&conn)?, db::count_users(&conn)?))
+    })
+    .await??;
     let next = safe_next_path(q.next.as_deref());
-    let error = q.error.as_deref().map(|_| "That key was not accepted.");
-    Ok(Html(render_login_page(&theme, &next, error)).into_response())
+    let error = q.error.as_deref().and_then(|code| {
+        LOGIN_ERRORS
+            .iter()
+            .find(|(c, _)| *c == code)
+            .map(|(_, msg)| *msg)
+    });
+    Ok(Html(render_login_page(&theme, &next, error, user_count == 0)).into_response())
 }
 
-/// POST /login
+/// POST /login — sign in, or create the first administrator when no users
+/// exist yet (requires the gateway API key).
 pub async fn login_submit(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -10058,42 +10141,332 @@ pub async fn login_submit(
     if !state.ui_auth_enabled {
         return Ok(axum::response::Redirect::to(&next).into_response());
     }
-    if form.key.trim() != state.api_key {
-        let target = format!("/login?error=1&next={}", url_encode(&next));
-        return Ok(axum::response::Redirect::to(&target).into_response());
+    let username = form.username.unwrap_or_default().trim().to_lowercase();
+    let password = form.password.unwrap_or_default();
+    let db = state.db.clone();
+    let user_count = spawn_blocking({
+        let db = db.clone();
+        move || {
+            let conn = db.lock().unwrap();
+            db::count_users(&conn)
+        }
+    })
+    .await??;
+
+    if user_count == 0 {
+        // Bootstrap: the API key gates creation of the first admin.
+        if form.api_key.as_deref().map(str::trim) != Some(state.api_key.as_str()) {
+            return Ok(login_error_redirect("key", &next));
+        }
+        let hash = match crate::ui_auth::hash_password(&password) {
+            Ok(h) => h,
+            Err(_) => return Ok(login_error_redirect("weak", &next)),
+        };
+        let display_name = form.display_name.unwrap_or_default();
+        let created = spawn_blocking(move || -> anyhow::Result<db::User> {
+            let conn = db.lock().unwrap();
+            let user =
+                db::create_user(&conn, &username, &display_name, db::USER_ROLE_ADMIN, &hash)?;
+            db::touch_user_login(&conn, user.id)?;
+            Ok(user)
+        })
+        .await?;
+        return match created {
+            Ok(user) => attach_session(
+                axum::response::Redirect::to(&next).into_response(),
+                &state,
+                &headers,
+                &user,
+            ),
+            Err(_) => Ok(login_error_redirect("name", &next)),
+        };
     }
-    let expires = now_ms() + crate::ui_auth::SESSION_TTL_MS;
-    let token = crate::ui_auth::session_token(&state.api_key, expires);
-    let cookie = crate::ui_auth::set_cookie_header(
-        &token,
-        crate::ui_auth::request_is_https(&headers),
-        crate::ui_auth::SESSION_TTL_MS / 1000,
-    );
-    let mut response = axum::response::Redirect::to(&next).into_response();
-    response
-        .headers_mut()
-        .insert(header::SET_COOKIE, HeaderValue::from_str(&cookie)?);
-    Ok(response)
+
+    let found = spawn_blocking({
+        let db = db.clone();
+        let username = username.clone();
+        move || {
+            let conn = db.lock().unwrap();
+            db::get_user_by_username(&conn, &username)
+        }
+    })
+    .await??;
+    let Some(user) = found else {
+        // Burn comparable time so absent users are not distinguishable.
+        let _ = crate::ui_auth::verify_password(&password, "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        return Ok(login_error_redirect("1", &next));
+    };
+    let ok = {
+        let phc = user.password_hash.clone();
+        spawn_blocking(move || crate::ui_auth::verify_password(&password, &phc)).await?
+    };
+    if !ok {
+        return Ok(login_error_redirect("1", &next));
+    }
+    if !user.is_active() {
+        return Ok(login_error_redirect("disabled", &next));
+    }
+    let user_id = user.id;
+    spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::touch_user_login(&conn, user_id)
+    })
+    .await??;
+    attach_session(
+        axum::response::Redirect::to(&next).into_response(),
+        &state,
+        &headers,
+        &user,
+    )
 }
 
 /// GET|POST /logout
 pub async fn logout() -> Result<Response> {
     let mut response = axum::response::Redirect::to("/login").into_response();
-    response.headers_mut().insert(
-        header::SET_COOKIE,
-        HeaderValue::from_str(&crate::ui_auth::clear_cookie_header())?,
-    );
+    for cookie in crate::ui_auth::clear_cookie_headers() {
+        response
+            .headers_mut()
+            .append(header::SET_COOKIE, HeaderValue::from_str(&cookie)?);
+    }
     Ok(response)
 }
 
-async fn load_theme(state: &AppState) -> String {
+// ── Users API ────────────────────────────────────────────────────────────────
+//
+// Reachable with the bearer key (agents / CLI act as administrators) or with
+// an admin browser session. Members may only change their own password.
+
+#[derive(Serialize)]
+pub struct UserView {
+    pub id: i64,
+    pub username: String,
+    pub display_name: String,
+    pub role: String,
+    pub disabled: bool,
+    pub created_at: i64,
+    pub last_login_at: Option<i64>,
+}
+
+impl From<db::User> for UserView {
+    fn from(u: db::User) -> Self {
+        UserView {
+            id: u.id,
+            username: u.username,
+            display_name: u.display_name,
+            role: u.role,
+            disabled: u.disabled_at.is_some(),
+            created_at: u.created_at,
+            last_login_at: u.last_login_at,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CreateUserRequest {
+    pub username: String,
+    pub password: String,
+    pub display_name: Option<String>,
+    pub role: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct UpdateUserRequest {
+    pub display_name: Option<String>,
+    pub role: Option<String>,
+    /// Accepts booleans or the strings ndesign forms send ("true"/"on").
+    pub disabled: Option<Value>,
+    pub password: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+/// Bearer-key callers are administrators; browser sessions must be admins.
+fn require_admin(headers: &HeaderMap) -> Result<()> {
+    match crate::ui_auth::request_user(headers) {
+        None => Ok(()),
+        Some(user) if user.is_admin() => Ok(()),
+        Some(_) => Err(AppError(
+            StatusCode::FORBIDDEN,
+            "administrator role required".into(),
+        )),
+    }
+}
+
+/// GET /v1/users
+pub async fn list_users(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<UserView>>> {
+    require_admin(&headers)?;
     let db = state.db.clone();
-    spawn_blocking(move || {
+    let users = spawn_blocking(move || {
         let conn = db.lock().unwrap();
-        db::get_theme(&conn).unwrap_or_else(|_| "dark".to_string())
+        db::list_users(&conn)
     })
-    .await
-    .unwrap_or_else(|_| "dark".to_string())
+    .await??;
+    Ok(Json(users.into_iter().map(UserView::from).collect()))
+}
+
+/// POST /v1/users
+pub async fn create_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateUserRequest>,
+) -> Result<Json<UserView>> {
+    require_admin(&headers)?;
+    let hash = crate::ui_auth::hash_password(&req.password)
+        .map_err(|e| AppError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let role = req
+        .role
+        .map(|r| r.trim().to_lowercase())
+        .filter(|r| !r.is_empty())
+        .unwrap_or_else(|| db::USER_ROLE_MEMBER.to_string());
+    let db = state.db.clone();
+    let user = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::create_user(
+            &conn,
+            &req.username,
+            req.display_name.as_deref().unwrap_or(""),
+            &role,
+            &hash,
+        )
+    })
+    .await?
+    .map_err(|e| AppError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok(Json(user.into()))
+}
+
+/// PATCH /v1/users/:id
+pub async fn update_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(req): Json<UpdateUserRequest>,
+) -> Result<Json<UserView>> {
+    require_admin(&headers)?;
+    let acting = crate::ui_auth::request_user(&headers);
+    let new_hash = match req.password.as_deref().map(str::trim) {
+        Some(p) if !p.is_empty() => Some(
+            crate::ui_auth::hash_password(p)
+                .map_err(|e| AppError(StatusCode::BAD_REQUEST, format!("{e:#}")))?,
+        ),
+        _ => None,
+    };
+    let disabled = req.disabled.as_ref().map(value_as_bool);
+    let role = req
+        .role
+        .map(|r| r.trim().to_lowercase())
+        .filter(|r| !r.is_empty());
+    let db = state.db.clone();
+    let user = spawn_blocking(move || -> anyhow::Result<db::User> {
+        let conn = db.lock().unwrap();
+        let existing =
+            db::get_user(&conn, id)?.ok_or_else(|| anyhow::anyhow!("user {id} not found"))?;
+        let demoting = matches!(role.as_deref(), Some(db::USER_ROLE_MEMBER)) && existing.is_admin();
+        let disabling = disabled == Some(true) && existing.is_active();
+        if (demoting || disabling) && existing.is_admin() && db::count_active_admins(&conn)? <= 1 {
+            anyhow::bail!("cannot remove the last active administrator");
+        }
+        if let Some(acting) = acting.as_ref() {
+            if acting.id == id && (demoting || disabling) {
+                anyhow::bail!("you cannot demote or disable your own account");
+            }
+        }
+        db::update_user_profile(&conn, id, req.display_name.as_deref(), role.as_deref())?;
+        if let Some(hash) = new_hash.as_deref() {
+            db::set_user_password(&conn, id, hash)?;
+        }
+        if let Some(disabled) = disabled {
+            db::set_user_disabled(&conn, id, disabled)?;
+        }
+        db::get_user(&conn, id)?.ok_or_else(|| anyhow::anyhow!("user {id} vanished"))
+    })
+    .await?
+    .map_err(|e| AppError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok(Json(user.into()))
+}
+
+/// DELETE /v1/users/:id
+pub async fn delete_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<ResolveResponse>> {
+    require_admin(&headers)?;
+    if let Some(acting) = crate::ui_auth::request_user(&headers) {
+        if acting.id == id {
+            return Err(AppError(
+                StatusCode::BAD_REQUEST,
+                "you cannot delete your own account".into(),
+            ));
+        }
+    }
+    let db = state.db.clone();
+    let changed = spawn_blocking(move || -> anyhow::Result<bool> {
+        let conn = db.lock().unwrap();
+        if let Some(existing) = db::get_user(&conn, id)? {
+            if existing.is_admin() && existing.is_active() && db::count_active_admins(&conn)? <= 1 {
+                anyhow::bail!("cannot delete the last active administrator");
+            }
+        }
+        db::delete_user(&conn, id)
+    })
+    .await?
+    .map_err(|e| AppError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok(Json(ResolveResponse { changed }))
+}
+
+/// GET /v1/users/me — the signed-in browser user (404 for bearer callers).
+pub async fn current_user(headers: HeaderMap) -> Result<Json<UserView>> {
+    let user = crate::ui_auth::request_user(&headers).ok_or_else(|| {
+        AppError(
+            StatusCode::NOT_FOUND,
+            "no browser session on this request".into(),
+        )
+    })?;
+    Ok(Json(UserView {
+        id: user.id,
+        username: user.username,
+        display_name: user.display_name,
+        role: user.role,
+        disabled: false,
+        created_at: 0,
+        last_login_at: None,
+    }))
+}
+
+/// POST /v1/users/me/password — change the signed-in user's own password.
+pub async fn change_own_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ChangePasswordRequest>,
+) -> Result<Json<ResolveResponse>> {
+    let session = crate::ui_auth::request_user(&headers).ok_or_else(|| {
+        AppError(
+            StatusCode::BAD_REQUEST,
+            "password changes require a browser session".into(),
+        )
+    })?;
+    let new_hash = crate::ui_auth::hash_password(&req.new_password)
+        .map_err(|e| AppError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let db = state.db.clone();
+    let changed = spawn_blocking(move || -> anyhow::Result<bool> {
+        let conn = db.lock().unwrap();
+        let user =
+            db::get_user(&conn, session.id)?.ok_or_else(|| anyhow::anyhow!("user not found"))?;
+        if !crate::ui_auth::verify_password(&req.current_password, &user.password_hash) {
+            anyhow::bail!("current password is incorrect");
+        }
+        db::set_user_password(&conn, user.id, &new_hash)
+    })
+    .await?
+    .map_err(|e| AppError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok(Json(ResolveResponse { changed }))
 }
 
 // ── GET /v1/projects/:ident/messages/unread ───────────────────────────────────
@@ -10641,82 +11014,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_submit_sets_session_cookie_for_correct_key() {
-        let state = test_state();
-        let form = LoginForm {
-            key: "test-key".into(),
-            next: Some("/tasks".into()),
-        };
-        let response = login_submit(State(state), HeaderMap::new(), axum::Form(form))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        assert_eq!(response.headers().get("location").unwrap(), "/tasks");
-        let cookie = response
-            .headers()
-            .get(header::SET_COOKIE)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-        assert!(cookie.starts_with("gw_session="));
-        assert!(cookie.contains("HttpOnly"));
-        let token = cookie
-            .trim_start_matches("gw_session=")
-            .split(';')
-            .next()
-            .unwrap();
-        assert!(crate::ui_auth::verify_session_token(
-            "test-key",
-            token,
-            now_ms()
-        ));
-    }
-
-    #[tokio::test]
-    async fn login_submit_rejects_wrong_key_without_cookie() {
-        let state = test_state();
-        let form = LoginForm {
-            key: "nope".into(),
-            next: None,
-        };
-        let response = login_submit(State(state), HeaderMap::new(), axum::Form(form))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        assert!(response
-            .headers()
-            .get("location")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("/login?error=1"));
-        assert!(response.headers().get(header::SET_COOKIE).is_none());
-    }
-
-    #[tokio::test]
-    async fn login_page_renders_form_and_escapes_next() {
-        let state = test_state();
-        let response = login_page(
-            State(state),
-            Query(LoginQuery {
-                next: Some("/tasks".into()),
-                error: Some("1".into()),
-            }),
-        )
-        .await
-        .unwrap();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(html.contains(r#"<form method="post" action="/login""#));
-        assert!(html.contains(r#"name="next" value="/tasks""#));
-        assert!(html.contains("not accepted"));
-        assert!(!html.contains("test-key"));
-    }
-
-    #[tokio::test]
     async fn register_project_without_remote_is_adhoc_and_creates_no_room() {
         let state = test_state();
         let Json(resp) = register_project(
@@ -10777,6 +11074,7 @@ mod tests {
         let state = test_state();
         let Json(first) = post_human_message(
             State(state.clone()),
+            HeaderMap::new(),
             Path("demo".into()),
             Json(HumanMessageRequest {
                 content: "Please look at the widget".into(),
@@ -10794,6 +11092,7 @@ mod tests {
         // Reply into the thread using the form-shaped payload and resolve it.
         let Json(reply) = post_human_message(
             State(state.clone()),
+            HeaderMap::new(),
             Path("demo".into()),
             Json(HumanMessageRequest {
                 content: "Never mind, done.".into(),
@@ -10831,6 +11130,7 @@ mod tests {
         // Empty content is rejected.
         let err = post_human_message(
             State(state),
+            HeaderMap::new(),
             Path("demo".into()),
             Json(HumanMessageRequest {
                 content: "   ".into(),
@@ -10850,6 +11150,7 @@ mod tests {
         let state = test_state();
         let _ = post_human_message(
             State(state.clone()),
+            HeaderMap::new(),
             Path("demo".into()),
             Json(HumanMessageRequest {
                 content: "Ship it?".into(),
@@ -10871,6 +11172,294 @@ mod tests {
         assert!(html.contains(r#"data-nd-action="POST /v1/projects/demo/messages/human""#));
         assert!(html.contains("gw-tab-active"));
         assert!(html.contains("Resolve all shown"));
+    }
+
+    fn login_form(username: &str, password: &str, key: Option<&str>) -> LoginForm {
+        LoginForm {
+            username: Some(username.into()),
+            password: Some(password.into()),
+            next: Some("/tasks".into()),
+            api_key: key.map(str::to_string),
+            display_name: Some("Will H".into()),
+        }
+    }
+
+    fn session_cookie_from(response: &Response) -> String {
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .find(|c| c.starts_with("gw_session="))
+            .expect("session cookie")
+    }
+
+    #[tokio::test]
+    async fn bootstrap_creates_first_admin_only_with_api_key() {
+        let state = test_state();
+        // Login page offers the bootstrap form while no users exist.
+        let page = login_page(State(state.clone()), Query(LoginQuery::default()))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(page.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("Create administrator"));
+        assert!(html.contains(r#"name="api_key""#));
+
+        // Wrong key: refused, no user created.
+        let resp = login_submit(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::Form(login_form("will", "correct horse", Some("nope"))),
+        )
+        .await
+        .unwrap();
+        assert!(resp
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("/login?error=key"));
+        {
+            let conn = state.db.lock().unwrap();
+            assert_eq!(db::count_users(&conn).unwrap(), 0);
+        }
+
+        // Right key: admin created and signed in.
+        let resp = login_submit(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::Form(login_form("will", "correct horse", Some("test-key"))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(resp.headers().get("location").unwrap(), "/tasks");
+        let cookie = session_cookie_from(&resp);
+        let token = cookie
+            .trim_start_matches("gw_session=")
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let conn = state.db.lock().unwrap();
+        let user = db::get_user_by_username(&conn, "will").unwrap().unwrap();
+        assert!(user.is_admin());
+        assert!(crate::ui_auth::verify_session_token(
+            "test-key",
+            &user,
+            &token,
+            now_ms()
+        ));
+    }
+
+    #[tokio::test]
+    async fn login_verifies_password_and_rejects_disabled_users() {
+        let state = test_state();
+        let user = {
+            let conn = state.db.lock().unwrap();
+            let hash = crate::ui_auth::hash_password("correct horse").unwrap();
+            db::create_user(&conn, "ann", "Ann", db::USER_ROLE_MEMBER, &hash).unwrap()
+        };
+        let bad = login_submit(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::Form(login_form("ann", "wrong", None)),
+        )
+        .await
+        .unwrap();
+        assert!(bad
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("/login?error=1"));
+        assert!(bad.headers().get(header::SET_COOKIE).is_none());
+
+        let good = login_submit(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::Form(login_form("ANN", "correct horse", None)),
+        )
+        .await
+        .unwrap();
+        assert!(session_cookie_from(&good).contains("HttpOnly"));
+
+        {
+            let conn = state.db.lock().unwrap();
+            db::set_user_disabled(&conn, user.id, true).unwrap();
+        }
+        let disabled = login_submit(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::Form(login_form("ann", "correct horse", None)),
+        )
+        .await
+        .unwrap();
+        assert!(disabled
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("/login?error=disabled"));
+    }
+
+    #[tokio::test]
+    async fn users_api_enforces_admin_and_protects_last_admin() {
+        let state = test_state();
+        // Bearer callers (no session headers) act as administrators.
+        let Json(admin) = create_user(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(CreateUserRequest {
+                username: "will".into(),
+                password: "correct horse".into(),
+                display_name: None,
+                role: Some("admin".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        let Json(member) = create_user(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(CreateUserRequest {
+                username: "ann".into(),
+                password: "correct horse".into(),
+                display_name: Some("Ann".into()),
+                role: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(member.role, "member");
+
+        // A member session may not manage users.
+        let mut member_headers = HeaderMap::new();
+        member_headers.insert(
+            crate::ui_auth::USER_HEADER,
+            HeaderValue::from_str(&format!("{}:ann:Ann", member.id)).unwrap(),
+        );
+        member_headers.insert(
+            crate::ui_auth::USER_ROLE_HEADER,
+            HeaderValue::from_static("member"),
+        );
+        let err = list_users(State(state.clone()), member_headers.clone())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+        // ...but may change their own password with the current one.
+        let Json(changed) = change_own_password(
+            State(state.clone()),
+            member_headers.clone(),
+            Json(ChangePasswordRequest {
+                current_password: "correct horse".into(),
+                new_password: "battery staple".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(changed.changed);
+        let wrong = change_own_password(
+            State(state.clone()),
+            member_headers,
+            Json(ChangePasswordRequest {
+                current_password: "correct horse".into(),
+                new_password: "another one!".into(),
+            }),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(wrong.0, StatusCode::BAD_REQUEST);
+
+        // The last active admin cannot be demoted, disabled, or deleted.
+        let demote = update_user(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(admin.id),
+            Json(UpdateUserRequest {
+                role: Some("member".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(demote.0, StatusCode::BAD_REQUEST);
+        let del = delete_user(State(state.clone()), HeaderMap::new(), Path(admin.id))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(del.0, StatusCode::BAD_REQUEST);
+
+        // Members can be disabled and deleted.
+        let Json(disabled) = update_user(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(member.id),
+            Json(UpdateUserRequest {
+                disabled: Some(Value::String("true".into())),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(disabled.disabled);
+        let Json(removed) = delete_user(State(state.clone()), HeaderMap::new(), Path(member.id))
+            .await
+            .unwrap();
+        assert!(removed.changed);
+        let Json(users) = list_users(State(state), HeaderMap::new()).await.unwrap();
+        assert_eq!(users.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn browser_actions_are_attributed_to_the_session_user() {
+        let state = test_state();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            crate::ui_auth::USER_HEADER,
+            HeaderValue::from_static("3:will:Will H"),
+        );
+        headers.insert(
+            crate::ui_auth::USER_ROLE_HEADER,
+            HeaderValue::from_static("admin"),
+        );
+        let Json(first) = post_human_message(
+            State(state.clone()),
+            headers.clone(),
+            Path("demo".into()),
+            Json(HumanMessageRequest {
+                content: "hello agents".into(),
+                parent_message_id: None,
+                author: None,
+                resolve: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(first.delivery_error.is_some());
+        let Json(resolved) = resolve_message(
+            State(state.clone()),
+            headers,
+            Path(("demo".into(), first.message_id)),
+        )
+        .await
+        .unwrap();
+        assert!(resolved.changed);
+        let conn = state.db.lock().unwrap();
+        let stored = db::get_message_by_id(&conn, "demo", first.message_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.resolved_by.as_deref(), Some("user:will"));
     }
 
     #[test]

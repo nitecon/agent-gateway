@@ -81,6 +81,7 @@ MESSAGE_RETENTION_DAYS=30
 BOT_MESSAGE_RETENTION_DAYS=7
 
 # Browser login for the control panel (on|off). Off is for loopback-only hosts.
+# First visit to /login creates the first administrator (asks for GATEWAY_API_KEY).
 GATEWAY_UI_AUTH=on
 
 # Log level: error | warn | info | debug | trace

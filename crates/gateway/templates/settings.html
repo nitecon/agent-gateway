@@ -1,12 +1,82 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="gw-grid">
+  {% if let Some(me) = current_user %}
+  <section class="nd-card">
+    <div class="nd-card-header"><strong>Your account</strong></div>
+    <div class="nd-card-body">
+      <dl class="gw-kv nd-mb-sm">
+        <dt>Signed in as</dt><dd><strong>{{ me.display_name }}</strong> <span class="gw-muted">({{ me.username }}, {{ me.role }})</span></dd>
+      </dl>
+      <form class="nd-stack nd-gap-sm" data-nd-action="POST /v1/users/me/password" data-nd-success="reload">
+        <input class="nd-input" name="current_password" type="password" placeholder="Current password" autocomplete="current-password" required>
+        <input class="nd-input" name="new_password" type="password" placeholder="New password (8+ characters)" autocomplete="new-password" minlength="8" required>
+        <div><button type="submit" class="nd-btn-secondary nd-btn-sm">Change password</button></div>
+      </form>
+      <p class="nd-text-xs nd-text-muted nd-mt-sm">Changing your password signs out your other sessions.</p>
+    </div>
+  </section>
+  {% endif %}
+
+  {% if is_admin %}
+  <section class="nd-card">
+    <div class="nd-card-header"><strong>Users</strong></div>
+    <div class="nd-card-body">
+      <p class="nd-text-xs nd-text-muted nd-mb-sm">People sign in with their own username and password; agents keep using the shared API key. Browser actions are attributed to the signed-in user.</p>
+      <table class="nd-table nd-table-hover nd-mb-md">
+        <thead><tr><th>User</th><th>Role</th><th>Last sign-in</th><th></th></tr></thead>
+        <tbody>
+          {% for u in users %}
+          <tr{% if u.disabled %} class="nd-text-muted"{% endif %}>
+            <td><strong>{{ u.display_name }}</strong> <span class="gw-muted">{{ u.username }}</span>{% if u.is_self %} <span class="gw-chip">you</span>{% endif %}{% if u.disabled %} <span class="gw-chip gw-chip-danger">disabled</span>{% endif %}</td>
+            <td>{{ u.role }}</td>
+            <td class="nd-text-xs nd-text-muted">{{ u.last_login }}</td>
+            <td>
+              <div class="gw-item-actions">
+                {% if !u.is_self %}
+                {% if u.role == "admin" %}
+                <button type="button" class="nd-btn-ghost nd-btn-sm" data-nd-action="PATCH /v1/users/{{ u.id }}" data-nd-body='{"role":"member"}' data-nd-success="reload">Make member</button>
+                {% else %}
+                <button type="button" class="nd-btn-ghost nd-btn-sm" data-nd-action="PATCH /v1/users/{{ u.id }}" data-nd-body='{"role":"admin"}' data-nd-success="reload">Make admin</button>
+                {% endif %}
+                {% if u.disabled %}
+                <button type="button" class="nd-btn-secondary nd-btn-sm" data-nd-action="PATCH /v1/users/{{ u.id }}" data-nd-body='{"disabled":false}' data-nd-success="reload">Enable</button>
+                {% else %}
+                <button type="button" class="nd-btn-ghost nd-btn-sm" data-nd-action="PATCH /v1/users/{{ u.id }}" data-nd-body='{"disabled":true}' data-nd-success="reload">Disable</button>
+                {% endif %}
+                <button type="button" class="nd-btn-ghost nd-btn-sm" data-nd-action="DELETE /v1/users/{{ u.id }}" data-nd-confirm="Delete {{ u.username }}? This cannot be undone." data-nd-success="reload">Delete</button>
+                {% endif %}
+              </div>
+              {% if !u.is_self %}
+              <form class="gw-inline-form nd-mt-sm" data-nd-action="PATCH /v1/users/{{ u.id }}" data-nd-success="reload">
+                <input name="password" type="password" placeholder="New password" autocomplete="new-password" minlength="8" required>
+                <button type="submit" class="nd-btn-ghost nd-btn-sm">Reset</button>
+              </form>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+          {% if users.is_empty() %}<tr><td colspan="4" class="gw-empty">No accounts yet.</td></tr>{% endif %}
+        </tbody>
+      </table>
+      <form class="gw-inline-form" data-nd-action="POST /v1/users" data-nd-success="reload">
+        <input name="username" placeholder="username" autocomplete="off" required>
+        <input name="display_name" placeholder="Display name">
+        <input name="password" type="password" placeholder="Password (8+)" autocomplete="new-password" minlength="8" required>
+        <select name="role" aria-label="Role"><option value="member" selected>member</option><option value="admin">admin</option></select>
+        <button type="submit" class="nd-btn-primary nd-btn-sm">Add user</button>
+      </form>
+      <p class="nd-text-xs nd-text-muted nd-mt-sm">Locked out? On the host: <code>gateway user add &lt;name&gt; --admin</code> or <code>gateway user reset-password &lt;name&gt;</code>.</p>
+    </div>
+  </section>
+  {% endif %}
+
   <section class="nd-card">
     <div class="nd-card-header"><strong>Gateway</strong></div>
     <div class="nd-card-body">
       <dl class="gw-kv">
         <dt>Version</dt><dd>v{{ version }}{% if let Some(update) = update_available %} <span class="gw-chip gw-chip-warn">update available: {{ update }}</span>{% endif %}</dd>
-        <dt>Browser login</dt><dd>{% if ui_auth_enabled %}enabled (session cookie, 30 days)</span>{% else %}<span class="gw-chip gw-chip-danger">disabled</span> pages are served without a login{% endif %}</dd>
+        <dt>Browser login</dt><dd>{% if ui_auth_enabled %}username and password, 30-day sessions{% else %}<span class="gw-chip gw-chip-danger">disabled</span> pages are served without a login{% endif %}</dd>
         <dt>Default channel</dt><dd>{{ default_channel }}</dd>
         <dt>Channel plugins</dt><dd>{% if plugins.is_empty() %}<span class="gw-muted">none configured</span>{% else %}{% for p in plugins %}<span class="gw-chip">{{ p }}</span>{% endfor %}{% endif %}</dd>
       </dl>

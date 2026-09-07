@@ -131,9 +131,14 @@ RUST_LOG=info
 
 > `GATEWAY_API_KEY` is the shared secret between the gateway and all clients. Use a long random string (e.g. `openssl rand -hex 32`).
 
-> The control-panel pages are protected by a browser session: `/login` accepts the
-> API key once and sets an HttpOnly cookie. Pages never embed the key. Set
-> `GATEWAY_UI_AUTH=off` only for loopback-only deployments.
+> The control-panel pages are protected by per-person accounts. The first visit to
+> `/login` creates the first administrator (it asks for the API key as proof you
+> operate the gateway); after that people sign in with a username and password and
+> administrators manage accounts under Settings. Agents keep using the shared API
+> key. Pages never embed the key. Recovery on the host: `gateway user add <name>
+> --admin` or `gateway user reset-password <name>` (password from
+> `GATEWAY_USER_PASSWORD` or stdin). Set `GATEWAY_UI_AUTH=off` only for
+> loopback-only deployments.
 
 > Retention deletes messages older than `MESSAGE_RETENTION_DAYS` once an agent has
 > acknowledged them (or they were authored by an agent or the gateway). Messages
@@ -187,6 +192,10 @@ The API context is the canonical agent handoff surface for artifact workflows. I
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/v1/projects` | Register a project. Idempotent. Body: `{"ident": "...", "channel": "discord", "repo_url": "github.com/org/repo.git"}`. With `repo_url` the project is a `repo` project: its repository mapping is derived from the remote and its channel room is created immediately. Without it the project is `adhoc`: no room is created until the first message is sent. Re-registering an unmapped project with `repo_url` fills in the mapping. |
+| `GET`/`POST` | `/v1/users` | List or create control-panel users (bearer key or admin session). Body: `{username, password, display_name?, role?}`. |
+| `PATCH`/`DELETE` | `/v1/users/:id` | Update display name, role, `disabled`, or `password`; or delete. The last active admin is protected. |
+| `GET` | `/v1/users/me` | The signed-in browser user. |
+| `POST` | `/v1/users/me/password` | Change your own password. Body: `{current_password, new_password}`. |
 | `POST` | `/v1/projects/:ident/archive` | Hide a project from default listings (data and URLs stay). |
 | `POST` | `/v1/projects/:ident/restore` | Undo archive. |
 | `PATCH` | `/v1/projects/:ident/repo` | Correct a project's repository mapping. Body: `{provider, namespace, repo_name}`; namespace and repo_name must be given together, both blank clears the mapping. |
@@ -469,9 +478,13 @@ project instead.
 
 ### Control panel
 
-All HTML pages require a browser session: `/login` accepts the gateway API key
-once and sets an HttpOnly cookie (`GATEWAY_UI_AUTH=off` disables the login for
-loopback-only hosts). Pages never embed the API key.
+All HTML pages require a signed-in user. `/login` creates the first
+administrator on a fresh gateway (API key required) and then accepts username
+and password; sessions are HttpOnly cookies bound to the account, so a password
+change or disable signs that user out everywhere. Browser actions (replies,
+resolves, comments) are attributed to the signed-in user, while agents keep the
+shared API key. `GATEWAY_UI_AUTH=off` disables the login for loopback-only
+hosts. Pages never embed the API key.
 
 | Page | What it is for |
 |------|----------------|
@@ -484,7 +497,7 @@ loopback-only hosts). Pages never embed the API key.
 | `/projects/:ident/artifacts`, `/documentation`, `/memories` | Existing artifact, documentation, and memory views inside the project tab strip. |
 | `/projects/:ident/settings` | Identity, repository mapping, channel room, external links (CI, runbooks), archive. |
 | `/patterns`, `/skills`, `/commands`, `/agents` | Library pages (unchanged). |
-| `/settings` | Gateway-level: version, login state, channel plugins, retention windows, theme. |
+| `/settings` | Gateway-level: your account and password, user management (admins), version, channel plugins, retention windows, theme. |
 
 Keyboard: `g h/a/p/t/s` jumps between sections, `j`/`k` move the selection,
 Enter opens it, `r` focuses the reply box, `e` resolves, `?` shows the help

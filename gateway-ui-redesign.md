@@ -8,8 +8,11 @@ the human-facing control panel.
 
 Shipped (see the commit series on `ui-redesign`):
 
-- Phase 0: session-cookie login for pages (`/login`, `GATEWAY_UI_AUTH`), API
-  key no longer embedded in pages, "unanswered" derived from agent
+- Phase 0: per-user login for pages (`/login`; first visit bootstraps an
+  administrator with the API key; argon2 password hashes; sessions bound to
+  the user's session epoch; `gateway user add|reset-password|list` for
+  recovery; admin user management in Settings; browser actions attributed to
+  the signed-in user), API key no longer embedded in pages, "unanswered" derived from agent
   confirmations, Discord author classification (`author_kind`), retention
   that actually purges. API key rotation was declined by the owner.
 - Phase 1: Eventic/build removed; `repo_url` on registration derives the

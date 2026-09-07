@@ -1076,6 +1076,21 @@ fn apply_schema(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE projects ADD COLUMN archived_at INTEGER", []);
     let _ = conn.execute("ALTER TABLE projects ADD COLUMN canonical_remote TEXT", []);
 
+    // ── Migration: browser user accounts ─────────────────────────────────────
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS users (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            username       TEXT NOT NULL UNIQUE,
+            display_name   TEXT NOT NULL,
+            role           TEXT NOT NULL DEFAULT 'member' CHECK(role IN ('admin','member')),
+            password_hash  TEXT NOT NULL,
+            session_epoch  INTEGER NOT NULL DEFAULT 1,
+            disabled_at    INTEGER,
+            created_at     INTEGER NOT NULL,
+            last_login_at  INTEGER
+        );",
+    )?;
+
     // ── Migration: human resolution state on messages + project links ─────────
     let _ = conn.execute("ALTER TABLE messages ADD COLUMN resolved_at INTEGER", []);
     let _ = conn.execute("ALTER TABLE messages ADD COLUMN resolved_by TEXT", []);
@@ -11360,7 +11375,7 @@ pub fn add_project_link(
         params![project_ident.as_str()],
         |r| r.get(0),
     )?;
-    let id = crud(conn).insert(
+    crud(conn).insert(
         "project_links",
         &[
             crud_col("project_ident", project_ident.as_str()),
@@ -11370,8 +11385,9 @@ pub fn add_project_link(
             crud_col("created_at", now_ms()),
         ],
     )?;
+    let id = conn.last_insert_rowid();
     Ok(ProjectLink {
-        id: id as i64,
+        id,
         project_ident,
         label: label.to_string(),
         url: url.to_string(),
@@ -11692,6 +11708,210 @@ pub fn get_thread(
         replies,
         confirmations,
     }))
+}
+
+// ── Users (browser accounts) ─────────────────────────────────────────────────
+//
+// Agents authenticate with the shared API key. People sign in to the control
+// panel with a username and password; the session names the user so browser
+// actions (replies, resolves, comments) are attributed to a person.
+
+pub const USER_ROLE_ADMIN: &str = "admin";
+pub const USER_ROLE_MEMBER: &str = "member";
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct User {
+    pub id: i64,
+    pub username: String,
+    pub display_name: String,
+    /// `admin` | `member`
+    pub role: String,
+    #[serde(skip_serializing)]
+    pub password_hash: String,
+    /// Bumped on password change or disable; invalidates outstanding sessions.
+    pub session_epoch: i64,
+    pub disabled_at: Option<i64>,
+    pub created_at: i64,
+    pub last_login_at: Option<i64>,
+}
+
+impl User {
+    pub fn is_admin(&self) -> bool {
+        self.role == USER_ROLE_ADMIN
+    }
+    pub fn is_active(&self) -> bool {
+        self.disabled_at.is_none()
+    }
+}
+
+const USER_SELECT_COLS: &str = "id, username, display_name, role, password_hash, session_epoch, disabled_at, created_at, last_login_at";
+
+fn row_to_user(row: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
+    Ok(User {
+        id: row.get(0)?,
+        username: row.get(1)?,
+        display_name: row.get(2)?,
+        role: row.get(3)?,
+        password_hash: row.get(4)?,
+        session_epoch: row.get(5)?,
+        disabled_at: row.get(6)?,
+        created_at: row.get(7)?,
+        last_login_at: row.get(8)?,
+    })
+}
+
+/// Lowercase, trimmed; letters, digits, `.`, `_`, `-`; 2..=40 chars.
+pub fn normalize_username(raw: &str) -> Result<String> {
+    let name = raw.trim().to_lowercase();
+    if name.len() < 2 || name.len() > 40 {
+        bail!("username must be 2-40 characters");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        bail!("username may contain letters, digits, '.', '_' and '-' only");
+    }
+    Ok(name)
+}
+
+pub fn count_users(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?)
+}
+
+pub fn list_users(conn: &Connection) -> Result<Vec<User>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {USER_SELECT_COLS} FROM users ORDER BY username ASC"
+    ))?;
+    let rows = stmt
+        .query_map([], row_to_user)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn get_user(conn: &Connection, id: i64) -> Result<Option<User>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {USER_SELECT_COLS} FROM users WHERE id = ?1"
+    ))?;
+    Ok(stmt.query_row(params![id], row_to_user).optional()?)
+}
+
+pub fn get_user_by_username(conn: &Connection, username: &str) -> Result<Option<User>> {
+    let username = username.trim().to_lowercase();
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {USER_SELECT_COLS} FROM users WHERE username = ?1"
+    ))?;
+    Ok(stmt
+        .query_row(params![username.as_str()], row_to_user)
+        .optional()?)
+}
+
+/// Create a user. `password_hash` must already be an argon2 PHC string.
+pub fn create_user(
+    conn: &Connection,
+    username: &str,
+    display_name: &str,
+    role: &str,
+    password_hash: &str,
+) -> Result<User> {
+    let username = normalize_username(username)?;
+    let display_name = display_name.trim();
+    let display_name = if display_name.is_empty() {
+        username.clone()
+    } else {
+        display_name.to_string()
+    };
+    if role != USER_ROLE_ADMIN && role != USER_ROLE_MEMBER {
+        bail!("role must be 'admin' or 'member'");
+    }
+    if get_user_by_username(conn, &username)?.is_some() {
+        bail!("username '{username}' is already taken");
+    }
+    crud(conn).insert(
+        "users",
+        &[
+            crud_col("username", username.as_str()),
+            crud_col("display_name", display_name.as_str()),
+            crud_col("role", role),
+            crud_col("password_hash", password_hash),
+            crud_col("session_epoch", 1_i64),
+            crud_col("created_at", now_ms()),
+        ],
+    )?;
+    let id = conn.last_insert_rowid();
+    get_user(conn, id)?.ok_or_else(|| anyhow::anyhow!("user insert did not persist"))
+}
+
+/// Partial update of profile fields. Returns the fresh row.
+pub fn update_user_profile(
+    conn: &Connection,
+    id: i64,
+    display_name: Option<&str>,
+    role: Option<&str>,
+) -> Result<Option<User>> {
+    if let Some(role) = role {
+        if role != USER_ROLE_ADMIN && role != USER_ROLE_MEMBER {
+            bail!("role must be 'admin' or 'member'");
+        }
+    }
+    let mut cols: Vec<CrudColumn<'_>> = Vec::new();
+    if let Some(name) = display_name.map(str::trim).filter(|n| !n.is_empty()) {
+        cols.push(crud_col("display_name", name));
+    }
+    if let Some(role) = role {
+        cols.push(crud_col("role", role));
+    }
+    if !cols.is_empty() {
+        crud(conn).update("users", &cols, &[crud_eq("id", id)])?;
+    }
+    get_user(conn, id)
+}
+
+/// Replace the password hash and invalidate existing sessions.
+pub fn set_user_password(conn: &Connection, id: i64, password_hash: &str) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE users SET password_hash = ?1, session_epoch = session_epoch + 1 WHERE id = ?2",
+        params![password_hash, id],
+    )?;
+    Ok(n > 0)
+}
+
+/// Disable (or re-enable) a user. Disabling invalidates sessions.
+pub fn set_user_disabled(conn: &Connection, id: i64, disabled: bool) -> Result<Option<User>> {
+    if disabled {
+        conn.execute(
+            "UPDATE users SET disabled_at = ?1, session_epoch = session_epoch + 1 WHERE id = ?2 AND disabled_at IS NULL",
+            params![now_ms(), id],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE users SET disabled_at = NULL WHERE id = ?1",
+            params![id],
+        )?;
+    }
+    get_user(conn, id)
+}
+
+pub fn delete_user(conn: &Connection, id: i64) -> Result<bool> {
+    let n = crud(conn).delete("users", &[crud_eq("id", id)])?;
+    Ok(n > 0)
+}
+
+pub fn touch_user_login(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE users SET last_login_at = ?1 WHERE id = ?2",
+        params![now_ms(), id],
+    )?;
+    Ok(())
+}
+
+/// Number of active admins; used to refuse removing the last one.
+pub fn count_active_admins(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM users WHERE role = 'admin' AND disabled_at IS NULL",
+        [],
+        |r| r.get(0),
+    )?)
 }
 
 #[cfg(test)]
@@ -12112,9 +12332,12 @@ mod tests {
         assert!(add_project_link(&conn, "proj", "CI", "ftp://nope").is_err());
         assert!(add_project_link(&conn, "proj", "", "https://x").is_err());
         let link = add_project_link(&conn, "proj", "CI", "https://ci.example.com").unwrap();
+        let second = add_project_link(&conn, "proj", "Docs", "https://docs.example.com").unwrap();
+        assert_ne!(link.id, second.id);
         let links = list_project_links(&conn, "proj").unwrap();
-        assert_eq!(links.len(), 1);
+        assert_eq!(links.len(), 2);
         assert_eq!(links[0].id, link.id);
+        assert!(delete_project_link(&conn, "proj", second.id).unwrap());
         assert!(delete_project_link(&conn, "proj", link.id).unwrap());
         assert!(!delete_project_link(&conn, "proj", link.id).unwrap());
     }
@@ -12207,6 +12430,42 @@ mod tests {
             1
         );
         assert_eq!(inbox_counts(&conn, "proj").unwrap().alerts_open, 0);
+    }
+
+    #[test]
+    fn users_crud_roles_and_session_epoch() {
+        let conn = test_conn();
+        assert_eq!(count_users(&conn).unwrap(), 0);
+        let admin = create_user(&conn, " Will ", "Will H", USER_ROLE_ADMIN, "hash-1").unwrap();
+        assert_eq!(admin.username, "will");
+        assert!(admin.is_admin());
+        assert!(create_user(&conn, "will", "", USER_ROLE_MEMBER, "x").is_err());
+        assert!(create_user(&conn, "bad name!", "", USER_ROLE_MEMBER, "x").is_err());
+        assert!(create_user(&conn, "ok", "", "root", "x").is_err());
+        let member = create_user(&conn, "ann", "", USER_ROLE_MEMBER, "hash-2").unwrap();
+        assert_eq!(member.display_name, "ann");
+        assert_eq!(list_users(&conn).unwrap().len(), 2);
+        assert_eq!(count_active_admins(&conn).unwrap(), 1);
+
+        assert!(set_user_password(&conn, member.id, "hash-3").unwrap());
+        let m = get_user(&conn, member.id).unwrap().unwrap();
+        assert_eq!(m.session_epoch, member.session_epoch + 1);
+        assert_eq!(m.password_hash, "hash-3");
+
+        let m = set_user_disabled(&conn, member.id, true).unwrap().unwrap();
+        assert!(!m.is_active());
+        assert_eq!(m.session_epoch, member.session_epoch + 2);
+        let m = set_user_disabled(&conn, member.id, false).unwrap().unwrap();
+        assert!(m.is_active());
+
+        let m = update_user_profile(&conn, member.id, Some("Ann B"), Some(USER_ROLE_ADMIN))
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.display_name, "Ann B");
+        assert_eq!(count_active_admins(&conn).unwrap(), 2);
+        assert!(get_user_by_username(&conn, "ANN").unwrap().is_some());
+        assert!(delete_user(&conn, member.id).unwrap());
+        assert!(!delete_user(&conn, member.id).unwrap());
     }
 
     #[test]

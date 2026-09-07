@@ -40,6 +40,27 @@ struct Cli {
 enum Command {
     /// Check for a newer version and update the gateway binary in place
     Update,
+    /// Manage control-panel user accounts (recovery path when no admin can sign in)
+    User {
+        #[command(subcommand)]
+        action: UserCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum UserCommand {
+    /// Create a user. Reads the password from GATEWAY_USER_PASSWORD or stdin.
+    Add {
+        username: String,
+        #[arg(long)]
+        display_name: Option<String>,
+        #[arg(long)]
+        admin: bool,
+    },
+    /// Reset a user's password (and sign out their sessions).
+    ResetPassword { username: String },
+    /// List users.
+    List,
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -67,7 +88,37 @@ pub struct AppState {
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
 
-async fn bearer_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
+/// Resolve the browser session on a request to a user row, if the cookie is
+/// present, well-formed, unexpired, and matches an active user.
+fn resolve_session_user(state: &AppState, headers: &axum::http::HeaderMap) -> Option<db::User> {
+    if !state.ui_auth_enabled {
+        return None;
+    }
+    let token = ui_auth::session_cookie(headers)?;
+    let user_id = ui_auth::token_user_id(&token)?;
+    let user = {
+        let conn = state.db.lock().unwrap();
+        db::get_user(&conn, user_id).ok().flatten()?
+    };
+    ui_auth::verify_session_token(&state.api_key, &user, &token, db::now_ms()).then_some(user)
+}
+
+/// Strip any client-supplied identity headers, then stamp the resolved user.
+fn stamp_user(request: &mut Request, user: Option<&db::User>) {
+    let headers = request.headers_mut();
+    headers.remove(ui_auth::USER_HEADER);
+    headers.remove(ui_auth::USER_ROLE_HEADER);
+    if let Some(user) = user {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&ui_auth::user_header_value(user)) {
+            headers.insert(ui_auth::USER_HEADER, v);
+        }
+        if let Ok(v) = axum::http::HeaderValue::from_str(&user.role) {
+            headers.insert(ui_auth::USER_ROLE_HEADER, v);
+        }
+    }
+}
+
+async fn bearer_auth(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
     let token = request
         .headers()
         .get("authorization")
@@ -75,11 +126,20 @@ async fn bearer_auth(State(state): State<AppState>, request: Request, next: Next
         .and_then(|v| v.strip_prefix("Bearer "));
 
     if token.map(|t| t == state.api_key).unwrap_or(false) {
+        stamp_user(&mut request, None);
         return next.run(request).await;
     }
     // Same-origin XHR from the control panel: session cookie + custom header.
-    if ui_auth::has_valid_ui_xhr(&state.api_key, request.headers(), db::now_ms()) {
-        return next.run(request).await;
+    if ui_auth::is_ui_xhr(request.headers()) {
+        if let Some(user) = resolve_session_user(&state, request.headers()) {
+            stamp_user(&mut request, Some(&user));
+            return next.run(request).await;
+        }
+        // Loopback deployments without login still get their XHR through.
+        if !state.ui_auth_enabled {
+            stamp_user(&mut request, None);
+            return next.run(request).await;
+        }
     }
     StatusCode::UNAUTHORIZED.into_response()
 }
@@ -91,10 +151,13 @@ async fn bearer_auth(State(state): State<AppState>, request: Request, next: Next
 /// Unauthenticated page loads are redirected to `/login?next=…`; other
 /// requests (XHR, POST) get a bare 401. Disabled entirely when
 /// `GATEWAY_UI_AUTH=off`.
-async fn ui_page_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    if !state.ui_auth_enabled
-        || ui_auth::has_valid_session(&state.api_key, request.headers(), db::now_ms())
-    {
+async fn ui_page_auth(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
+    if !state.ui_auth_enabled {
+        stamp_user(&mut request, None);
+        return next.run(request).await;
+    }
+    if let Some(user) = resolve_session_user(&state, request.headers()) {
+        stamp_user(&mut request, Some(&user));
         return next.run(request).await;
     }
     let wants_html = request.method() == axum::http::Method::GET
@@ -199,6 +262,10 @@ async fn main() -> Result<()> {
 
     // ── CLI parsing ──────────────────────────────────────────────────────────
     let cli = Cli::parse();
+
+    if let Some(Command::User { action }) = &cli.command {
+        return run_user_command(action);
+    }
 
     if let Some(Command::Update) = cli.command {
         let client = reqwest::Client::builder()
@@ -725,6 +792,13 @@ async fn main() -> Result<()> {
             "/v1/patterns/{id}/comments",
             get(routes::list_pattern_comments_handler).post(routes::add_pattern_comment_handler),
         )
+        .route("/v1/users", get(routes::list_users).post(routes::create_user))
+        .route("/v1/users/me", get(routes::current_user))
+        .route("/v1/users/me/password", post(routes::change_own_password))
+        .route(
+            "/v1/users/{id}",
+            patch(routes::update_user).delete(routes::delete_user),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), bearer_auth));
 
     // Control-panel pages sit behind the browser session cookie (see
@@ -813,6 +887,73 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
 
+    Ok(())
+}
+
+/// `gateway user …`: local account management against the configured database.
+fn run_user_command(action: &UserCommand) -> Result<()> {
+    let db_config = db::DatabaseConfig::from_env().context("load database config")?;
+    let db = db::open_config(&db_config)?;
+    let conn = db.lock().unwrap();
+    let read_password = || -> Result<String> {
+        if let Ok(p) = std::env::var("GATEWAY_USER_PASSWORD") {
+            return Ok(p);
+        }
+        eprint!("Password: ");
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("read password from stdin")?;
+        Ok(line.trim_end_matches(['\r', '\n']).to_string())
+    };
+    match action {
+        UserCommand::Add {
+            username,
+            display_name,
+            admin,
+        } => {
+            let password = read_password()?;
+            let hash = ui_auth::hash_password(&password)?;
+            let role = if *admin {
+                db::USER_ROLE_ADMIN
+            } else {
+                db::USER_ROLE_MEMBER
+            };
+            let user = db::create_user(
+                &conn,
+                username,
+                display_name.as_deref().unwrap_or(""),
+                role,
+                &hash,
+            )?;
+            println!(
+                "created {} ({}) as {}",
+                user.username, user.display_name, user.role
+            );
+        }
+        UserCommand::ResetPassword { username } => {
+            let user = db::get_user_by_username(&conn, username)?
+                .ok_or_else(|| anyhow::anyhow!("no user named '{username}'"))?;
+            let password = read_password()?;
+            let hash = ui_auth::hash_password(&password)?;
+            db::set_user_password(&conn, user.id, &hash)?;
+            println!(
+                "password reset for {}; existing sessions signed out",
+                user.username
+            );
+        }
+        UserCommand::List => {
+            for user in db::list_users(&conn)? {
+                println!(
+                    "{:<20} {:<8} {}{}",
+                    user.username,
+                    user.role,
+                    user.display_name,
+                    if user.is_active() { "" } else { "  (disabled)" }
+                );
+            }
+        }
+    }
     Ok(())
 }
 
