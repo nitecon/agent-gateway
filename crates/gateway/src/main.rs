@@ -3,6 +3,7 @@ mod channels;
 mod db;
 mod projects;
 mod routes;
+mod ui;
 mod ui_auth;
 
 use anyhow::{Context, Result};
@@ -54,6 +55,9 @@ pub struct AppState {
     /// When false (`GATEWAY_UI_AUTH=off`), control-panel pages are served
     /// without a browser session. Intended for loopback-only deployments.
     pub ui_auth_enabled: bool,
+    /// Retention windows (days) shown on the Settings page.
+    pub retention_days: u64,
+    pub bot_retention_days: u64,
     pub artifact_operations: db::ArtifactOperationsEnvelope,
     pub artifact_body_schema_enabled: bool,
     pub artifact_auth_enforced: bool,
@@ -446,6 +450,8 @@ async fn main() -> Result<()> {
         default_channel,
         api_key,
         ui_auth_enabled,
+        retention_days,
+        bot_retention_days,
         artifact_operations,
         artifact_body_schema_enabled,
         artifact_auth_enforced,
@@ -459,6 +465,30 @@ async fn main() -> Result<()> {
             get(routes::list_projects_handler).post(routes::register_project),
         )
         .route("/v1/projects/{ident}/messages", post(routes::send_message))
+        .route(
+            "/v1/projects/{ident}/messages/resolve",
+            post(routes::resolve_messages_bulk),
+        )
+        .route(
+            "/v1/projects/{ident}/messages/{id}/resolve",
+            post(routes::resolve_message),
+        )
+        .route(
+            "/v1/projects/{ident}/messages/{id}/reopen",
+            post(routes::reopen_message),
+        )
+        .route(
+            "/v1/projects/{ident}/links",
+            get(routes::list_project_links).post(routes::add_project_link),
+        )
+        .route(
+            "/v1/projects/{ident}/links/{id}",
+            axum::routing::delete(routes::delete_project_link),
+        )
+        .route(
+            "/v1/projects/{ident}/room",
+            post(routes::create_project_room),
+        )
         .route(
             "/v1/projects/{ident}/messages/unread",
             get(routes::get_unread_messages),
@@ -688,7 +718,16 @@ async fn main() -> Result<()> {
     // `ui_page_auth`). The three /skills, /commands, /agents pages replace
     // the old /manage tab hub.
     let pages = Router::new()
-        .route("/", get(routes::dashboard))
+        .route("/", get(ui::home::home_page))
+        .route("/projects", get(ui::projects::projects_registry_page))
+        .route(
+            "/projects/{ident}",
+            get(ui::projects::project_overview_page),
+        )
+        .route(
+            "/projects/{ident}/settings",
+            get(ui::projects::project_settings_page),
+        )
         .route("/documentation", get(routes::api_docs_index_page))
         .route("/api-docs", get(routes::api_docs_index_page))
         .route("/artifacts", get(routes::artifacts_index_page))
@@ -729,7 +768,7 @@ async fn main() -> Result<()> {
         .route("/agents", get(routes::agents_page))
         .route("/agents/new", get(routes::new_agent_page))
         .route("/agents/{name}", get(routes::agent_detail_page))
-        .route("/settings", get(routes::settings_page))
+        .route("/settings", get(ui::settings::settings_page))
         .route("/theme", get(routes::get_theme).post(routes::set_theme))
         .layer(middleware::from_fn_with_state(state.clone(), ui_page_auth));
 

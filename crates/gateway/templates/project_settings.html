@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="gw-grid">
+  <section class="nd-card">
+    <div class="nd-card-header"><strong>Identity</strong></div>
+    <div class="nd-card-body">
+      <dl class="gw-kv">
+        <dt>Ident</dt><dd><code>{{ ident }}</code></dd>
+        <dt>Kind</dt><dd>{{ kind }}{% if kind == "adhoc" %} <span class="gw-muted">(registered from a directory name)</span>{% endif %}</dd>
+        <dt>Canonical remote</dt><dd>{% if let Some(remote) = canonical_remote %}<code>{{ remote }}</code>{% else %}<span class="gw-muted">not reported yet — fills in the next time agent-tools runs in the repository</span>{% endif %}</dd>
+        <dt>Registered</dt><dd>{{ created }}</dd>
+      </dl>
+    </div>
+  </section>
+
+  <section class="nd-card">
+    <div class="nd-card-header"><strong>Repository</strong></div>
+    <div class="nd-card-body">
+      <p class="nd-text-xs nd-text-muted nd-mb-sm">Derived automatically from the remote. Edit only to correct it; leave both fields blank to clear.</p>
+      <form class="gw-inline-form" data-nd-action="PATCH /v1/projects/{{ ident }}/repo" data-nd-success="reload">
+        <select name="provider" aria-label="Provider">
+          <option value="github"{% if provider == "github" %} selected{% endif %}>github</option>
+          <option value="gitlab"{% if provider == "gitlab" %} selected{% endif %}>gitlab</option>
+          <option value="bitbucket"{% if provider == "bitbucket" %} selected{% endif %}>bitbucket</option>
+        </select>
+        <input name="namespace" value="{{ namespace }}" placeholder="namespace" aria-label="Namespace">
+        <input name="repo_name" value="{{ repo_name }}" placeholder="repository" aria-label="Repository">
+        <button type="submit" class="nd-btn-primary nd-btn-sm">Save</button>
+      </form>
+      {% if let Some(url) = repo_url %}<p class="nd-text-xs nd-mt-sm"><a href="{{ url }}" rel="noopener" target="_blank">{{ url }}</a></p>{% endif %}
+    </div>
+  </section>
+
+  <section class="nd-card">
+    <div class="nd-card-header"><strong>Channel</strong></div>
+    <div class="nd-card-body">
+      <dl class="gw-kv">
+        <dt>Plugin</dt><dd>{{ channel }}</dd>
+        <dt>Room</dt><dd>{% if has_room %}<code>{{ room_id }}</code>{% else %}<span class="gw-muted">none yet — created on first send</span>{% endif %}</dd>
+      </dl>
+      {% if !has_room %}
+      <button type="button" class="nd-btn-secondary nd-btn-sm nd-mt-sm" data-nd-action="POST /v1/projects/{{ ident }}/room" data-nd-success="reload">Create room now</button>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="nd-card">
+    <div class="nd-card-header"><strong>External links</strong></div>
+    <div class="nd-card-body">
+      <p class="nd-text-xs nd-text-muted nd-mb-sm">CI dashboards, runbooks, staging URLs. The gateway links out; it does not integrate.</p>
+      {% if !links.is_empty() %}
+      <ul class="gw-list nd-mb-sm">
+        {% for l in links %}
+        <li>
+          <div><div class="gw-item-title">{{ l.label }}</div><div class="gw-item-meta"><a href="{{ l.url }}" rel="noopener" target="_blank">{{ l.url }}</a></div></div>
+          <div class="gw-item-actions"><button type="button" class="nd-btn-ghost nd-btn-sm" data-nd-action="DELETE /v1/projects/{{ ident }}/links/{{ l.id }}" data-nd-success="reload">Remove</button></div>
+        </li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+      <form class="gw-inline-form" data-nd-action="POST /v1/projects/{{ ident }}/links" data-nd-success="reload">
+        <input name="label" placeholder="Label (e.g. Woodpecker)" aria-label="Label" required>
+        <input name="url" placeholder="https://…" aria-label="URL" type="url" required>
+        <button type="submit" class="nd-btn-secondary nd-btn-sm">Add link</button>
+      </form>
+    </div>
+  </section>
+
+  <section class="nd-card">
+    <div class="nd-card-header"><strong>Lifecycle</strong></div>
+    <div class="nd-card-body">
+      {% if archived %}
+      <p class="nd-text-sm nd-mb-sm">This project is archived. It is hidden from default lists; tasks, memories, and messages remain reachable.</p>
+      <button type="button" class="nd-btn-primary nd-btn-sm" data-nd-action="POST /v1/projects/{{ ident }}/restore" data-nd-success="reload">Restore</button>
+      {% else %}
+      <p class="nd-text-sm nd-mb-sm">Archiving hides the project from Home, the registry, and pickers. Nothing is deleted.</p>
+      <button type="button" class="nd-btn-ghost nd-btn-sm" data-nd-action="POST /v1/projects/{{ ident }}/archive" data-nd-success="reload">Archive project</button>
+      {% endif %}
+    </div>
+  </section>
+</div>
+{% endblock %}

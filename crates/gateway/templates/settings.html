@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="gw-grid">
+  <section class="nd-card">
+    <div class="nd-card-header"><strong>Gateway</strong></div>
+    <div class="nd-card-body">
+      <dl class="gw-kv">
+        <dt>Version</dt><dd>v{{ version }}{% if let Some(update) = update_available %} <span class="gw-chip gw-chip-warn">update available: {{ update }}</span>{% endif %}</dd>
+        <dt>Browser login</dt><dd>{% if ui_auth_enabled %}enabled (session cookie, 30 days)</span>{% else %}<span class="gw-chip gw-chip-danger">disabled</span> pages are served without a login{% endif %}</dd>
+        <dt>Default channel</dt><dd>{{ default_channel }}</dd>
+        <dt>Channel plugins</dt><dd>{% if plugins.is_empty() %}<span class="gw-muted">none configured</span>{% else %}{% for p in plugins %}<span class="gw-chip">{{ p }}</span>{% endfor %}{% endif %}</dd>
+      </dl>
+    </div>
+  </section>
+
+  <section class="nd-card">
+    <div class="nd-card-header"><strong>Retention</strong></div>
+    <div class="nd-card-body">
+      <dl class="gw-kv">
+        <dt>Acknowledged messages</dt><dd>deleted after {{ retention_days }} days</dd>
+        <dt>Bot and webhook messages</dt><dd>deleted after {{ bot_retention_days }} days</dd>
+        <dt>Open human messages</dt><dd>kept until acknowledged or resolved</dd>
+      </dl>
+      <p class="nd-text-xs nd-text-muted nd-mt-sm">Set with <code>MESSAGE_RETENTION_DAYS</code> and <code>BOT_MESSAGE_RETENTION_DAYS</code> in the gateway environment.</p>
+    </div>
+  </section>
+
+  <section class="nd-card">
+    <div class="nd-card-header"><strong>Appearance</strong></div>
+    <div class="nd-card-body">
+      <p class="nd-text-sm">Theme: <strong>{{ theme_name }}</strong>. Use the Theme button in the header to switch; the choice is stored on the gateway.</p>
+    </div>
+  </section>
+
+  <section class="nd-card">
+    <div class="nd-card-header"><strong>Projects</strong></div>
+    <div class="nd-card-body">
+      <p class="nd-text-sm nd-mb-sm">{{ project_count }} active, {{ archived_count }} archived. Repository mappings, channel rooms, links, and archive state live on each project.</p>
+      <a class="nd-btn-secondary nd-btn-sm" href="/projects">Open the project registry</a>
+    </div>
+  </section>
+</div>
+{% endblock %}

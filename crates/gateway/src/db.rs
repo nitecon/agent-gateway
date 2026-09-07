@@ -1071,6 +1071,24 @@ fn apply_schema(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE projects ADD COLUMN archived_at INTEGER", []);
     let _ = conn.execute("ALTER TABLE projects ADD COLUMN canonical_remote TEXT", []);
 
+    // ── Migration: human resolution state on messages + project links ─────────
+    let _ = conn.execute("ALTER TABLE messages ADD COLUMN resolved_at INTEGER", []);
+    let _ = conn.execute("ALTER TABLE messages ADD COLUMN resolved_by TEXT", []);
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_messages_open_roots
+             ON messages(project_ident, source, id) WHERE resolved_at IS NULL;
+         CREATE TABLE IF NOT EXISTS project_links (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_ident  TEXT NOT NULL REFERENCES projects(ident) ON DELETE CASCADE,
+            label          TEXT NOT NULL,
+            url            TEXT NOT NULL,
+            rank           INTEGER NOT NULL DEFAULT 0,
+            created_at     INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_project_links_project
+             ON project_links(project_ident, rank);",
+    )?;
+
     // Migrate existing confirmed messages to agent_confirmations for "_default" agent.
     conn.execute(
         "INSERT OR IGNORE INTO agent_confirmations (agent_id, project_ident, message_id, confirmed_at)
@@ -10785,6 +10803,588 @@ pub fn reorder_tasks_in_column(
     Ok(())
 }
 
+// ── Control-panel queries ────────────────────────────────────────────────────
+//
+// Read models for the human-facing pages (Home inbox, Activity, project
+// overview, registry). Everything here is derived from existing tables; the
+// only writes are message resolution and project links.
+
+/// One row on the Home "Needs you" list.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NeedsYouItem {
+    /// `agent_update` | `open_question` | `stalled_task` | `review_decision`
+    pub kind: &'static str,
+    pub project_ident: String,
+    pub title: String,
+    pub detail: String,
+    pub at: i64,
+    pub href: String,
+    pub message_id: Option<i64>,
+    pub agent_id: Option<String>,
+}
+
+/// Default idle window after which an in-progress task counts as stalled.
+pub const STALLED_TASK_MS: i64 = 24 * 60 * 60 * 1000;
+
+fn snippet(subject: Option<String>, content: &str) -> String {
+    let base = subject
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| content.lines().next().unwrap_or("").to_string());
+    let mut out: String = base.chars().take(140).collect();
+    if base.chars().count() > 140 {
+        out.push('…');
+    }
+    out
+}
+
+/// Items that need a human decision, newest first, across active projects.
+pub fn list_needs_you(conn: &Connection, now: i64, limit: usize) -> Result<Vec<NeedsYouItem>> {
+    let mut items = Vec::new();
+
+    // Latest unresolved agent update per project with no human message after it.
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT m.id, m.project_ident, m.subject, m.content, m.agent_id, m.sent_at
+             FROM messages m
+             JOIN projects p ON p.ident = m.project_ident AND p.archived_at IS NULL
+             WHERE m.source = 'agent'
+               AND m.message_type = 'message'
+               AND m.resolved_at IS NULL
+               AND m.id = (
+                   SELECT MAX(m2.id) FROM messages m2
+                   WHERE m2.project_ident = m.project_ident
+                     AND m2.source = 'agent' AND m2.message_type = 'message'
+                     AND m2.resolved_at IS NULL)
+               AND NOT EXISTS (
+                   SELECT 1 FROM messages h
+                   WHERE h.project_ident = m.project_ident
+                     AND h.source = 'user'
+                     AND COALESCE(h.author_kind, 'human') = 'human'
+                     AND h.id > m.id)
+             ORDER BY m.sent_at DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, ident, subject, content, agent_id, at) = row?;
+            items.push(NeedsYouItem {
+                kind: "agent_update",
+                href: format!("/projects/{ident}/inbox?thread={id}"),
+                project_ident: ident,
+                title: snippet(subject, &content),
+                detail: agent_id
+                    .as_deref()
+                    .map(|a| format!("from {a}"))
+                    .unwrap_or_default(),
+                at,
+                message_id: Some(id),
+                agent_id,
+            });
+        }
+    }
+
+    // Human messages no agent has acknowledged yet.
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT m.id, m.project_ident, m.subject, m.content, m.sent_at
+             FROM messages m
+             JOIN projects p ON p.ident = m.project_ident AND p.archived_at IS NULL
+             WHERE m.source = 'user'
+               AND COALESCE(m.author_kind, 'human') = 'human'
+               AND m.resolved_at IS NULL
+               AND m.confirmed_at IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM agent_confirmations ac
+                   WHERE ac.project_ident = m.project_ident AND ac.message_id = m.id)
+             ORDER BY m.sent_at DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, ident, subject, content, at) = row?;
+            items.push(NeedsYouItem {
+                kind: "open_question",
+                href: format!("/projects/{ident}/inbox?thread={id}"),
+                project_ident: ident,
+                title: snippet(subject, &content),
+                detail: "no agent has picked this up".to_string(),
+                at,
+                message_id: Some(id),
+                agent_id: None,
+            });
+        }
+    }
+
+    // In-progress tasks idle past the stall window.
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT t.id, t.project_ident, t.title, t.owner_agent_id, t.updated_at
+             FROM tasks t
+             JOIN projects p ON p.ident = t.project_ident AND p.archived_at IS NULL
+             WHERE t.status = 'in_progress' AND t.updated_at < ?1
+             ORDER BY t.updated_at ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![now - STALLED_TASK_MS, limit as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, ident, title, owner, at) = row?;
+            items.push(NeedsYouItem {
+                kind: "stalled_task",
+                href: format!("/projects/{ident}/tasks/{id}"),
+                project_ident: ident,
+                title,
+                detail: match owner {
+                    Some(owner) => format!("in progress, owned by {owner}, no activity"),
+                    None => "in progress, unowned, no activity".to_string(),
+                },
+                at,
+                message_id: None,
+                agent_id: None,
+            });
+        }
+    }
+
+    // Artifacts explicitly waiting on the user.
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT a.artifact_id, a.project_ident, a.title, a.kind, a.updated_at
+             FROM artifacts a
+             JOIN projects p ON p.ident = a.project_ident AND p.archived_at IS NULL
+             WHERE a.review_state = 'needs_user_decision'
+             ORDER BY a.updated_at DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, ident, title, kind, at) = row?;
+            items.push(NeedsYouItem {
+                kind: "review_decision",
+                href: format!("/projects/{ident}/artifacts/{id}"),
+                project_ident: ident,
+                title,
+                detail: format!("{kind} needs your decision"),
+                at,
+                message_id: None,
+                agent_id: None,
+            });
+        }
+    }
+
+    items.sort_by_key(|item| std::cmp::Reverse(item.at));
+    items.truncate(limit);
+    Ok(items)
+}
+
+/// An agent seen recently, with what it is working on.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AgentPresence {
+    pub agent_id: String,
+    pub project_ident: String,
+    pub hostname: Option<String>,
+    pub last_seen: i64,
+    pub task_id: Option<String>,
+    pub task_title: Option<String>,
+    pub last_message: Option<String>,
+}
+
+/// Agents with any activity since `since_ms`, most recent first.
+pub fn list_agent_presence(
+    conn: &Connection,
+    since_ms: i64,
+    project_ident: Option<&str>,
+) -> Result<Vec<AgentPresence>> {
+    let project_filter = project_ident.map(normalize_project_ident);
+    let mut stmt = conn.prepare_cached(
+        "SELECT activity.agent_id, activity.project_ident, MAX(activity.last_seen) AS last_seen FROM (
+             SELECT agent_id, project_ident, confirmed_at AS last_seen FROM agent_confirmations
+             UNION ALL
+             SELECT agent_id, project_ident, sent_at FROM messages WHERE agent_id IS NOT NULL
+             UNION ALL
+             SELECT owner_agent_id, project_ident, updated_at FROM tasks WHERE owner_agent_id IS NOT NULL
+             UNION ALL
+             SELECT source_agent_id, project_ident, updated_at FROM gateway_memories
+             WHERE source_agent_id IS NOT NULL AND tombstoned_at IS NULL
+         ) activity
+         JOIN projects p ON p.ident = activity.project_ident AND p.archived_at IS NULL
+         WHERE activity.last_seen >= ?1
+           AND activity.agent_id != '_default'
+           AND (?2 IS NULL OR activity.project_ident = ?2)
+         GROUP BY activity.agent_id, activity.project_ident
+         ORDER BY last_seen DESC
+         LIMIT 100",
+    )?;
+    let base = stmt
+        .query_map(params![since_ms, project_filter.as_deref()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut task_stmt = conn.prepare_cached(
+        "SELECT id, title FROM tasks
+         WHERE project_ident = ?1 AND owner_agent_id = ?2 AND status = 'in_progress'
+         ORDER BY updated_at DESC LIMIT 1",
+    )?;
+    let mut msg_stmt = conn.prepare_cached(
+        "SELECT hostname, COALESCE(subject, substr(content, 1, 120)) FROM messages
+         WHERE project_ident = ?1 AND agent_id = ?2
+         ORDER BY id DESC LIMIT 1",
+    )?;
+    let mut out = Vec::with_capacity(base.len());
+    for (agent_id, project_ident, last_seen) in base {
+        let task: Option<(String, String)> = task_stmt
+            .query_row(params![project_ident.as_str(), agent_id.as_str()], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        let msg: Option<(Option<String>, String)> = msg_stmt
+            .query_row(params![project_ident.as_str(), agent_id.as_str()], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        out.push(AgentPresence {
+            agent_id,
+            project_ident,
+            hostname: msg.as_ref().and_then(|m| m.0.clone()),
+            last_seen,
+            task_id: task.as_ref().map(|t| t.0.clone()),
+            task_title: task.map(|t| t.1),
+            last_message: msg.map(|m| m.1),
+        });
+    }
+    Ok(out)
+}
+
+/// One row on the activity feed.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ActivityEvent {
+    pub at: i64,
+    /// `task` | `message` | `artifact` | `memory`
+    pub kind: &'static str,
+    pub project_ident: String,
+    pub summary: String,
+    pub state: String,
+    pub href: String,
+    pub actor: Option<String>,
+}
+
+/// Most recent events across all (or one) active project(s).
+pub fn list_recent_activity(
+    conn: &Connection,
+    project_ident: Option<&str>,
+    limit: usize,
+) -> Result<Vec<ActivityEvent>> {
+    let project_filter = project_ident.map(normalize_project_ident);
+    let mut stmt = conn.prepare_cached(
+        "SELECT ev.at, ev.kind, ev.project_ident, ev.summary, ev.state, ev.ref_id, ev.actor FROM (
+             SELECT t.updated_at AS at, 'task' AS kind, t.project_ident, t.title AS summary,
+                    t.status AS state, t.id AS ref_id, t.owner_agent_id AS actor
+             FROM tasks t
+             UNION ALL
+             SELECT m.sent_at, 'message', m.project_ident,
+                    COALESCE(m.subject, substr(m.content, 1, 120)), m.message_type,
+                    CAST(m.id AS TEXT), m.agent_id
+             FROM messages m WHERE m.source = 'agent'
+             UNION ALL
+             SELECT a.updated_at, 'artifact', a.project_ident, a.title,
+                    a.lifecycle_state || ' · ' || a.review_state, a.artifact_id, a.created_by_actor_id
+             FROM artifacts a
+             UNION ALL
+             SELECT g.updated_at, 'memory', g.project_ident, substr(g.content, 1, 120),
+                    g.memory_type, g.id, g.source_agent_id
+             FROM gateway_memories g WHERE g.tombstoned_at IS NULL
+         ) ev
+         JOIN projects p ON p.ident = ev.project_ident AND p.archived_at IS NULL
+         WHERE (?1 IS NULL OR ev.project_ident = ?1)
+         ORDER BY ev.at DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![project_filter.as_deref(), limit as i64], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, String>(5)?,
+            r.get::<_, Option<String>>(6)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (at, kind, ident, summary, state, ref_id, actor) = row?;
+        let (kind, href): (&'static str, String) = match kind.as_str() {
+            "task" => ("task", format!("/projects/{ident}/tasks/{ref_id}")),
+            "message" => (
+                "message",
+                format!("/projects/{ident}/inbox?thread={ref_id}"),
+            ),
+            "artifact" => ("artifact", format!("/projects/{ident}/artifacts/{ref_id}")),
+            _ => ("memory", format!("/projects/{ident}/memories")),
+        };
+        out.push(ActivityEvent {
+            at,
+            kind,
+            project_ident: ident,
+            summary: summary.chars().take(140).collect(),
+            state,
+            href,
+            actor,
+        });
+    }
+    Ok(out)
+}
+
+/// Mark one message resolved. Returns true if it was open.
+pub fn resolve_message(
+    conn: &Connection,
+    project_ident: &str,
+    msg_id: i64,
+    resolved_by: &str,
+) -> Result<bool> {
+    let project_ident = normalize_project_ident(project_ident);
+    let n = conn.execute(
+        "UPDATE messages SET resolved_at = ?1, resolved_by = ?2
+         WHERE id = ?3 AND project_ident = ?4 AND resolved_at IS NULL",
+        params![now_ms(), resolved_by, msg_id, project_ident.as_str()],
+    )?;
+    Ok(n > 0)
+}
+
+/// Reopen a resolved message. Returns true if it was resolved.
+pub fn reopen_message(conn: &Connection, project_ident: &str, msg_id: i64) -> Result<bool> {
+    let project_ident = normalize_project_ident(project_ident);
+    let n = conn.execute(
+        "UPDATE messages SET resolved_at = NULL, resolved_by = NULL
+         WHERE id = ?1 AND project_ident = ?2 AND resolved_at IS NOT NULL",
+        params![msg_id, project_ident.as_str()],
+    )?;
+    Ok(n > 0)
+}
+
+/// Resolve every open root message in a project sent before `before_ms`
+/// (optionally only those of one `author_kind`). Returns the count.
+pub fn resolve_messages_before(
+    conn: &Connection,
+    project_ident: &str,
+    before_ms: i64,
+    author_kind: Option<&str>,
+    resolved_by: &str,
+) -> Result<usize> {
+    let project_ident = normalize_project_ident(project_ident);
+    let n = conn.execute(
+        "UPDATE messages SET resolved_at = ?1, resolved_by = ?2
+         WHERE project_ident = ?3
+           AND resolved_at IS NULL
+           AND parent_message_id IS NULL
+           AND sent_at < ?4
+           AND (?5 IS NULL OR COALESCE(author_kind, CASE source WHEN 'user' THEN 'human' ELSE source END) = ?5)",
+        params![
+            now_ms(),
+            resolved_by,
+            project_ident.as_str(),
+            before_ms,
+            author_kind
+        ],
+    )?;
+    Ok(n)
+}
+
+/// Free-form external link attached to a project (CI, runbook, staging …).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProjectLink {
+    pub id: i64,
+    pub project_ident: String,
+    pub label: String,
+    pub url: String,
+    pub rank: i64,
+}
+
+pub fn list_project_links(conn: &Connection, project_ident: &str) -> Result<Vec<ProjectLink>> {
+    let project_ident = normalize_project_ident(project_ident);
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, project_ident, label, url, rank FROM project_links
+         WHERE project_ident = ?1 ORDER BY rank ASC, id ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![project_ident.as_str()], |r| {
+            Ok(ProjectLink {
+                id: r.get(0)?,
+                project_ident: r.get(1)?,
+                label: r.get(2)?,
+                url: r.get(3)?,
+                rank: r.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn add_project_link(
+    conn: &Connection,
+    project_ident: &str,
+    label: &str,
+    url: &str,
+) -> Result<ProjectLink> {
+    let project_ident = normalize_project_ident(project_ident);
+    let label = label.trim();
+    let url = url.trim();
+    if label.is_empty() || url.is_empty() {
+        bail!("label and url are required");
+    }
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        bail!("url must start with http:// or https://");
+    }
+    let rank: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(rank), 0) + 1 FROM project_links WHERE project_ident = ?1",
+        params![project_ident.as_str()],
+        |r| r.get(0),
+    )?;
+    let id = crud(conn).insert(
+        "project_links",
+        &[
+            crud_col("project_ident", project_ident.as_str()),
+            crud_col("label", label),
+            crud_col("url", url),
+            crud_col("rank", rank),
+            crud_col("created_at", now_ms()),
+        ],
+    )?;
+    Ok(ProjectLink {
+        id: id as i64,
+        project_ident,
+        label: label.to_string(),
+        url: url.to_string(),
+        rank,
+    })
+}
+
+pub fn delete_project_link(conn: &Connection, project_ident: &str, id: i64) -> Result<bool> {
+    let project_ident = normalize_project_ident(project_ident);
+    let n = crud(conn).delete(
+        "project_links",
+        &[
+            crud_eq("id", id),
+            crud_eq("project_ident", project_ident.as_str()),
+        ],
+    )?;
+    Ok(n > 0)
+}
+
+/// Most recent activity timestamp per project (messages, tasks, artifacts,
+/// memories). Projects with no activity are absent from the map.
+pub fn project_last_activity(conn: &Connection) -> Result<HashMap<String, i64>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT project_ident, MAX(at) FROM (
+             SELECT project_ident, sent_at AS at FROM messages
+             UNION ALL SELECT project_ident, updated_at FROM tasks
+             UNION ALL SELECT project_ident, updated_at FROM artifacts
+             UNION ALL SELECT project_ident, updated_at FROM gateway_memories
+         ) GROUP BY project_ident",
+    )?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Everything the project Overview tab shows.
+#[derive(serde::Serialize)]
+pub struct ProjectOverview {
+    pub project: Project,
+    pub stats: ProjectStats,
+    pub in_progress: Vec<TaskSummary>,
+    pub agent_updates_open: i64,
+    pub questions_open: i64,
+    pub recent_artifacts: Vec<ArtifactSummary>,
+    pub links: Vec<ProjectLink>,
+    pub agents: Vec<AgentPresence>,
+    pub activity: Vec<ActivityEvent>,
+}
+
+pub fn project_overview(
+    conn: &Connection,
+    project_ident: &str,
+    now: i64,
+) -> Result<Option<ProjectOverview>> {
+    let project_ident = normalize_project_ident(project_ident);
+    let Some(project) = get_project(conn, &project_ident)? else {
+        return Ok(None);
+    };
+    let stats = list_project_stats_filtered(conn, true)?
+        .into_iter()
+        .find(|s| s.ident == project.ident)
+        .ok_or_else(|| anyhow::anyhow!("project stats missing for '{project_ident}'"))?;
+    let in_progress = list_tasks(conn, &project_ident, &["in_progress".to_string()], false)?;
+    let agent_updates_open: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM messages
+         WHERE project_ident = ?1 AND source = 'agent' AND message_type = 'message'
+           AND resolved_at IS NULL AND parent_message_id IS NULL",
+        params![project_ident.as_str()],
+        |r| r.get(0),
+    )?;
+    let questions_open = stats.unread_count;
+    let recent_artifacts = {
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {ARTIFACT_SUMMARY_SELECT_COLS} FROM artifacts a
+             WHERE a.project_ident = ?1 ORDER BY a.updated_at DESC LIMIT 5"
+        ))?;
+        let rows = stmt
+            .query_map(params![project_ident.as_str()], row_to_artifact_summary)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    let links = list_project_links(conn, &project_ident)?;
+    let agents = list_agent_presence(conn, now - 60 * 60 * 1000, Some(&project_ident))?;
+    let activity = list_recent_activity(conn, Some(&project_ident), 20)?;
+    Ok(Some(ProjectOverview {
+        project,
+        stats,
+        in_progress,
+        agent_updates_open,
+        questions_open,
+        recent_artifacts,
+        links,
+        agents,
+        activity,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11109,6 +11709,103 @@ mod tests {
             deliver_to_agents: source == "user",
             author_kind: None,
         }
+    }
+
+    #[test]
+    fn control_panel_queries_surface_updates_questions_stalls_and_presence() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("proj")).unwrap();
+        insert_project(&conn, &test_project("hidden")).unwrap();
+        set_project_archived(&conn, "hidden", true).unwrap();
+        upsert_agent(&conn, "proj", "agent-a").unwrap();
+        let now = now_ms();
+
+        // Human question nobody acknowledged → waiting on agents.
+        let question =
+            insert_message(&conn, &test_message("proj", "user", "Can we ship?", None)).unwrap();
+        // Agent update with no human reply after it → needs you.
+        let update = insert_message(
+            &conn,
+            &Message {
+                subject: Some("Deployed v2".into()),
+                ..test_message("proj", "agent", "Deployed v2 to staging", Some("agent-a"))
+            },
+        )
+        .unwrap();
+        // Same shapes in an archived project must not surface.
+        insert_message(
+            &conn,
+            &test_message("hidden", "agent", "ignored", Some("agent-z")),
+        )
+        .unwrap();
+
+        // Stalled task: in progress, untouched for two days.
+        let task = insert_task(&conn, "proj", "Old work", None, None, &[], None, "user").unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'in_progress', owner_agent_id = 'agent-a', updated_at = ?1 WHERE id = ?2",
+            params![now - 2 * STALLED_TASK_MS, task.id],
+        )
+        .unwrap();
+
+        let items = list_needs_you(&conn, now, 50).unwrap();
+        let kinds: Vec<&str> = items.iter().map(|i| i.kind).collect();
+        assert!(kinds.contains(&"agent_update"), "{kinds:?}");
+        assert!(kinds.contains(&"open_question"), "{kinds:?}");
+        assert!(kinds.contains(&"stalled_task"), "{kinds:?}");
+        assert!(items.iter().all(|i| i.project_ident == "proj"));
+        assert!(items.iter().any(|i| i.message_id == Some(update)));
+        assert!(items.iter().any(|i| i.message_id == Some(question)));
+
+        // Resolving the update removes it; a human reply would too.
+        assert!(resolve_message(&conn, "proj", update, "user").unwrap());
+        assert!(!resolve_message(&conn, "proj", update, "user").unwrap());
+        let items = list_needs_you(&conn, now, 50).unwrap();
+        assert!(!items.iter().any(|i| i.message_id == Some(update)));
+        assert!(reopen_message(&conn, "proj", update).unwrap());
+
+        // Bulk resolve everything before "now + 1" clears both root messages.
+        assert_eq!(
+            resolve_messages_before(&conn, "proj", now_ms() + 1_000, None, "user").unwrap(),
+            2
+        );
+        assert!(list_needs_you(&conn, now, 50)
+            .unwrap()
+            .iter()
+            .all(|i| i.message_id.is_none()));
+
+        // Presence: agent-a is visible with its in-progress task, only in proj.
+        let presence = list_agent_presence(&conn, 0, None).unwrap();
+        let a = presence
+            .iter()
+            .find(|p| p.agent_id == "agent-a")
+            .expect("agent-a present");
+        assert_eq!(a.project_ident, "proj");
+        assert_eq!(a.task_title.as_deref(), Some("Old work"));
+        assert!(presence.iter().all(|p| p.project_ident != "hidden"));
+
+        // Activity feed and per-project overview render without SQL errors.
+        let activity = list_recent_activity(&conn, None, 10).unwrap();
+        assert!(activity.iter().any(|e| e.kind == "task"));
+        assert!(activity.iter().any(|e| e.kind == "message"));
+        assert!(activity.iter().all(|e| e.project_ident == "proj"));
+        let overview = project_overview(&conn, "proj", now).unwrap().unwrap();
+        assert_eq!(overview.in_progress.len(), 1);
+        assert!(project_overview(&conn, "missing", now).unwrap().is_none());
+        assert!(project_last_activity(&conn).unwrap().contains_key("proj"));
+    }
+
+    #[test]
+    fn project_links_validate_and_round_trip() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("proj")).unwrap();
+        assert!(add_project_link(&conn, "proj", "CI", "ftp://nope").is_err());
+        assert!(add_project_link(&conn, "proj", "", "https://x").is_err());
+        let link = add_project_link(&conn, "proj", "CI", "https://ci.example.com").unwrap();
+        let links = list_project_links(&conn, "proj").unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].id, link.id);
+        assert!(delete_project_link(&conn, "proj", link.id).unwrap());
+        assert!(!delete_project_link(&conn, "proj", link.id).unwrap());
     }
 
     #[test]

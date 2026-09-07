@@ -1,0 +1,50 @@
+<body class="app-page">
+<div class="app-layout nd-h-screen nd-overflow-hidden">
+  <nav class="sidebar" id="app-sidebar">
+    <a class="nd-nav-brand" href="/">agent-gateway</a>
+    <p class="nd-nav-section">Work</p>
+    <ul class="nd-nav-menu">
+      <li><a href="/"{% if nav == "home" %} class="nd-active"{% endif %}>Home</a></li>
+      <li><a href="/activity"{% if nav == "activity" %} class="nd-active"{% endif %}>Activity</a></li>
+      <li><a href="/projects"{% if nav == "projects" %} class="nd-active"{% endif %}>Projects</a></li>
+      <li><a href="/tasks"{% if nav == "tasks" %} class="nd-active"{% endif %}>Tasks</a></li>
+    </ul>
+    <p class="nd-nav-section">Library</p>
+    <ul class="nd-nav-menu">
+      <li><a href="/patterns"{% if nav == "patterns" %} class="nd-active"{% endif %}>Patterns</a></li>
+      <li><a href="/skills"{% if nav == "skills" %} class="nd-active"{% endif %}>Skills</a></li>
+      <li><a href="/commands"{% if nav == "commands" %} class="nd-active"{% endif %}>Commands</a></li>
+      <li><a href="/agents"{% if nav == "agents" %} class="nd-active"{% endif %}>Agents</a></li>
+    </ul>
+    <p class="nd-nav-section">Gateway</p>
+    <ul class="nd-nav-menu">
+      <li><a href="/settings"{% if nav == "settings" %} class="nd-active"{% endif %}>Settings</a></li>
+    </ul>
+  </nav>
+  <div class="app-body">
+    <header>
+      <div class="app-header-left">
+        <button class="hamburger" data-nd-toggle="sidebar">&#9776;</button>
+        <div>
+          {% if let Some(project) = project %}
+          <nav class="gw-breadcrumb nd-text-xs nd-text-muted" aria-label="Breadcrumb">
+            <a href="/projects">Projects</a> <span aria-hidden="true">/</span>
+            <a href="/projects/{{ project.ident }}">{{ project.ident }}</a>
+          </nav>
+          {% endif %}
+          <h1 class="app-header-title">{{ page_title }}</h1>
+        </div>
+      </div>
+      <div class="app-header-right">
+        <button class="nd-btn-secondary" data-nd-theme-toggle title="Toggle theme">Theme</button>
+        <a class="nd-btn-ghost nd-btn-sm" href="/logout" title="Sign out">Sign out</a>
+      </div>
+    </header>
+    {% if let Some(project) = project %}
+    <nav class="gw-tabs" aria-label="Project sections">
+      {% for tab in project.tabs() %}
+      <a href="{{ tab.href }}"{% if tab.key == project.active_tab %} class="gw-tab-active" aria-current="page"{% endif %}>{{ tab.label }}</a>
+      {% endfor %}
+    </nav>
+    {% endif %}
+    <main class="app-content">

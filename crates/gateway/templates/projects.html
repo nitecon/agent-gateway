@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="gw-filters">
+  <span class="nd-text-xs nd-text-muted">Show:</span>
+  <a href="/projects?state=active"{% if state_filter == "active" %} class="gw-filter-active"{% endif %}>Active ({{ active_count }})</a>
+  <a href="/projects?state=archived"{% if state_filter == "archived" %} class="gw-filter-active"{% endif %}>Archived ({{ archived_count }})</a>
+  <a href="/projects?state=all"{% if state_filter == "all" %} class="gw-filter-active"{% endif %}>All</a>
+  <span class="nd-text-xs nd-text-muted" style="margin-left:1rem">Kind:</span>
+  <a href="/projects?state={{ state_filter }}&kind=all"{% if kind_filter == "all" %} class="gw-filter-active"{% endif %}>Any</a>
+  <a href="/projects?state={{ state_filter }}&kind=repo"{% if kind_filter == "repo" %} class="gw-filter-active"{% endif %}>Repository</a>
+  <a href="/projects?state={{ state_filter }}&kind=adhoc"{% if kind_filter == "adhoc" %} class="gw-filter-active"{% endif %}>Adhoc</a>
+</div>
+
+<section class="nd-card">
+  <div class="nd-card-body nd-p-0">
+    <table class="nd-table nd-table-hover">
+      <thead><tr><th>Project</th><th>Channel</th><th>Inbox</th><th>Tasks</th><th>Last activity</th><th></th></tr></thead>
+      <tbody>
+        {% for p in rows %}
+        <tr{% if p.archived %} class="nd-text-muted"{% endif %}>
+          <td>
+            <a href="/projects/{{ p.ident }}"><strong>{{ p.ident }}</strong></a>
+            {% if p.kind == "adhoc" %}<span class="gw-chip gw-chip-warn" title="Registered from a directory name, no repository">adhoc</span>{% endif %}
+            {% if p.archived %}<span class="gw-chip">archived</span>{% endif %}
+            <div class="nd-text-xs nd-text-muted">{% if let Some(repo) = p.repo_full_name %}{{ repo }}{% else %}no repository{% endif %}</div>
+          </td>
+          <td class="nd-text-xs">{% if p.has_room %}{{ p.channel_name }}{% else %}<span class="nd-text-muted">no room yet</span>{% endif %}</td>
+          <td>
+            {% if p.unanswered > 0 %}<a class="nd-btn-secondary nd-btn-sm" href="/projects/{{ p.ident }}/inbox?state=open">{{ p.unanswered }} open</a>
+            {% else %}<a class="nd-btn-ghost nd-btn-sm" href="/projects/{{ p.ident }}/inbox">Inbox</a>{% endif %}
+          </td>
+          <td>
+            {% if p.active_tasks > 0 %}<a class="nd-btn-secondary nd-btn-sm" href="/projects/{{ p.ident }}/tasks">{{ p.in_progress }} / {{ p.todo }}</a>
+            <div class="nd-text-xs nd-text-muted">in progress / todo</div>
+            {% else %}<a class="nd-btn-ghost nd-btn-sm" href="/projects/{{ p.ident }}/tasks">No open tasks</a>{% endif %}
+          </td>
+          <td class="nd-text-xs nd-text-muted" title="{{ p.last_activity_when }}">{{ p.last_activity_age }}</td>
+          <td>
+            <div class="gw-item-actions">
+              <a class="nd-btn-ghost nd-btn-sm" href="/projects/{{ p.ident }}/settings">Settings</a>
+              {% if p.archived %}
+              <button type="button" class="nd-btn-secondary nd-btn-sm" data-nd-action="POST /v1/projects/{{ p.ident }}/restore" data-nd-success="reload">Restore</button>
+              {% else %}
+              <button type="button" class="nd-btn-ghost nd-btn-sm" data-nd-action="POST /v1/projects/{{ p.ident }}/archive" data-nd-success="reload">Archive</button>
+              {% endif %}
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+        {% if rows.is_empty() %}
+        <tr><td colspan="6" class="gw-empty">No projects match. Projects register themselves the first time <code>agent-tools</code> runs inside a repository.</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

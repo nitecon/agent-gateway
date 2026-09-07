@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block content %}
+{% if let Some(update) = update_available %}
+<div class="nd-alert nd-alert-warning nd-mb-lg">
+  <strong>Update available:</strong> {{ update }} (current: v{{ version }}) — run <code>gateway update</code>
+</div>
+{% endif %}
+
+<section class="nd-card nd-mb-lg">
+  <div class="nd-card-header nd-flex nd-justify-between nd-items-center">
+    <strong>Needs you</strong>
+    <span class="nd-text-xs nd-text-muted">{{ needs_you.len() }} item{% if needs_you.len() != 1 %}s{% endif %}</span>
+  </div>
+  <div class="nd-card-body">
+    {% if needs_you.is_empty() %}
+    <div class="gw-empty">Nothing is waiting on you. Agents post here when they report in, ask a question, stall on a task, or need a review decision.</div>
+    {% else %}
+    <ul class="gw-list">
+      {% for item in needs_you %}
+      <li>
+        <div>
+          <div class="gw-item-title">
+            <span class="gw-chip {{ item.chip_class }}">{{ item.kind_label }}</span>
+            <a href="/projects/{{ item.project_ident }}" class="gw-chip">{{ item.project_ident }}</a>
+            <a href="{{ item.href }}">{{ item.title }}</a>
+          </div>
+          <div class="gw-item-meta">{{ item.detail }}{% if !item.detail.is_empty() %} · {% endif %}{{ item.age }}</div>
+        </div>
+        <div class="gw-item-actions">
+          <a class="nd-btn-secondary nd-btn-sm" href="{{ item.href }}">Open</a>
+          {% if let Some(message_id) = item.message_id %}
+          <button type="button" class="nd-btn-ghost nd-btn-sm"
+                  data-nd-action="POST /v1/projects/{{ item.project_ident }}/messages/{{ message_id }}/resolve"
+                  data-nd-success="reload">Resolve</button>
+          {% endif %}
+        </div>
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </div>
+</section>
+
+<section class="nd-mb-lg">
+  <div class="nd-flex nd-justify-between nd-items-center nd-mb-sm">
+    <strong>Agents at work</strong>
+    <a class="nd-text-xs" href="/activity">All activity →</a>
+  </div>
+  {% if agents.is_empty() %}
+  <div class="nd-card"><div class="nd-card-body gw-empty">No agent has checked in during the last hour.</div></div>
+  {% else %}
+  <div class="gw-presence">
+    {% for agent in agents %}
+    <div class="nd-card">
+      <div class="nd-card-body">
+        <div class="gw-item-title">{{ agent.agent_id }}</div>
+        <div class="gw-item-meta">
+          <a href="/projects/{{ agent.project_ident }}">{{ agent.project_ident }}</a>
+          {% if let Some(host) = agent.hostname %} · {{ host }}{% endif %}
+          · {{ agent.age }}
+        </div>
+        {% if let Some(task_title) = agent.task_title %}
+        <div class="gw-item-meta">▶ <a href="{{ agent.task_href }}">{{ task_title }}</a></div>
+        {% else if let Some(last) = agent.last_message %}
+        <div class="gw-item-meta">💬 {{ last }}</div>
+        {% endif %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+</section>
+
+<details class="nd-card">
+  <summary class="nd-card-header" style="cursor:pointer"><strong>Recent activity</strong> <span class="nd-text-xs nd-text-muted">last {{ activity.len() }} events</span></summary>
+  <div class="nd-card-body nd-p-0">
+    <table class="nd-table nd-table-hover">
+      <thead><tr><th>When</th><th>Project</th><th>What</th><th>State</th><th>Who</th></tr></thead>
+      <tbody>
+        {% for ev in activity %}
+        <tr>
+          <td class="nd-text-muted nd-text-xs" title="{{ ev.when }}">{{ ev.age }}</td>
+          <td><a href="/projects/{{ ev.project_ident }}">{{ ev.project_ident }}</a></td>
+          <td><span class="gw-chip">{{ ev.kind }}</span> <a href="{{ ev.href }}">{{ ev.summary }}</a></td>
+          <td class="nd-text-xs">{{ ev.state }}</td>
+          <td class="nd-text-xs nd-text-muted">{% if let Some(actor) = ev.actor %}{{ actor }}{% endif %}</td>
+        </tr>
+        {% endfor %}
+        {% if activity.is_empty() %}
+        <tr><td colspan="5" class="gw-empty">No activity recorded yet.</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</details>
+{% endblock %}

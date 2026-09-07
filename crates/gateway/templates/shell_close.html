@@ -1,0 +1,18 @@
+    </main>
+  </div>
+</div>
+<script src="{{ ndesign_base }}/ndesign.min.js"></script>
+<script>
+NDesign.configure({ headers: { 'X-Gateway-UI': '1' } });
+document.addEventListener('nd:theme-change', (e) => {
+  const theme = e.detail && e.detail.theme;
+  if (!theme) return;
+  fetch('/theme', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Gateway-UI': '1' },
+    body: JSON.stringify({ theme })
+  }).catch(() => {});
+});
+</script>
+</body>
+</html>

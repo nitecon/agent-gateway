@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="gw-grid nd-mb-lg">
+  <section class="nd-card">
+    <div class="nd-card-header"><strong>Inbox</strong></div>
+    <div class="nd-card-body">
+      <ul class="gw-list">
+        <li><div><div class="gw-item-title">{{ questions_open }} question{% if questions_open != 1 %}s{% endif %} waiting on agents</div></div>
+            <div class="gw-item-actions"><a class="nd-btn-secondary nd-btn-sm" href="/projects/{{ ident }}/inbox?state=open">Open</a></div></li>
+        <li><div><div class="gw-item-title">{{ agent_updates_open }} agent update{% if agent_updates_open != 1 %}s{% endif %} not yet resolved</div></div>
+            <div class="gw-item-actions"><a class="nd-btn-secondary nd-btn-sm" href="/projects/{{ ident }}/inbox">Review</a></div></li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="nd-card">
+    <div class="nd-card-header nd-flex nd-justify-between nd-items-center"><strong>In progress</strong>
+      <a class="nd-text-xs" href="/projects/{{ ident }}/tasks">{{ todo }} todo · {{ done }} done →</a></div>
+    <div class="nd-card-body">
+      {% if in_progress.is_empty() %}
+      <div class="gw-empty">No task is in progress.</div>
+      {% else %}
+      <ul class="gw-list">
+        {% for t in in_progress %}
+        <li>
+          <div>
+            <div class="gw-item-title"><a href="/projects/{{ ident }}/tasks/{{ t.id }}">{{ t.title }}</a></div>
+            <div class="gw-item-meta">{% if let Some(owner) = t.owner %}{{ owner }} · {% endif %}updated {{ t.age }}{% if t.comments > 0 %} · {{ t.comments }} comments{% endif %}</div>
+          </div>
+        </li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="nd-card">
+    <div class="nd-card-header nd-flex nd-justify-between nd-items-center"><strong>Recent artifacts</strong>
+      <a class="nd-text-xs" href="/projects/{{ ident }}/artifacts">All →</a></div>
+    <div class="nd-card-body">
+      {% if artifacts.is_empty() %}
+      <div class="gw-empty">No specs, reviews, or documentation artifacts yet.</div>
+      {% else %}
+      <ul class="gw-list">
+        {% for a in artifacts %}
+        <li>
+          <div>
+            <div class="gw-item-title"><span class="gw-chip">{{ a.kind }}</span><a href="/projects/{{ ident }}/artifacts/{{ a.id }}">{{ a.title }}</a></div>
+            <div class="gw-item-meta">{{ a.state }} · {{ a.age }}</div>
+          </div>
+        </li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="nd-card">
+    <div class="nd-card-header nd-flex nd-justify-between nd-items-center"><strong>Project</strong>
+      <a class="nd-text-xs" href="/projects/{{ ident }}/settings">Settings →</a></div>
+    <div class="nd-card-body">
+      <dl class="gw-kv">
+        <dt>Repository</dt><dd>{% if let Some(url) = repo_url %}<a href="{{ url }}" rel="noopener" target="_blank">{{ repo_full_name }}</a>{% else %}<span class="gw-muted">none</span>{% endif %}</dd>
+        <dt>Kind</dt><dd>{{ kind }}</dd>
+        <dt>Channel</dt><dd>{{ channel }}</dd>
+        <dt>Documentation</dt><dd><a href="/projects/{{ ident }}/documentation">{{ doc_count }} pages</a></dd>
+        <dt>Memories</dt><dd><a href="/projects/{{ ident }}/memories">{{ memory_count }}</a></dd>
+      </dl>
+      {% if !links.is_empty() %}
+      <div class="nd-mt-md nd-text-xs nd-text-muted">Links</div>
+      <ul class="gw-list">
+        {% for l in links %}<li><div><a href="{{ l.url }}" rel="noopener" target="_blank">{{ l.label }}</a> <span class="gw-item-meta">{{ l.url }}</span></div></li>{% endfor %}
+      </ul>
+      {% endif %}
+    </div>
+  </section>
+</div>
+
+<section class="nd-mb-lg">
+  <strong class="nd-mb-sm" style="display:block">Agents here in the last hour</strong>
+  {% if agents.is_empty() %}
+  <div class="nd-card"><div class="nd-card-body gw-empty">No agent activity in the last hour.</div></div>
+  {% else %}
+  <div class="gw-presence">
+    {% for agent in agents %}
+    <div class="nd-card"><div class="nd-card-body">
+      <div class="gw-item-title">{{ agent.agent_id }}</div>
+      <div class="gw-item-meta">{% if let Some(host) = agent.hostname %}{{ host }} · {% endif %}{{ agent.age }}</div>
+      {% if let Some(task_title) = agent.task_title %}<div class="gw-item-meta">▶ <a href="{{ agent.task_href }}">{{ task_title }}</a></div>
+      {% else if let Some(last) = agent.last_message %}<div class="gw-item-meta">💬 {{ last }}</div>{% endif %}
+    </div></div>
+    {% endfor %}
+  </div>
+  {% endif %}
+</section>
+
+<section class="nd-card">
+  <div class="nd-card-header"><strong>Recent activity</strong></div>
+  <div class="nd-card-body nd-p-0">
+    <table class="nd-table nd-table-hover">
+      <thead><tr><th>When</th><th>What</th><th>State</th><th>Who</th></tr></thead>
+      <tbody>
+        {% for ev in activity %}
+        <tr>
+          <td class="nd-text-muted nd-text-xs" title="{{ ev.when }}">{{ ev.age }}</td>
+          <td><span class="gw-chip">{{ ev.kind }}</span> <a href="{{ ev.href }}">{{ ev.summary }}</a></td>
+          <td class="nd-text-xs">{{ ev.state }}</td>
+          <td class="nd-text-xs nd-text-muted">{% if let Some(actor) = ev.actor %}{{ actor }}{% endif %}</td>
+        </tr>
+        {% endfor %}
+        {% if activity.is_empty() %}<tr><td colspan="4" class="gw-empty">Nothing yet.</td></tr>{% endif %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

@@ -15,6 +15,9 @@ use crate::{
     channel::OutboundMessage,
     db::{self, now_ms, Message, Project},
     projects::{normalize_project_ident, sanitize_ident},
+    ui::{
+        control_panel_close, control_panel_head, control_panel_open, control_panel_open_project, he,
+    },
     AppState,
 };
 
@@ -3895,6 +3898,180 @@ async fn set_project_archived(
     Ok(Json(project))
 }
 
+// ── Message resolution (human inbox) ─────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct ResolveResponse {
+    pub changed: bool,
+}
+
+#[derive(Serialize)]
+pub struct BulkResolveResponse {
+    pub resolved: usize,
+}
+
+#[derive(Deserialize, Default)]
+pub struct BulkResolveRequest {
+    /// Resolve root messages sent before this epoch-ms timestamp (default now).
+    pub before_ms: Option<i64>,
+    /// Restrict to one author kind: human | bot | webhook | agent | system.
+    pub author_kind: Option<String>,
+}
+
+fn resolver_identity(headers: &HeaderMap) -> String {
+    match headers.get("x-agent-id").and_then(|v| v.to_str().ok()) {
+        Some(agent) if !agent.is_empty() => format!("agent:{agent}"),
+        _ => "user".to_string(),
+    }
+}
+
+/// POST /v1/projects/:ident/messages/:id/resolve
+pub async fn resolve_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((ident, id)): Path<(String, i64)>,
+) -> Result<Json<ResolveResponse>> {
+    let by = resolver_identity(&headers);
+    let db = state.db.clone();
+    let changed = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::resolve_message(&conn, &ident, id, &by)
+    })
+    .await??;
+    Ok(Json(ResolveResponse { changed }))
+}
+
+/// POST /v1/projects/:ident/messages/:id/reopen
+pub async fn reopen_message(
+    State(state): State<AppState>,
+    Path((ident, id)): Path<(String, i64)>,
+) -> Result<Json<ResolveResponse>> {
+    let db = state.db.clone();
+    let changed = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::reopen_message(&conn, &ident, id)
+    })
+    .await??;
+    Ok(Json(ResolveResponse { changed }))
+}
+
+/// POST /v1/projects/:ident/messages/resolve — bulk resolve open root messages.
+pub async fn resolve_messages_bulk(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(ident): Path<String>,
+    body: Option<Json<BulkResolveRequest>>,
+) -> Result<Json<BulkResolveResponse>> {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let by = resolver_identity(&headers);
+    let before = req.before_ms.unwrap_or_else(now_ms);
+    let kind = req
+        .author_kind
+        .map(|k| k.trim().to_lowercase())
+        .filter(|k| !k.is_empty());
+    let db = state.db.clone();
+    let resolved = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::resolve_messages_before(&conn, &ident, before, kind.as_deref(), &by)
+    })
+    .await??;
+    Ok(Json(BulkResolveResponse { resolved }))
+}
+
+// ── Project links + rooms ────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct ProjectLinkRequest {
+    pub label: String,
+    pub url: String,
+}
+
+/// GET /v1/projects/:ident/links
+pub async fn list_project_links(
+    State(state): State<AppState>,
+    Path(ident): Path<String>,
+) -> Result<Json<Vec<db::ProjectLink>>> {
+    let db = state.db.clone();
+    let links = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::list_project_links(&conn, &ident)
+    })
+    .await??;
+    Ok(Json(links))
+}
+
+/// POST /v1/projects/:ident/links
+pub async fn add_project_link(
+    State(state): State<AppState>,
+    Path(ident): Path<String>,
+    Json(req): Json<ProjectLinkRequest>,
+) -> Result<Json<db::ProjectLink>> {
+    let db = state.db.clone();
+    let link = spawn_blocking(move || -> anyhow::Result<db::ProjectLink> {
+        let conn = db.lock().unwrap();
+        if db::get_project(&conn, &ident)?.is_none() {
+            anyhow::bail!("project '{ident}' not found");
+        }
+        db::add_project_link(&conn, &ident, &req.label, &req.url)
+    })
+    .await?
+    .map_err(|e| AppError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok(Json(link))
+}
+
+/// DELETE /v1/projects/:ident/links/:id
+pub async fn delete_project_link(
+    State(state): State<AppState>,
+    Path((ident, id)): Path<(String, i64)>,
+) -> Result<Json<ResolveResponse>> {
+    let db = state.db.clone();
+    let changed = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::delete_project_link(&conn, &ident, id)
+    })
+    .await??;
+    Ok(Json(ResolveResponse { changed }))
+}
+
+/// POST /v1/projects/:ident/room — create the channel room for an adhoc
+/// project ahead of its first message.
+pub async fn create_project_room(
+    State(state): State<AppState>,
+    Path(ident): Path<String>,
+) -> Result<Json<Project>> {
+    let (channel_name, room_id) = {
+        let conn = state.db.lock().unwrap();
+        match db::get_project(&conn, &ident)? {
+            Some(p) => (p.channel_name, p.room_id),
+            None => {
+                return Err(AppError(
+                    StatusCode::NOT_FOUND,
+                    format!("project '{ident}' not found"),
+                ))
+            }
+        }
+    };
+    let plugin = state
+        .plugins
+        .get(&channel_name)
+        .ok_or_else(|| {
+            AppError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("channel plugin '{channel_name}' is not configured"),
+            )
+        })?
+        .clone();
+    ensure_project_room(&state, &ident, plugin.as_ref(), room_id).await?;
+    let db = state.db.clone();
+    let project = spawn_blocking(move || -> anyhow::Result<Option<Project>> {
+        let conn = db.lock().unwrap();
+        db::get_project(&conn, &ident)
+    })
+    .await??
+    .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "project not found".into()))?;
+    Ok(Json(project))
+}
+
 // ── Agent memory gateway ─────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -4779,7 +4956,7 @@ pub async fn register_project(
 
 /// Resolve the plugin room for an outbound send, creating it on first use for
 /// adhoc projects that were registered without one.
-async fn ensure_project_room(
+pub(crate) async fn ensure_project_room(
     state: &AppState,
     ident: &str,
     plugin: &dyn crate::channel::ChannelPlugin,
@@ -5697,13 +5874,6 @@ pub async fn agent_detail_page(
 
 // ── GET / (dashboard) ─────────────────────────────────────────────────────────
 
-fn he(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
 fn truncate_text(s: &str, max_chars: usize) -> String {
     let mut out = s.chars().take(max_chars).collect::<String>();
     if s.chars().count() > max_chars {
@@ -6151,151 +6321,6 @@ fn path_segment(s: &str) -> String {
     out
 }
 
-pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
-    let db = state.db.clone();
-    let (data, theme) = spawn_blocking(move || -> anyhow::Result<_> {
-        let conn = db.lock().unwrap();
-        Ok((db::get_dashboard_data(&conn)?, db::get_theme(&conn)?))
-    })
-    .await??;
-
-    let current_version = env!("AGENT_GATEWAY_VERSION");
-    let update_banner = {
-        let guard = state.update_available.lock().unwrap();
-        match guard.as_deref() {
-            Some(version) => format!(
-                r#"<div class="nd-alert nd-alert-warning nd-mb-lg">
-  <strong>Update available:</strong> {} (current: v{}) — run <code>gateway update</code>
-</div>"#,
-                he(version),
-                he(current_version),
-            ),
-            None => String::new(),
-        }
-    };
-
-    let active_task_count: i64 = data
-        .projects
-        .iter()
-        .map(|p| p.todo_count + p.in_progress_count)
-        .sum();
-    let in_progress_task_count: i64 = data.projects.iter().map(|p| p.in_progress_count).sum();
-    let unanswered_message_count: i64 = data.projects.iter().map(|p| p.unread_count).sum();
-
-    let rows = if data.project_count == 0 {
-        r#"<tr><td colspan="5" class="nd-text-muted nd-text-center">No projects registered yet</td></tr>"#.to_string()
-    } else {
-        data.projects
-            .iter()
-            .map(|p| {
-                let active_tasks = p.todo_count + p.in_progress_count;
-                let work_cell = if active_tasks > 0 {
-                    format!(
-                        r#"<a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/tasks">{active} active</a>
-<div class="nd-text-xs nd-text-muted">{in_progress} in progress · {todo} open</div>"#,
-                        ident = he(&p.ident),
-                        active = active_tasks,
-                        in_progress = p.in_progress_count,
-                        todo = p.todo_count,
-                    )
-                } else {
-                    format!(
-                        r#"<a class="nd-btn-ghost nd-btn-sm" href="/projects/{}/tasks">No active tasks</a>"#,
-                        he(&p.ident)
-                    )
-                };
-                let messages_cell = if p.unread_count > 0 {
-                    format!(
-                        r#"<span class="nd-badge nd-badge-sm nd-text-danger">{} unanswered</span>"#,
-                        p.unread_count
-                    )
-                } else {
-                    r#"<span class="nd-text-muted">Clear</span>"#.into()
-                };
-                let docs_cell = if p.api_doc_count > 0 {
-                    format!(
-                        r#"<a class="nd-btn-secondary nd-btn-sm" href="/projects/{}/documentation">{} pages</a>"#,
-                        he(&p.ident),
-                        p.api_doc_count
-                    )
-                } else {
-                    format!(
-                        r#"<a class="nd-btn-ghost nd-btn-sm" href="/projects/{}/documentation">No docs</a>"#,
-                        he(&p.ident)
-                    )
-                };
-                let memories_cell = if p.memory_count > 0 {
-                    format!(
-                        r#"<a class="nd-btn-secondary nd-btn-sm" href="/projects/{}/memories">{} memories</a>"#,
-                        he(&p.ident),
-                        p.memory_count
-                    )
-                } else {
-                    format!(
-                        r#"<a class="nd-btn-ghost nd-btn-sm" href="/projects/{}/memories">No memories</a>"#,
-                        he(&p.ident)
-                    )
-                };
-                format!(
-                    "<tr><td><strong>{}</strong><div class=\"nd-text-xs nd-text-muted\">{}</div></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                    he(&p.ident),
-                    he(p.repo_full_name.as_deref().unwrap_or("no repository")),
-                    work_cell,
-                    messages_cell,
-                    docs_cell,
-                    memories_cell,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-
-    let content = format!(
-        r#"  {banner}
-  <p class="nd-text-muted nd-text-sm">Operations dashboard · v{version}</p>
-
-  <section class="nd-row nd-gap-md nd-mb-lg">
-    <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{projects}</div><div class="nd-text-xs nd-text-muted">Projects</div></div></div></div>
-    <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{active_tasks}</div><div class="nd-text-xs nd-text-muted">Active tasks</div></div></div></div>
-    <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{in_progress_tasks}</div><div class="nd-text-xs nd-text-muted">In progress</div></div></div></div>
-    <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{unanswered}</div><div class="nd-text-xs nd-text-muted">Unanswered</div></div></div></div>
-    <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{skills}</div><div class="nd-text-xs nd-text-muted">Skills</div></div></div></div>
-    <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{api_docs}</div><div class="nd-text-xs nd-text-muted">Docs</div></div></div></div>
-    <div class="nd-col-2"><div class="nd-card"><div class="nd-card-body"><div class="nd-text-2xl nd-font-bold">{memories}</div><div class="nd-text-xs nd-text-muted">Memories</div></div></div></div>
-  </section>
-
-  <section class="nd-card">
-    <div class="nd-card-header"><strong>Attention queue</strong></div>
-    <div class="nd-card-body nd-p-0">
-      <table class="nd-table nd-table-hover">
-        <thead><tr><th>Project</th><th>Work</th><th>Messages</th><th>Documentation</th><th>Memory</th></tr></thead>
-        <tbody>{rows}</tbody>
-      </table>
-    </div>
-  </section>"#,
-        banner = update_banner,
-        version = he(current_version),
-        projects = data.project_count,
-        active_tasks = active_task_count,
-        in_progress_tasks = in_progress_task_count,
-        unanswered = unanswered_message_count,
-        skills = data.skill_count,
-        api_docs = data.api_doc_count,
-        memories = data.memory_count,
-        rows = rows,
-    );
-
-    let html = format!(
-        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
-        head = control_panel_head("agent-gateway — Dashboard", &theme, ""),
-        open = control_panel_open("Dashboard", "dashboard"),
-        content = content,
-        close = control_panel_close(),
-    );
-
-    Ok(Html(html))
-}
-
 pub async fn api_docs_index_page(State(state): State<AppState>) -> Result<Html<String>> {
     let db = state.db.clone();
     let (projects, theme) = spawn_blocking(move || -> anyhow::Result<_> {
@@ -6613,7 +6638,7 @@ pub async fn memories_page(
     let html = format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
         head = control_panel_head("agent-gateway - Memories", &theme, ""),
-        open = control_panel_open(&page_title, "memories"),
+        open = control_panel_open_project(&page_title, &ident, "memories"),
         content = content,
         close = control_panel_close(),
     );
@@ -6737,7 +6762,7 @@ pub async fn api_docs_page(
             &theme,
             documentation_head_extra()
         ),
-        open = control_panel_open(&page_title, "documentation"),
+        open = control_panel_open_project(&page_title, &ident, "documentation"),
         content = content,
         close = control_panel_close(),
     );
@@ -6937,7 +6962,7 @@ pub async fn api_doc_detail_page(
             &theme,
             documentation_head_extra()
         ),
-        open = control_panel_open(&page_title, "documentation"),
+        open = control_panel_open_project(&page_title, &ident, "documentation"),
         content = content,
         close = control_panel_close(),
     );
@@ -6996,7 +7021,7 @@ pub async fn artifacts_index_page(State(state): State<AppState>) -> Result<Html<
     let html = format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
         head = control_panel_head("agent-gateway - Advanced records", &theme, ""),
-        open = control_panel_open("Advanced Records", "documentation"),
+        open = control_panel_open("Artifacts", "projects"),
         content = content,
         close = control_panel_close(),
     );
@@ -7169,7 +7194,7 @@ pub async fn artifact_workspace_page(
     let html = format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
         head = control_panel_head("agent-gateway - Advanced records", &theme, ""),
-        open = control_panel_open(&page_title, "documentation"),
+        open = control_panel_open_project(&page_title, &ident, "artifacts"),
         content = content,
         close = control_panel_close(),
     );
@@ -7520,125 +7545,7 @@ pub async fn artifact_detail_page(
     let html = format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
         head = control_panel_head("agent-gateway - Advanced record", &theme, ""),
-        open = control_panel_open(&page_title, "documentation"),
-        content = content,
-        close = control_panel_close(),
-    );
-    Ok(Html(html))
-}
-
-pub async fn settings_page(State(state): State<AppState>) -> Result<Html<String>> {
-    let db = state.db.clone();
-    let (theme, projects) = spawn_blocking(move || -> anyhow::Result<_> {
-        let conn = db.lock().unwrap();
-        Ok((
-            db::get_theme(&conn)?,
-            db::list_project_stats_filtered(&conn, true)?,
-        ))
-    })
-    .await??;
-
-    let project_rows = if projects.is_empty() {
-        r#"<tr><td colspan="4" class="nd-text-muted nd-text-center">No projects registered yet.</td></tr>"#.to_string()
-    } else {
-        projects
-            .iter()
-            .map(|p| {
-                let provider = p.repo_provider.as_deref().unwrap_or("github");
-                let namespace = p.repo_namespace.as_deref().unwrap_or("");
-                let repo_name = p.repo_name.as_deref().unwrap_or("");
-                let archived = p.archived_at.is_some();
-                let state_badge = if archived {
-                    r#"<span class="nd-badge nd-badge-sm">archived</span>"#
-                } else if p.kind == db::PROJECT_KIND_ADHOC {
-                    r#"<span class="nd-badge nd-badge-sm nd-text-muted">adhoc</span>"#
-                } else {
-                    r#"<span class="nd-badge nd-badge-sm">repo</span>"#
-                };
-                let remote = p
-                    .canonical_remote
-                    .as_deref()
-                    .map(|r| format!(r#"<div class="nd-text-xs nd-text-muted">{}</div>"#, he(r)))
-                    .unwrap_or_default();
-                let lifecycle = if archived {
-                    format!(
-                        r#"<button type="button" class="nd-btn-secondary nd-btn-sm" data-nd-action="POST /v1/projects/{ident}/restore" data-nd-success="reload">Restore</button>"#,
-                        ident = he(&p.ident)
-                    )
-                } else {
-                    format!(
-                        r#"<button type="button" class="nd-btn-ghost nd-btn-sm" data-nd-action="POST /v1/projects/{ident}/archive" data-nd-success="reload">Archive</button>"#,
-                        ident = he(&p.ident)
-                    )
-                };
-                format!(
-                    r#"<tr{row_class}>
-  <td><strong>{ident}</strong>{remote}</td>
-  <td>{state_badge}</td>
-  <td>
-    <form class="settings-inline-form" data-nd-action="PATCH /v1/projects/{ident}/repo" data-nd-success="reload">
-      <select name="provider" aria-label="Provider">
-        <option value="github"{github_selected}>github</option>
-        <option value="gitlab"{gitlab_selected}>gitlab</option>
-        <option value="bitbucket"{bitbucket_selected}>bitbucket</option>
-      </select>
-      <input name="namespace" value="{namespace}" placeholder="namespace" aria-label="Namespace">
-      <input name="repo_name" value="{repo_name}" placeholder="repository" aria-label="Repository">
-      <button type="submit" class="nd-btn-primary nd-btn-sm">Save</button>
-    </form>
-  </td>
-  <td>{lifecycle}</td>
-</tr>"#,
-                    row_class = if archived { r#" class="nd-text-muted""# } else { "" },
-                    ident = he(&p.ident),
-                    remote = remote,
-                    state_badge = state_badge,
-                    namespace = he(namespace),
-                    repo_name = he(repo_name),
-                    github_selected = if provider == "github" { " selected" } else { "" },
-                    gitlab_selected = if provider == "gitlab" { " selected" } else { "" },
-                    bitbucket_selected = if provider == "bitbucket" { " selected" } else { "" },
-                    lifecycle = lifecycle,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-
-    let content = format!(
-        r#"  <section class="nd-card">
-    <div class="nd-card-header"><strong>Projects</strong></div>
-    <div class="nd-card-body">
-      <p class="nd-text-sm nd-text-muted nd-mb-md">Repository mappings are filled automatically when a client registers a project from a git remote. Edit a row only to correct a mapping; leave both fields blank to clear it. Archived projects keep their data and URLs but leave the default lists.</p>
-      <table class="nd-table nd-table-hover">
-        <thead><tr><th>Project</th><th>Kind</th><th>Repository</th><th></th></tr></thead>
-        <tbody>{project_rows}</tbody>
-      </table>
-    </div>
-  </section>"#,
-        project_rows = project_rows,
-    );
-
-    let html = format!(
-        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
-        head = control_panel_head(
-            "agent-gateway - Settings",
-            &theme,
-            r#"<style>
-.settings-inline-form {
-  display: flex;
-  gap: 0.5rem;
-  align-items: center;
-  flex-wrap: wrap;
-}
-.settings-inline-form input,
-.settings-inline-form select {
-  min-width: 8rem;
-  max-width: 16rem;
-}
-</style>"#,
-        ),
-        open = control_panel_open("Settings", "settings"),
+        open = control_panel_open_project(&page_title, &ident, "artifacts"),
         content = content,
         close = control_panel_close(),
     );
@@ -9394,7 +9301,7 @@ pub async fn new_task_page(
     let html = format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
         head = control_panel_head("agent-gateway - New task", &theme, ""),
-        open = control_panel_open(&page_title, "tasks"),
+        open = control_panel_open_project(&page_title, &ident, "tasks"),
         content = content,
         close = control_panel_close(),
     );
@@ -9619,7 +9526,7 @@ fn render_task_link_page(detail: &db::TaskDetail, theme: &str) -> String {
 .task-link-comment + .task-link-comment { border-top: 1px solid var(--nd-border-color); padding-top: 1rem; }
 </style>"#,
         ),
-        open = control_panel_open(&page_title, "tasks"),
+        open = control_panel_open_project(&page_title, &detail.task.project_ident, "tasks"),
         content = content,
         close = control_panel_close(),
     )
@@ -9884,160 +9791,11 @@ pub async fn tasks_board(
 }
 </style>"#,
         ),
-        open = control_panel_open(&page_title, "tasks"),
+        open = control_panel_open_project(&page_title, &ident, "tasks"),
         content = content,
         close = control_panel_close(),
     );
     Ok(Html(html))
-}
-
-// ── ndesign partials (shared by control-panel pages) ─────────────────────────
-
-/// CDN base for the ndesign runtime and theme stylesheets. Shared by
-/// `control_panel_head` / `control_panel_close` and every page that uses
-/// them. Kept as a constant so the version is bumped in one place.
-const NDESIGN_BASE: &str = "https://storage.googleapis.com/ndesign-cdn/ndesign/v0.4.0";
-
-fn theme_toggle_button() -> &'static str {
-    r#"<button class="nd-btn-secondary" data-nd-theme-toggle title="Toggle theme">Theme</button>"#
-}
-
-// ── Control-panel layout helpers (shared by dashboard + future admin pages) ───
-
-/// Render the `<head>` contents for a control-panel page.
-///
-/// Emits charset + viewport meta, the page `<title>`, ndesign base CSS, the
-/// active theme stylesheet (class `theme` so the runtime switcher can swap it),
-/// the two theme-registration meta tags, plus the `endpoint:api` and
-/// `csrf-token` meta tags the ndesign runtime expects. `extra` is appended
-/// verbatim — pages that declare ndesign store vars (`<meta name="var:…">`)
-/// pass them in here so the runtime finds them during init.
-///
-/// `theme` must be `"light"` or `"dark"`; any other value falls back to
-/// `"dark"`.
-fn control_panel_head(title: &str, theme: &str, extra: &str) -> String {
-    let theme = if theme == "light" { "light" } else { "dark" };
-    format!(
-        r#"<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title}</title>
-<link rel="stylesheet" href="{base}/ndesign.min.css">
-<link rel="stylesheet" class="theme" data-theme="{theme}" href="{base}/themes/{theme}.min.css">
-<meta name="nd-theme" content="light" data-href="{base}/themes/light.min.css">
-<meta name="nd-theme" content="dark" data-href="{base}/themes/dark.min.css">
-<meta name="endpoint:api" content="">
-<meta name="csrf-token" content="">
-{extra}"#,
-        title = he(title),
-        base = NDESIGN_BASE,
-        theme = theme,
-        extra = extra,
-    )
-}
-
-/// Open the control-panel body up to the start of `<main class="app-content">`.
-///
-/// Emits `<body class="app-page">`, the app layout wrapper, the sidebar (brand
-/// plus the Main section with Dashboard, Documentation, Tasks, Patterns,
-/// Skills, Commands, Agents, and Settings links), and the header (hamburger
-/// toggle, page title, theme toggle).
-///
-/// * `page_title` — rendered inside the header's `<h1>`.
-/// * `active` — which sidebar link receives `class="nd-active"`. Accepts
-///   `"dashboard"`, `"documentation"`, `"tasks"`, `"patterns"`, `"skills"`,
-///   `"commands"`, `"agents"`, or `"settings"`. The legacy `"api-docs"`
-///   value maps to Documentation for compatibility.
-fn control_panel_open(page_title: &str, active: &str) -> String {
-    let cls = |key: &str| -> &'static str {
-        if key == active {
-            r#" class="nd-active""#
-        } else {
-            ""
-        }
-    };
-    let documentation_cls = if matches!(active, "documentation" | "api-docs") {
-        r#" class="nd-active""#
-    } else {
-        ""
-    };
-    format!(
-        r#"<body class="app-page">
-<div class="app-layout nd-h-screen nd-overflow-hidden">
-  <nav class="sidebar" id="app-sidebar">
-    <span class="nd-nav-brand">agent-gateway</span>
-    <p class="nd-nav-section">Main</p>
-    <ul class="nd-nav-menu">
-      <li><a href="/"{dashboard}>Dashboard</a></li>
-      <li><a href="/documentation"{documentation}>Documentation</a></li>
-      <li><a href="/memories"{memories}>Memories</a></li>
-      <li><a href="/tasks"{tasks}>Tasks</a></li>
-      <li><a href="/patterns"{patterns}>Patterns</a></li>
-      <li><a href="/skills"{skills}>Skills</a></li>
-      <li><a href="/commands"{commands}>Commands</a></li>
-      <li><a href="/agents"{agents}>Agents</a></li>
-      <li><a href="/settings"{settings}>Settings</a></li>
-    </ul>
-  </nav>
-  <div class="app-body">
-    <header>
-      <div class="app-header-left">
-        <button class="hamburger" data-nd-toggle="sidebar">&#9776;</button>
-        <h1 class="app-header-title">{title}</h1>
-      </div>
-      <div class="app-header-right">
-        {theme_toggle}
-        <a class="nd-btn-ghost nd-btn-sm" href="/logout" title="Sign out">Sign out</a>
-      </div>
-    </header>
-    <main class="app-content">"#,
-        dashboard = cls("dashboard"),
-        documentation = documentation_cls,
-        memories = cls("memories"),
-        tasks = cls("tasks"),
-        patterns = cls("patterns"),
-        skills = cls("skills"),
-        commands = cls("commands"),
-        agents = cls("agents"),
-        settings = cls("settings"),
-        title = he(page_title),
-        theme_toggle = theme_toggle_button(),
-    )
-}
-
-/// Close the control-panel body: close `<main>`, `<div class="app-body">`,
-/// and `<div class="app-layout">`, then emit the ndesign runtime script and
-/// an inline config block that (a) tags same-origin XHR with the
-/// `X-Gateway-UI` header so the bearer middleware accepts the session cookie
-/// and (b) persists `nd:theme-change` events back to the server.
-///
-/// The API key is deliberately *not* embedded: pages authenticate with the
-/// HttpOnly session cookie issued by `/login` (see `crate::ui_auth`).
-///
-/// Output is deliberately limited to two `<script>` tags (the ndesign
-/// runtime + this inline config block) to keep the per-page script budget
-/// predictable.
-fn control_panel_close() -> String {
-    format!(
-        r#"    </main>
-  </div>
-</div>
-<script src="{base}/ndesign.min.js"></script>
-<script>
-NDesign.configure({{ headers: {{ 'X-Gateway-UI': '1' }} }});
-document.addEventListener('nd:theme-change', (e) => {{
-  const theme = e.detail && e.detail.theme;
-  if (!theme) return;
-  fetch('/theme', {{
-    method: 'POST',
-    headers: {{ 'Content-Type': 'application/json', 'X-Gateway-UI': '1' }},
-    body: JSON.stringify({{ theme }})
-  }}).catch(() => {{}});
-}});
-</script>
-</body>
-</html>"#,
-        base = NDESIGN_BASE,
-    )
 }
 
 // ── Login / logout ───────────────────────────────────────────────────────────
@@ -10703,20 +10461,6 @@ mod tests {
     }
 
     #[test]
-    fn control_panel_close_never_embeds_the_api_key() {
-        let html = control_panel_close();
-        assert!(!html.contains("Bearer"));
-        assert!(!html.contains("Authorization"));
-        assert!(html.contains("'X-Gateway-UI': '1'"));
-    }
-
-    #[test]
-    fn control_panel_header_offers_sign_out() {
-        let html = control_panel_open("Dashboard", "dashboard");
-        assert!(html.contains(r#"href="/logout""#));
-    }
-
-    #[test]
     fn safe_next_path_rejects_offsite_and_login_loops() {
         assert_eq!(safe_next_path(Some("/tasks")), "/tasks");
         assert_eq!(safe_next_path(Some("//evil.example")), "/");
@@ -10865,41 +10609,25 @@ mod tests {
         assert_eq!(db::list_project_stats(&conn).unwrap().len(), 1);
     }
 
-    #[tokio::test]
-    async fn settings_page_lists_archived_projects_and_no_eventic() {
-        let state = test_state();
-        let _ = archive_project(State(state.clone()), Path("demo".into()))
-            .await
-            .unwrap();
-        let Html(html) = settings_page(State(state)).await.unwrap();
-        assert!(html.contains("archived"));
-        assert!(html.contains(r#"data-nd-action="POST /v1/projects/demo/restore""#));
-        assert!(!html.contains("Eventic"));
-        assert!(!html.contains("/build"));
+    #[test]
+    fn control_panel_nav_maps_documentation_and_memories_to_projects() {
+        for active in ["documentation", "api-docs", "memories"] {
+            let html = control_panel_open("Page", active);
+            assert!(
+                html.contains(r#"<li><a href="/projects" class="nd-active">Projects</a></li>"#),
+                "{active}"
+            );
+            assert!(!html.contains(r#"href="/documentation""#));
+        }
     }
 
     #[test]
-    fn control_panel_nav_exposes_documentation() {
-        let html = control_panel_open("Documentation", "documentation");
-
-        assert!(html
-            .contains(r#"<li><a href="/documentation" class="nd-active">Documentation</a></li>"#));
-    }
-
-    #[test]
-    fn control_panel_nav_maps_legacy_api_docs_to_documentation() {
-        let html = control_panel_open("API Docs", "api-docs");
-
-        assert!(html
-            .contains(r#"<li><a href="/documentation" class="nd-active">Documentation</a></li>"#));
-        assert!(!html.contains(r#">Artifacts</a>"#));
-    }
-
-    #[test]
-    fn control_panel_nav_exposes_memories() {
-        let html = control_panel_open("Memories", "memories");
-
-        assert!(html.contains(r#"<li><a href="/memories" class="nd-active">Memories</a></li>"#));
+    fn control_panel_nav_exposes_library_and_gateway_sections() {
+        let html = control_panel_open("Patterns", "patterns");
+        assert!(html.contains(r#"<li><a href="/patterns" class="nd-active">Patterns</a></li>"#));
+        assert!(html.contains(r#"href="/activity""#));
+        assert!(html.contains(r#"href="/settings""#));
+        assert!(html.contains(r#"href="/logout""#));
     }
 
     fn test_state_with_operations(artifact_operations: db::ArtifactOperationsEnvelope) -> AppState {
@@ -10933,6 +10661,8 @@ mod tests {
             default_channel: "discord".to_string(),
             api_key: "test-key".to_string(),
             ui_auth_enabled: true,
+            retention_days: 30,
+            bot_retention_days: 7,
             artifact_operations,
             artifact_body_schema_enabled: true,
             artifact_auth_enforced: false,
