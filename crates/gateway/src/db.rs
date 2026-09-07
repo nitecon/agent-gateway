@@ -1187,13 +1187,14 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             requester_hostname    TEXT,
             created_at            INTEGER NOT NULL,
             completed_at          INTEGER,
-            completion_message_id INTEGER REFERENCES messages(id)
+            completion_message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_task_delegations_source
             ON task_delegations(source_project_ident, source_task_id);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_task_delegations_target
             ON task_delegations(target_project_ident, target_task_id);",
     )?;
+    migrate_task_delegations_completion_fk(conn)?;
 
     // ── Patterns: global markdown pattern library ────────────────────────────
     conn.execute_batch(
@@ -5376,6 +5377,59 @@ pub fn append_workflow_run_outputs(
             ended_at: Some(run.ended_at),
         },
     )
+}
+
+/// Older databases declared `task_delegations.completion_message_id` with a
+/// plain `REFERENCES messages(id)` and no delete action, which made the daily
+/// retention purge abort with `FOREIGN KEY constraint failed` the moment a
+/// completion message aged past the cutoff. SQLite cannot alter a foreign key
+/// in place, so rebuild the table once with `ON DELETE SET NULL`.
+fn migrate_task_delegations_completion_fk(conn: &Connection) -> Result<()> {
+    let sql: Option<String> = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'task_delegations'",
+        [],
+        |r| r.get(0),
+    )?;
+    let Some(sql) = sql else {
+        return Ok(());
+    };
+    if sql.contains("ON DELETE SET NULL") {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "PRAGMA foreign_keys=OFF;
+         ALTER TABLE task_delegations RENAME TO task_delegations_old;
+         CREATE TABLE task_delegations (
+            id                    TEXT PRIMARY KEY,
+            source_project_ident  TEXT NOT NULL REFERENCES projects(ident),
+            source_task_id        TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            target_project_ident  TEXT NOT NULL REFERENCES projects(ident),
+            target_task_id        TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            requester_agent_id    TEXT,
+            requester_hostname    TEXT,
+            created_at            INTEGER NOT NULL,
+            completed_at          INTEGER,
+            completion_message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL
+         );
+         INSERT INTO task_delegations (
+            id, source_project_ident, source_task_id, target_project_ident,
+            target_task_id, requester_agent_id, requester_hostname, created_at,
+            completed_at, completion_message_id
+         )
+         SELECT
+            id, source_project_ident, source_task_id, target_project_ident,
+            target_task_id, requester_agent_id, requester_hostname, created_at,
+            completed_at, completion_message_id
+         FROM task_delegations_old;
+         DROP TABLE task_delegations_old;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_task_delegations_source
+            ON task_delegations(source_project_ident, source_task_id);
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_task_delegations_target
+            ON task_delegations(target_project_ident, target_task_id);
+         PRAGMA foreign_keys=ON;",
+    )?;
+    Ok(())
 }
 
 fn migrate_messages_for_system_delivery(conn: &Connection) -> Result<()> {
@@ -10257,77 +10311,6 @@ pub fn list_tasks(
     Ok(rows)
 }
 
-/// A task together with the project it belongs to (cross-project listings).
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct CrossProjectTask {
-    pub project_ident: String,
-    pub task: TaskSummary,
-}
-
-/// Tasks in the given statuses across all active projects (or one project),
-/// most recently updated first. Done tasks are limited to the recent
-/// fall-off window so the list stays bounded.
-pub fn list_tasks_across_projects(
-    conn: &Connection,
-    statuses: &[String],
-    project_ident: Option<&str>,
-    limit: usize,
-) -> Result<Vec<CrossProjectTask>> {
-    if statuses.is_empty() {
-        return Ok(Vec::new());
-    }
-    let project_filter = project_ident.map(normalize_project_ident);
-    let placeholders: Vec<String> = (0..statuses.len()).map(|i| format!("?{}", i + 3)).collect();
-    let sql = format!(
-        "SELECT t.project_ident, t.id, t.title, t.status, t.rank, t.labels,
-                t.owner_agent_id, t.hostname, t.reporter,
-                (SELECT COUNT(*) FROM task_comments tc WHERE tc.task_id = t.id),
-                t.created_at, t.updated_at, t.kind,
-                t.delegated_to_project_ident, t.delegated_to_task_id
-         FROM tasks t
-         JOIN projects p ON p.ident = t.project_ident AND p.archived_at IS NULL
-         WHERE (?1 IS NULL OR t.project_ident = ?1)
-           AND t.status IN ({})
-           AND (t.status != 'done' OR (t.done_at IS NOT NULL AND t.done_at > ?2))
-         ORDER BY t.updated_at DESC
-         LIMIT {}",
-        placeholders.join(","),
-        limit.max(1)
-    );
-    let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(statuses.len() + 2);
-    bound.push(Box::new(project_filter));
-    bound.push(Box::new(now_ms() - TASK_DONE_FALLOFF_MS));
-    for s in statuses {
-        bound.push(Box::new(s.clone()));
-    }
-    let params_vec: Vec<&dyn rusqlite::ToSql> = bound.iter().map(|b| b.as_ref()).collect();
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt
-        .query_map(params_vec.as_slice(), |r| {
-            Ok(CrossProjectTask {
-                project_ident: r.get(0)?,
-                task: TaskSummary {
-                    id: r.get(1)?,
-                    title: r.get(2)?,
-                    status: r.get(3)?,
-                    rank: r.get(4)?,
-                    labels: parse_labels(r.get::<_, Option<String>>(5)?),
-                    owner_agent_id: r.get(6)?,
-                    hostname: r.get(7)?,
-                    reporter: r.get(8)?,
-                    comment_count: r.get(9)?,
-                    created_at: r.get(10)?,
-                    updated_at: r.get(11)?,
-                    kind: r.get(12)?,
-                    delegated_to_project_ident: r.get(13)?,
-                    delegated_to_task_id: r.get(14)?,
-                },
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
-}
-
 /// Fetch a task and all of its comments, scoped by `project_ident` for safety.
 /// Comments are ordered ascending by `created_at`.
 pub fn get_task_detail(
@@ -12547,6 +12530,100 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(remaining, vec![human_open]);
+    }
+
+    #[test]
+    fn purge_clears_delegation_completion_message_instead_of_failing() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("source")).unwrap();
+        insert_project(&conn, &test_project("target")).unwrap();
+        let target = insert_task(
+            &conn,
+            "target",
+            "Build dependency",
+            None,
+            None,
+            &[],
+            None,
+            "tester",
+        )
+        .unwrap();
+        let source = insert_delegated_task(
+            &conn,
+            &DelegatedTaskInsert {
+                project_ident: "source",
+                title: "Build dependency (DELEGATED)",
+                description: None,
+                details: None,
+                labels: &[],
+                hostname: None,
+                reporter: "tester",
+                target_project_ident: "target",
+                target_task_id: &target.id,
+            },
+        )
+        .unwrap();
+        let delegation = insert_task_delegation(
+            &conn, "source", &source.id, "target", &target.id, None, None,
+        )
+        .unwrap();
+        let message_id = insert_message(
+            &conn,
+            &test_message("source", "agent", "delegation complete", Some("agent-a")),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE messages SET sent_at = ?1 WHERE id = ?2",
+            params![now_ms() - 100_000, message_id],
+        )
+        .unwrap();
+        mark_delegation_complete(&conn, &delegation.id, message_id).unwrap();
+
+        let deleted = purge_old_messages_with_policy(&conn, now_ms(), now_ms()).unwrap();
+        assert_eq!(deleted, 1);
+
+        let after = get_delegation_by_source(&conn, "source", &source.id)
+            .unwrap()
+            .unwrap();
+        assert!(after.completed_at.is_some());
+        assert_eq!(after.completion_message_id, None);
+    }
+
+    #[test]
+    fn legacy_delegation_fk_is_migrated_to_set_null() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        apply_schema(&conn).unwrap();
+        // Recreate the pre-fix table shape, then re-run the schema.
+        conn.execute_batch(
+            "DROP TABLE task_delegations;
+             CREATE TABLE task_delegations (
+                id                    TEXT PRIMARY KEY,
+                source_project_ident  TEXT NOT NULL REFERENCES projects(ident),
+                source_task_id        TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                target_project_ident  TEXT NOT NULL REFERENCES projects(ident),
+                target_task_id        TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                requester_agent_id    TEXT,
+                requester_hostname    TEXT,
+                created_at            INTEGER NOT NULL,
+                completed_at          INTEGER,
+                completion_message_id INTEGER REFERENCES messages(id)
+             );",
+        )
+        .unwrap();
+        apply_schema(&conn).unwrap();
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'task_delegations'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(sql.contains("ON DELETE SET NULL"));
+        let fk_on: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk_on, 1);
     }
 
     #[test]
