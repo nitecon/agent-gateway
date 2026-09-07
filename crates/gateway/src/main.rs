@@ -386,7 +386,10 @@ async fn main() -> Result<()> {
         let conn = db.lock().unwrap();
         db::all_projects(&conn)?
     };
-    for project in &existing_projects {
+    for project in existing_projects
+        .iter()
+        .filter(|project| !project.room_id.is_empty())
+    {
         if let Some(plugin) = plugins.get(&project.channel_name) {
             plugin.register_room(&project.room_id, project.last_msg_id.as_deref());
         }
@@ -515,16 +518,16 @@ async fn main() -> Result<()> {
             patch(routes::update_delegation_handler),
         )
         .route(
-            "/v1/projects/repo-mappings/bulk",
-            post(routes::bulk_update_project_repo_mappings),
-        )
-        .route(
             "/v1/projects/{ident}/repo",
             patch(routes::update_project_repo_mapping),
         )
         .route(
-            "/v1/projects/{ident}/eventic",
-            get(routes::get_project_eventic_status),
+            "/v1/projects/{ident}/archive",
+            post(routes::archive_project),
+        )
+        .route(
+            "/v1/projects/{ident}/restore",
+            post(routes::restore_project),
         )
         .route(
             "/v1/projects/{ident}/api-docs",
@@ -666,17 +669,6 @@ async fn main() -> Result<()> {
             post(routes::link_existing_spec_task_handler),
         )
         .route(
-            "/v1/eventic/servers",
-            get(routes::get_eventic_servers)
-                .post(routes::add_eventic_server)
-                .put(routes::replace_eventic_servers),
-        )
-        .route(
-            "/v1/eventic/servers/{id}",
-            patch(routes::update_eventic_server).delete(routes::delete_eventic_server),
-        )
-        .route("/v1/eventic/projects", get(routes::list_eventic_projects))
-        .route(
             "/v1/patterns",
             get(routes::list_patterns_handler).post(routes::create_pattern_handler),
         )
@@ -702,7 +694,6 @@ async fn main() -> Result<()> {
         .route("/artifacts", get(routes::artifacts_index_page))
         .route("/memories", get(routes::memories_index_page))
         .route("/projects/{ident}/memories", get(routes::memories_page))
-        .route("/projects/{ident}/build", get(routes::project_build_page))
         .route(
             "/projects/{ident}/artifacts",
             get(routes::artifact_workspace_page),

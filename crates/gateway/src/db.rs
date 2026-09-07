@@ -879,7 +879,17 @@ pub struct Project {
     pub repo_namespace: Option<String>,
     pub repo_name: Option<String>,
     pub repo_full_name: Option<String>,
+    /// `repo` when the project was registered from a git remote, `adhoc` when
+    /// it came from a bare directory name and has no repository.
+    pub kind: String,
+    /// Set when the project is hidden from default listings.
+    pub archived_at: Option<i64>,
+    /// Normalized `host/namespace/name` remote the client reported, if any.
+    pub canonical_remote: Option<String>,
 }
+
+pub const PROJECT_KIND_REPO: &str = "repo";
+pub const PROJECT_KIND_ADHOC: &str = "adhoc";
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Message {
@@ -1052,6 +1062,14 @@ fn apply_schema(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE projects ADD COLUMN repo_namespace TEXT", []);
     let _ = conn.execute("ALTER TABLE projects ADD COLUMN repo_name TEXT", []);
     let _ = conn.execute("ALTER TABLE projects ADD COLUMN repo_full_name TEXT", []);
+
+    // ── Migration: project kind, archive state, canonical remote ─────────────
+    let _ = conn.execute(
+        "ALTER TABLE projects ADD COLUMN kind TEXT NOT NULL DEFAULT 'repo'",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE projects ADD COLUMN archived_at INTEGER", []);
+    let _ = conn.execute("ALTER TABLE projects ADD COLUMN canonical_remote TEXT", []);
 
     // Migrate existing confirmed messages to agent_confirmations for "_default" agent.
     conn.execute(
@@ -5425,7 +5443,8 @@ pub fn get_project(conn: &Connection, ident: &str) -> Result<Option<Project>> {
     let ident = normalize_project_ident(ident);
     let mut stmt = conn.prepare_cached(
         "SELECT ident, channel_name, room_id, last_msg_id, created_at,
-                repo_provider, repo_namespace, repo_name, repo_full_name
+                repo_provider, repo_namespace, repo_name, repo_full_name,
+                kind, archived_at, canonical_remote
          FROM projects WHERE ident = ?1",
     )?;
     let mut rows = stmt.query_map(params![ident.as_str()], row_to_project)?;
@@ -5440,7 +5459,8 @@ pub fn get_project_by_room(
 ) -> Result<Option<Project>> {
     let mut stmt = conn.prepare_cached(
         "SELECT ident, channel_name, room_id, last_msg_id, created_at,
-                repo_provider, repo_namespace, repo_name, repo_full_name
+                repo_provider, repo_namespace, repo_name, repo_full_name,
+                kind, archived_at, canonical_remote
          FROM projects WHERE channel_name = ?1 AND room_id = ?2",
     )?;
     let mut rows = stmt.query_map(params![channel_name, room_id], row_to_project)?;
@@ -5477,6 +5497,9 @@ pub fn insert_project(conn: &Connection, p: &Project) -> Result<()> {
             crud_col("repo_namespace", repo_namespace.as_deref()),
             crud_col("repo_name", repo_name.as_deref()),
             crud_col("repo_full_name", repo_full_name.as_deref()),
+            crud_col("kind", p.kind.as_str()),
+            crud_col("archived_at", p.archived_at),
+            crud_col("canonical_remote", p.canonical_remote.as_deref()),
         ],
         &["ident"],
     )?;
@@ -5497,7 +5520,8 @@ pub fn all_projects(conn: &Connection) -> Result<Vec<Project>> {
     // must not surface in room registration or any human-facing enumeration.
     let mut stmt = conn.prepare_cached(
         "SELECT ident, channel_name, room_id, last_msg_id, created_at,
-                repo_provider, repo_namespace, repo_name, repo_full_name
+                repo_provider, repo_namespace, repo_name, repo_full_name,
+                kind, archived_at, canonical_remote
          FROM projects
          WHERE ident != '__global__'",
     )?;
@@ -5528,6 +5552,11 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         repo_namespace: row.get(6)?,
         repo_name: row.get(7)?,
         repo_full_name: row.get(8)?,
+        kind: row
+            .get::<_, Option<String>>(9)?
+            .unwrap_or_else(|| PROJECT_KIND_REPO.to_string()),
+        archived_at: row.get(10)?,
+        canonical_remote: row.get(11)?,
     })
 }
 
@@ -5574,7 +5603,17 @@ pub fn update_project_repo_mapping(
     let repo_name = normalize_optional_lowercase(repo_name);
     let repo_full_name = match (namespace.as_deref(), repo_name.as_deref()) {
         (Some(ns), Some(repo)) => Some(format!("{ns}/{repo}")),
-        _ => None,
+        (None, None) => None,
+        _ => bail!("namespace and repo_name must be supplied together (leave both blank to clear the mapping)"),
+    };
+    let (provider, namespace, repo_name) = if repo_full_name.is_some() {
+        (
+            provider.or_else(|| Some("github".to_string())),
+            namespace,
+            repo_name,
+        )
+    } else {
+        (None, None, None)
     };
     ensure_repo_mapping_available(conn, &ident, provider.as_deref(), repo_full_name.as_deref())?;
 
@@ -5585,49 +5624,83 @@ pub fn update_project_repo_mapping(
             crud_col("repo_namespace", namespace.as_deref()),
             crud_col("repo_name", repo_name.as_deref()),
             crud_col("repo_full_name", repo_full_name.as_deref()),
+            crud_col(
+                "kind",
+                if repo_full_name.is_some() {
+                    PROJECT_KIND_REPO
+                } else {
+                    PROJECT_KIND_ADHOC
+                },
+            ),
         ],
         &[crud_eq("ident", ident.as_str())],
     )?;
     get_project(conn, &ident)
 }
 
-pub fn bulk_fill_missing_repo_mappings(
+/// Fill in repository metadata from a parsed remote when the project has no
+/// mapping yet. Returns true when a change was written. Never overwrites an
+/// existing mapping; always records the canonical remote when it is missing.
+pub fn backfill_project_repo(
     conn: &Connection,
-    provider: &str,
-    namespace: &str,
-) -> Result<usize> {
-    let Some(provider) = normalize_optional_lowercase(Some(provider)) else {
-        return Ok(0);
+    ident: &str,
+    repo: &crate::projects::RepoRef,
+) -> Result<bool> {
+    let ident = normalize_project_ident(ident);
+    let Some(existing) = get_project(conn, &ident)? else {
+        return Ok(false);
     };
-    let Some(namespace) = normalize_optional_lowercase(Some(namespace)) else {
-        return Ok(0);
-    };
-
-    let projects = all_projects(conn)?;
-    let mut changed = 0;
-    for project in projects
-        .iter()
-        .filter(|project| project.repo_full_name.as_deref().unwrap_or("").is_empty())
-    {
-        let repo_full_name = format!("{namespace}/{}", project.ident);
-        ensure_repo_mapping_available(
-            conn,
-            &project.ident,
-            Some(&provider),
-            Some(&repo_full_name),
-        )?;
-        changed += crud(conn).update(
-            "projects",
-            &[
-                crud_col("repo_provider", provider.as_str()),
-                crud_col("repo_namespace", namespace.as_str()),
-                crud_col("repo_name", project.ident.as_str()),
-                crud_col("repo_full_name", repo_full_name.as_str()),
-            ],
-            &[crud_eq("ident", project.ident.as_str())],
-        )?;
+    let mut cols: Vec<CrudColumn<'_>> = Vec::new();
+    if existing.canonical_remote.is_none() {
+        cols.push(crud_col("canonical_remote", repo.canonical.as_str()));
     }
-    Ok(changed)
+    let full_name = repo.full_name();
+    if existing.repo_full_name.is_none()
+        && ensure_repo_mapping_available(conn, &ident, Some(&repo.provider), Some(&full_name))
+            .is_ok()
+    {
+        cols.push(crud_col("repo_provider", repo.provider.as_str()));
+        cols.push(crud_col("repo_namespace", repo.namespace.as_str()));
+        cols.push(crud_col("repo_name", repo.name.as_str()));
+        cols.push(crud_col("repo_full_name", full_name.as_str()));
+        cols.push(crud_col("kind", PROJECT_KIND_REPO));
+    } else if existing.kind != PROJECT_KIND_REPO && existing.repo_full_name.is_some() {
+        cols.push(crud_col("kind", PROJECT_KIND_REPO));
+    }
+    if cols.is_empty() {
+        return Ok(false);
+    }
+    crud(conn).update("projects", &cols, &[crud_eq("ident", ident.as_str())])?;
+    Ok(true)
+}
+
+/// Archive or restore a project. Archived projects keep all data and URLs but
+/// drop out of default listings.
+pub fn set_project_archived(
+    conn: &Connection,
+    ident: &str,
+    archived: bool,
+) -> Result<Option<Project>> {
+    let ident = normalize_project_ident(ident);
+    let archived_at: Option<i64> = if archived { Some(now_ms()) } else { None };
+    crud(conn).update(
+        "projects",
+        &[crud_col("archived_at", archived_at)],
+        &[crud_eq("ident", ident.as_str())],
+    )?;
+    get_project(conn, &ident)
+}
+
+/// Persist the room a channel plugin created for a project that was
+/// registered without one (adhoc projects create rooms lazily on first send).
+pub fn set_project_room(conn: &Connection, ident: &str, room_id: &str) -> Result<()> {
+    let ident = normalize_project_ident(ident);
+    crud(conn).update(
+        "projects",
+        &[crud_col("room_id", room_id)],
+        &[crud_eq("ident", ident.as_str())],
+    )?;
+    Ok(())
 }
 
 // ── Messages ─────────────────────────────────────────────────────────────────
@@ -6959,6 +7032,9 @@ fn ensure_global_memory_project(conn: &Connection) -> Result<()> {
             repo_namespace: None,
             repo_name: None,
             repo_full_name: None,
+            kind: PROJECT_KIND_REPO.to_string(),
+            archived_at: None,
+            canonical_remote: None,
         },
     )
 }
@@ -7143,6 +7219,9 @@ pub struct ProjectStats {
     pub repo_namespace: Option<String>,
     pub repo_name: Option<String>,
     pub repo_full_name: Option<String>,
+    pub kind: String,
+    pub archived_at: Option<i64>,
+    pub canonical_remote: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -7172,6 +7251,19 @@ pub struct DashboardData {
 /// identity, its channel, the originating room id, the total message count,
 /// active task counts, and the number of unconfirmed user-sourced messages.
 pub fn list_project_stats(conn: &Connection) -> Result<Vec<ProjectStats>> {
+    list_project_stats_filtered(conn, false)
+}
+
+/// Like [`list_project_stats`], optionally including archived projects.
+pub fn list_project_stats_filtered(
+    conn: &Connection,
+    include_archived: bool,
+) -> Result<Vec<ProjectStats>> {
+    let archived_filter = if include_archived {
+        ""
+    } else {
+        " AND p.archived_at IS NULL"
+    };
     let sql = format!(
         "SELECT p.ident, p.channel_name, p.room_id,
                 COUNT(m.id),
@@ -7196,10 +7288,11 @@ pub fn list_project_stats(conn: &Connection) -> Result<Vec<ProjectStats>> {
                 (SELECT COUNT(*) FROM gateway_memories gm
                  WHERE gm.project_ident = p.ident
                    AND gm.tombstoned_at IS NULL),
-                p.repo_provider, p.repo_namespace, p.repo_name, p.repo_full_name
+                p.repo_provider, p.repo_namespace, p.repo_name, p.repo_full_name,
+                p.kind, p.archived_at, p.canonical_remote
          FROM projects p
          LEFT JOIN messages m ON m.project_ident = p.ident
-         WHERE p.ident != '__global__'
+         WHERE p.ident != '__global__'{archived_filter}
          GROUP BY p.ident
          ORDER BY
             (SELECT COUNT(*) FROM tasks t
@@ -7236,6 +7329,11 @@ pub fn list_project_stats(conn: &Connection) -> Result<Vec<ProjectStats>> {
                 repo_namespace: r.get(11)?,
                 repo_name: r.get(12)?,
                 repo_full_name: r.get(13)?,
+                kind: r
+                    .get::<_, Option<String>>(14)?
+                    .unwrap_or_else(|| PROJECT_KIND_REPO.to_string()),
+                archived_at: r.get(15)?,
+                canonical_remote: r.get(16)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -10861,6 +10959,9 @@ mod tests {
             repo_namespace: None,
             repo_name: None,
             repo_full_name: None,
+            kind: PROJECT_KIND_REPO.to_string(),
+            archived_at: None,
+            canonical_remote: None,
         }
     }
 
@@ -10877,6 +10978,55 @@ mod tests {
             .query_row("SELECT project_ident FROM cursors", [], |row| row.get(0))
             .unwrap();
         assert_eq!(cursor_ident, "demoproject");
+    }
+
+    #[test]
+    fn repo_mapping_rejects_partial_input_and_clears_when_blank() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("proj")).unwrap();
+        let err = update_project_repo_mapping(&conn, "proj", Some("github"), Some("nitecon"), None)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("together"));
+
+        let mapped =
+            update_project_repo_mapping(&conn, "proj", None, Some("nitecon"), Some("proj"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(mapped.repo_full_name.as_deref(), Some("nitecon/proj"));
+        assert_eq!(mapped.repo_provider.as_deref(), Some("github"));
+        assert_eq!(mapped.kind, PROJECT_KIND_REPO);
+
+        let cleared =
+            update_project_repo_mapping(&conn, "proj", Some("github"), Some(""), Some(""))
+                .unwrap()
+                .unwrap();
+        assert!(cleared.repo_full_name.is_none());
+        assert!(cleared.repo_provider.is_none());
+        assert_eq!(cleared.kind, PROJECT_KIND_ADHOC);
+    }
+
+    #[test]
+    fn backfill_project_repo_fills_empty_mapping_but_never_overwrites() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("proj")).unwrap();
+        let repo = crate::projects::parse_remote("https://github.com/nitecon/proj.git").unwrap();
+        assert!(backfill_project_repo(&conn, "proj", &repo).unwrap());
+        let p = get_project(&conn, "proj").unwrap().unwrap();
+        assert_eq!(p.repo_full_name.as_deref(), Some("nitecon/proj"));
+        assert_eq!(
+            p.canonical_remote.as_deref(),
+            Some("github.com/nitecon/proj")
+        );
+        assert_eq!(p.kind, PROJECT_KIND_REPO);
+
+        // A different remote later must not clobber the existing mapping.
+        let other = crate::projects::parse_remote("https://gitlab.com/x/y.git").unwrap();
+        assert!(!backfill_project_repo(&conn, "proj", &other).unwrap());
+        let p = get_project(&conn, "proj").unwrap().unwrap();
+        assert_eq!(p.repo_full_name.as_deref(), Some("nitecon/proj"));
+
+        // Unknown projects are a no-op.
+        assert!(!backfill_project_repo(&conn, "missing", &repo).unwrap());
     }
 
     #[test]

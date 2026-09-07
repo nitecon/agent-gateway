@@ -39,8 +39,6 @@ impl<E: Into<anyhow::Error>> From<E> for AppError {
 
 type Result<T> = std::result::Result<T, AppError>;
 
-const EVENTIC_SERVERS_SETTING: &str = "eventic.servers";
-
 // ── Artifact operations envelope accessor (T016 plumbing) ───────────────────
 //
 // T016 owns the typed runtime surface for the T004 operations envelope. The
@@ -3836,256 +3834,13 @@ pub async fn set_theme(
     Ok(Json(ThemeResponse { theme }))
 }
 
-// ── Eventic configuration + build status ─────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EventicServer {
-    pub id: String,
-    pub name: String,
-    pub base_url: String,
-    pub enabled: bool,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct EventicServerInput {
-    pub id: Option<String>,
-    pub name: String,
-    pub base_url: String,
-    pub enabled: Option<Value>,
-}
+// ── Project repository mapping ───────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 pub struct RepoMappingRequest {
     pub provider: Option<String>,
     pub namespace: Option<String>,
     pub repo_name: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct BulkRepoMappingRequest {
-    pub provider: String,
-    pub namespace: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct BulkRepoMappingResponse {
-    pub updated: usize,
-}
-
-#[derive(Debug, Serialize)]
-pub struct EventicProjectSource {
-    pub server_id: String,
-    pub server_name: String,
-    pub base_url: String,
-    pub projects: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ProjectBuildStatus {
-    pub project_ident: String,
-    pub repo_provider: Option<String>,
-    pub repo_full_name: Option<String>,
-    pub server_id: Option<String>,
-    pub server_name: Option<String>,
-    pub base_url: Option<String>,
-    pub status: Option<Value>,
-    pub hint: Option<String>,
-}
-
-fn normalize_eventic_server(input: EventicServerInput, existing_id: Option<&str>) -> EventicServer {
-    let base_url = input.base_url.trim().trim_end_matches('/').to_string();
-    let raw_id = input
-        .id
-        .as_deref()
-        .or(existing_id)
-        .filter(|s| !s.trim().is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            let seed = if input.name.trim().is_empty() {
-                &base_url
-            } else {
-                input.name.trim()
-            };
-            sanitize_ident(seed)
-        });
-    EventicServer {
-        id: sanitize_ident(&raw_id),
-        name: input.name.trim().to_string(),
-        base_url,
-        enabled: input
-            .enabled
-            .as_ref()
-            .and_then(|v| match v {
-                Value::Bool(b) => Some(*b),
-                Value::String(s) => Some(s == "true" || s == "on" || s == "1"),
-                Value::Number(n) => Some(n.as_i64().unwrap_or_default() != 0),
-                _ => None,
-            })
-            .unwrap_or(true),
-    }
-}
-
-fn load_eventic_servers(conn: &rusqlite::Connection) -> anyhow::Result<Vec<EventicServer>> {
-    match db::get_setting(conn, EVENTIC_SERVERS_SETTING)? {
-        Some(raw) => Ok(serde_json::from_str(&raw)?),
-        None => Ok(Vec::new()),
-    }
-}
-
-fn save_eventic_servers(
-    conn: &rusqlite::Connection,
-    servers: &[EventicServer],
-) -> anyhow::Result<()> {
-    db::set_setting(
-        conn,
-        EVENTIC_SERVERS_SETTING,
-        &serde_json::to_string(servers)?,
-    )?;
-    Ok(())
-}
-
-async fn fetch_eventic_projects(server: &EventicServer) -> anyhow::Result<Vec<String>> {
-    let url = format!("{}/projects", server.base_url.trim_end_matches('/'));
-    let projects = reqwest::Client::new()
-        .get(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<Vec<String>>()
-        .await?;
-    Ok(projects)
-}
-
-async fn fetch_eventic_project_status(
-    server: &EventicServer,
-    repo_full_name: &str,
-) -> anyhow::Result<Value> {
-    let url = format!(
-        "{}/projects/{}",
-        server.base_url.trim_end_matches('/'),
-        repo_full_name.trim_start_matches('/')
-    );
-    let status = reqwest::Client::new()
-        .get(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<Value>()
-        .await?;
-    Ok(status)
-}
-
-pub async fn get_eventic_servers(
-    State(state): State<AppState>,
-) -> Result<Json<Vec<EventicServer>>> {
-    let db = state.db.clone();
-    let servers = spawn_blocking(move || {
-        let conn = db.lock().unwrap();
-        load_eventic_servers(&conn)
-    })
-    .await??;
-    Ok(Json(servers))
-}
-
-pub async fn replace_eventic_servers(
-    State(state): State<AppState>,
-    Json(servers): Json<Vec<EventicServer>>,
-) -> Result<Json<Vec<EventicServer>>> {
-    let db = state.db.clone();
-    let saved = spawn_blocking(move || -> anyhow::Result<Vec<EventicServer>> {
-        let conn = db.lock().unwrap();
-        save_eventic_servers(&conn, &servers)?;
-        Ok(servers)
-    })
-    .await??;
-    Ok(Json(saved))
-}
-
-pub async fn add_eventic_server(
-    State(state): State<AppState>,
-    Json(input): Json<EventicServerInput>,
-) -> Result<Json<Vec<EventicServer>>> {
-    let db = state.db.clone();
-    let servers = spawn_blocking(move || -> anyhow::Result<Vec<EventicServer>> {
-        let conn = db.lock().unwrap();
-        let mut servers = load_eventic_servers(&conn)?;
-        let mut server = normalize_eventic_server(input, None);
-        if server.id.is_empty() {
-            server.id = format!("eventic-{}", now_ms());
-        }
-        let original_id = server.id.clone();
-        let mut suffix = 2;
-        while servers.iter().any(|s| s.id == server.id) {
-            server.id = format!("{original_id}-{suffix}");
-            suffix += 1;
-        }
-        servers.push(server);
-        save_eventic_servers(&conn, &servers)?;
-        Ok(servers)
-    })
-    .await??;
-    Ok(Json(servers))
-}
-
-pub async fn update_eventic_server(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(input): Json<EventicServerInput>,
-) -> Result<Json<Vec<EventicServer>>> {
-    let db = state.db.clone();
-    let servers = spawn_blocking(move || -> anyhow::Result<Vec<EventicServer>> {
-        let conn = db.lock().unwrap();
-        let mut servers = load_eventic_servers(&conn)?;
-        let idx = servers
-            .iter()
-            .position(|s| s.id == id)
-            .ok_or_else(|| anyhow::anyhow!("eventic server '{id}' not found"))?;
-        servers[idx] = normalize_eventic_server(input, Some(&id));
-        save_eventic_servers(&conn, &servers)?;
-        Ok(servers)
-    })
-    .await??;
-    Ok(Json(servers))
-}
-
-pub async fn delete_eventic_server(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<Vec<EventicServer>>> {
-    let db = state.db.clone();
-    let servers = spawn_blocking(move || -> anyhow::Result<Vec<EventicServer>> {
-        let conn = db.lock().unwrap();
-        let mut servers = load_eventic_servers(&conn)?;
-        servers.retain(|s| s.id != id);
-        save_eventic_servers(&conn, &servers)?;
-        Ok(servers)
-    })
-    .await??;
-    Ok(Json(servers))
-}
-
-pub async fn list_eventic_projects(
-    State(state): State<AppState>,
-) -> Result<Json<Vec<EventicProjectSource>>> {
-    let db = state.db.clone();
-    let servers = spawn_blocking(move || {
-        let conn = db.lock().unwrap();
-        load_eventic_servers(&conn)
-    })
-    .await??;
-
-    let mut out = Vec::new();
-    for server in servers.iter().filter(|s| s.enabled) {
-        if let Ok(projects) = fetch_eventic_projects(server).await {
-            out.push(EventicProjectSource {
-                server_id: server.id.clone(),
-                server_name: server.name.clone(),
-                base_url: server.base_url.clone(),
-                projects,
-            });
-        }
-    }
-    Ok(Json(out))
 }
 
 pub async fn update_project_repo_mapping(
@@ -4109,84 +3864,35 @@ pub async fn update_project_repo_mapping(
     Ok(Json(project))
 }
 
-pub async fn bulk_update_project_repo_mappings(
-    State(state): State<AppState>,
-    Json(req): Json<BulkRepoMappingRequest>,
-) -> Result<Json<BulkRepoMappingResponse>> {
-    let db = state.db.clone();
-    let updated = spawn_blocking(move || {
-        let conn = db.lock().unwrap();
-        db::bulk_fill_missing_repo_mappings(&conn, &req.provider, &req.namespace)
-    })
-    .await??;
-    Ok(Json(BulkRepoMappingResponse { updated }))
-}
-
-pub async fn get_project_eventic_status(
+/// POST /v1/projects/:ident/archive
+pub async fn archive_project(
     State(state): State<AppState>,
     Path(ident): Path<String>,
-) -> Result<Json<ProjectBuildStatus>> {
+) -> Result<Json<Project>> {
+    set_project_archived(state, ident, true).await
+}
+
+/// POST /v1/projects/:ident/restore
+pub async fn restore_project(
+    State(state): State<AppState>,
+    Path(ident): Path<String>,
+) -> Result<Json<Project>> {
+    set_project_archived(state, ident, false).await
+}
+
+async fn set_project_archived(
+    state: AppState,
+    ident: String,
+    archived: bool,
+) -> Result<Json<Project>> {
     let db = state.db.clone();
-    let (project, servers) = spawn_blocking(move || -> anyhow::Result<_> {
+    let project = spawn_blocking(move || -> anyhow::Result<Option<Project>> {
         let conn = db.lock().unwrap();
-        let project = db::get_project(&conn, &ident)?
-            .ok_or_else(|| anyhow::anyhow!("project '{ident}' not found"))?;
-        Ok((project, load_eventic_servers(&conn)?))
+        db::set_project_archived(&conn, &ident, archived)
     })
-    .await??;
-
-    let Some(repo_full_name) = project.repo_full_name.clone() else {
-        return Ok(Json(ProjectBuildStatus {
-            project_ident: project.ident,
-            repo_provider: project.repo_provider,
-            repo_full_name: None,
-            server_id: None,
-            server_name: None,
-            base_url: None,
-            status: None,
-            hint: Some("No repository mapping is configured for this gateway project. Add a provider, namespace, and repository in Settings, or tell the user Eventic is not configured so build information is unavailable.".into()),
-        }));
-    };
-
-    let enabled: Vec<_> = servers.into_iter().filter(|s| s.enabled).collect();
-    if enabled.is_empty() {
-        return Ok(Json(ProjectBuildStatus {
-            project_ident: project.ident,
-            repo_provider: project.repo_provider,
-            repo_full_name: Some(repo_full_name),
-            server_id: None,
-            server_name: None,
-            base_url: None,
-            status: None,
-            hint: Some("No enabled Eventic servers are configured. Add an Eventic server in Settings to expose build information.".into()),
-        }));
-    }
-
-    for server in &enabled {
-        if let Ok(status) = fetch_eventic_project_status(server, &repo_full_name).await {
-            return Ok(Json(ProjectBuildStatus {
-                project_ident: project.ident,
-                repo_provider: project.repo_provider,
-                repo_full_name: Some(repo_full_name),
-                server_id: Some(server.id.clone()),
-                server_name: Some(server.name.clone()),
-                base_url: Some(server.base_url.clone()),
-                status: Some(status),
-                hint: None,
-            }));
-        }
-    }
-
-    Ok(Json(ProjectBuildStatus {
-        project_ident: project.ident,
-        repo_provider: project.repo_provider,
-        repo_full_name: Some(repo_full_name),
-        server_id: None,
-        server_name: None,
-        base_url: None,
-        status: None,
-        hint: Some("The mapped repository was not found on any enabled Eventic server, or the servers were unreachable.".into()),
-    }))
+    .await??
+    .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "project not found".into()))?;
+    Ok(Json(project))
 }
 
 // ── Agent memory gateway ─────────────────────────────────────────────────────
@@ -4957,6 +4663,12 @@ pub struct RegisterProjectRequest {
     pub ident: String,
     /// Which channel plugin to use. Defaults to gateway's DEFAULT_CHANNEL.
     pub channel: Option<String>,
+    /// Git remote (or agent-tools canonical ident such as
+    /// `github.com/nitecon/agent-gateway.git`). When present the repository
+    /// mapping is derived from it and the project is registered as a `repo`
+    /// project; otherwise it is an `adhoc` project with no channel room until
+    /// the first message is sent.
+    pub repo_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -4964,6 +4676,8 @@ pub struct RegisterProjectResponse {
     pub ident: String,
     pub channel_name: String,
     pub room_id: String,
+    pub kind: String,
+    pub repo_full_name: Option<String>,
 }
 
 pub async fn register_project(
@@ -4974,60 +4688,117 @@ pub async fn register_project(
     let channel_name = body
         .channel
         .unwrap_or_else(|| state.default_channel.clone());
+    // Prefer the explicit remote; fall back to the ident itself when a client
+    // still sends the full remote URL as the identity.
+    let repo = body
+        .repo_url
+        .as_deref()
+        .and_then(crate::projects::parse_remote)
+        .or_else(|| crate::projects::parse_remote(&body.ident));
 
-    // Return existing project immediately (idempotent).
+    // Existing project: idempotent return, but heal an empty mapping when the
+    // client now tells us the remote.
     {
-        let conn = state.db.lock().unwrap();
-        if let Some(existing) = db::get_project(&conn, &project_ident)? {
+        let db = state.db.clone();
+        let ident = project_ident.clone();
+        let repo_for_backfill = repo.clone();
+        let existing = spawn_blocking(move || -> anyhow::Result<Option<Project>> {
+            let conn = db.lock().unwrap();
+            if let Some(repo) = repo_for_backfill.as_ref() {
+                db::backfill_project_repo(&conn, &ident, repo)?;
+            }
+            db::get_project(&conn, &ident)
+        })
+        .await??;
+        if let Some(existing) = existing {
             return Ok(Json(RegisterProjectResponse {
                 ident: existing.ident,
                 channel_name: existing.channel_name,
                 room_id: existing.room_id,
+                kind: existing.kind,
+                repo_full_name: existing.repo_full_name,
             }));
         }
     }
 
-    // Look up the requested plugin.
-    let plugin = state
-        .plugins
-        .get(&channel_name)
-        .ok_or_else(|| {
-            AppError(
-                StatusCode::BAD_REQUEST,
-                format!("unknown channel plugin: '{channel_name}'"),
+    // Repo projects get their room now; adhoc projects (bare directory names)
+    // get one lazily on first send so stray `cd`s do not create channels.
+    let (kind, room_id) = match repo.as_ref() {
+        Some(_) => {
+            let plugin = state
+                .plugins
+                .get(&channel_name)
+                .ok_or_else(|| {
+                    AppError(
+                        StatusCode::BAD_REQUEST,
+                        format!("unknown channel plugin: '{channel_name}'"),
+                    )
+                })?
+                .clone();
+            (
+                db::PROJECT_KIND_REPO.to_string(),
+                plugin.ensure_room(&project_ident).await?,
             )
-        })?
-        .clone();
+        }
+        None => (db::PROJECT_KIND_ADHOC.to_string(), String::new()),
+    };
 
-    // Plugin creates/finds the room.
-    let room_id = plugin.ensure_room(&project_ident).await?;
-
-    // Persist.
     let project = Project {
         ident: project_ident.clone(),
         channel_name: channel_name.clone(),
         room_id: room_id.clone(),
         last_msg_id: None,
         created_at: now_ms(),
-        repo_provider: None,
-        repo_namespace: None,
-        repo_name: None,
-        repo_full_name: None,
+        repo_provider: repo.as_ref().map(|r| r.provider.clone()),
+        repo_namespace: repo.as_ref().map(|r| r.namespace.clone()),
+        repo_name: repo.as_ref().map(|r| r.name.clone()),
+        repo_full_name: repo.as_ref().map(|r| r.full_name()),
+        kind: kind.clone(),
+        archived_at: None,
+        canonical_remote: repo.as_ref().map(|r| r.canonical.clone()),
     };
 
     let db = state.db.clone();
     let project_clone = project.clone();
-    spawn_blocking(move || {
+    let stored = spawn_blocking(move || -> anyhow::Result<Option<Project>> {
         let conn = db.lock().unwrap();
-        db::insert_project(&conn, &project_clone)
+        db::insert_project(&conn, &project_clone)?;
+        db::get_project(&conn, &project_clone.ident)
     })
-    .await??;
+    .await??
+    .unwrap_or(project);
 
     Ok(Json(RegisterProjectResponse {
-        ident: project_ident,
-        channel_name,
-        room_id,
+        ident: stored.ident,
+        channel_name: stored.channel_name,
+        room_id: stored.room_id,
+        kind: stored.kind,
+        repo_full_name: stored.repo_full_name,
     }))
+}
+
+/// Resolve the plugin room for an outbound send, creating it on first use for
+/// adhoc projects that were registered without one.
+async fn ensure_project_room(
+    state: &AppState,
+    ident: &str,
+    plugin: &dyn crate::channel::ChannelPlugin,
+    room_id: String,
+) -> Result<String> {
+    if !room_id.is_empty() {
+        return Ok(room_id);
+    }
+    let created = plugin.ensure_room(ident).await?;
+    plugin.register_room(&created, None);
+    let db = state.db.clone();
+    let ident = ident.to_string();
+    let persisted = created.clone();
+    spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::set_project_room(&conn, &ident, &persisted)
+    })
+    .await??;
+    Ok(created)
 }
 
 // ── POST /v1/projects/:ident/messages ─────────────────────────────────────────
@@ -5078,6 +4849,7 @@ pub async fn send_message(
             )
         })?
         .clone();
+    let room_id = ensure_project_room(&state, &ident, plugin.as_ref(), room_id).await?;
 
     let agent_id = extract_agent_id(&headers);
     let body_text = req.body.or(req.content).unwrap_or_default();
@@ -6411,7 +6183,7 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
     let unanswered_message_count: i64 = data.projects.iter().map(|p| p.unread_count).sum();
 
     let rows = if data.project_count == 0 {
-        r#"<tr><td colspan="6" class="nd-text-muted nd-text-center">No projects registered yet</td></tr>"#.to_string()
+        r#"<tr><td colspan="5" class="nd-text-muted nd-text-center">No projects registered yet</td></tr>"#.to_string()
     } else {
         data.projects
             .iter()
@@ -6440,14 +6212,6 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
                 } else {
                     r#"<span class="nd-text-muted">Clear</span>"#.into()
                 };
-                let build_cell = match &p.repo_full_name {
-                    Some(repo) => format!(
-                        r#"<a class="nd-btn-secondary nd-btn-sm" href="/projects/{}/build">{}</a>"#,
-                        he(&p.ident),
-                        he(repo)
-                    ),
-                    None => r#"<a class="nd-btn-ghost nd-btn-sm" href="/settings">Map repo</a>"#.into(),
-                };
                 let docs_cell = if p.api_doc_count > 0 {
                     format!(
                         r#"<a class="nd-btn-secondary nd-btn-sm" href="/projects/{}/documentation">{} pages</a>"#,
@@ -6473,13 +6237,12 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
                     )
                 };
                 format!(
-                    "<tr><td><strong>{}</strong><div class=\"nd-text-xs nd-text-muted\">{}</div></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    "<tr><td><strong>{}</strong><div class=\"nd-text-xs nd-text-muted\">{}</div></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                     he(&p.ident),
-                    he(p.repo_full_name.as_deref().unwrap_or(&p.channel_name)),
+                    he(p.repo_full_name.as_deref().unwrap_or("no repository")),
                     work_cell,
                     messages_cell,
                     docs_cell,
-                    build_cell,
                     memories_cell,
                 )
             })
@@ -6505,7 +6268,7 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
     <div class="nd-card-header"><strong>Attention queue</strong></div>
     <div class="nd-card-body nd-p-0">
       <table class="nd-table nd-table-hover">
-        <thead><tr><th>Project</th><th>Work</th><th>Messages</th><th>Documentation</th><th>Build</th><th>Memory</th></tr></thead>
+        <thead><tr><th>Project</th><th>Work</th><th>Messages</th><th>Documentation</th><th>Memory</th></tr></thead>
         <tbody>{rows}</tbody>
       </table>
     </div>
@@ -6925,7 +6688,6 @@ pub async fn api_docs_page(
     <a class="nd-btn-secondary nd-btn-sm" href="/documentation">All documentation</a>
     <a class="nd-btn-secondary nd-btn-sm" href="/">Dashboard</a>
     <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/tasks">Tasks</a>
-    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/build">Build</a>
   </div>
 
   <section class="nd-card nd-mb-lg">
@@ -7767,86 +7529,53 @@ pub async fn artifact_detail_page(
 
 pub async fn settings_page(State(state): State<AppState>) -> Result<Html<String>> {
     let db = state.db.clone();
-    let (theme, servers, projects) = spawn_blocking(move || -> anyhow::Result<_> {
+    let (theme, projects) = spawn_blocking(move || -> anyhow::Result<_> {
         let conn = db.lock().unwrap();
         Ok((
             db::get_theme(&conn)?,
-            load_eventic_servers(&conn)?,
-            db::list_project_stats(&conn)?,
+            db::list_project_stats_filtered(&conn, true)?,
         ))
     })
     .await??;
 
-    let mut eventic_projects = Vec::new();
-    for server in servers.iter().filter(|s| s.enabled) {
-        if let Ok(projects) = fetch_eventic_projects(server).await {
-            eventic_projects.extend(projects);
-        }
-    }
-    eventic_projects.sort();
-    eventic_projects.dedup();
-
-    let server_rows = if servers.is_empty() {
-        r#"<tr><td colspan="5" class="nd-text-muted nd-text-center">No Eventic servers configured.</td></tr>"#.to_string()
-    } else {
-        servers
-            .iter()
-            .map(|s| {
-                let enabled_true = if s.enabled { " selected" } else { "" };
-                let enabled_false = if s.enabled { "" } else { " selected" };
-                format!(
-                    r#"<tr>
-  <td class="nd-text-muted">{id}</td>
-  <td colspan="3">
-    <form class="settings-inline-form" data-nd-action="PATCH /v1/eventic/servers/{id}" data-nd-success="reload">
-      <input type="hidden" name="id" value="{id}">
-      <input name="name" value="{name}" aria-label="Server name" required>
-      <input name="base_url" value="{base_url}" aria-label="Base URL" required>
-      <select name="enabled" aria-label="Enabled">
-        <option value="true"{enabled_true}>enabled</option>
-        <option value="false"{enabled_false}>disabled</option>
-      </select>
-      <button type="submit" class="nd-btn-primary nd-btn-sm">Save</button>
-    </form>
-  </td>
-  <td><button type="button" class="nd-btn-danger nd-btn-sm" data-nd-action="DELETE /v1/eventic/servers/{id}" data-nd-success="reload">Delete</button></td>
-</tr>"#,
-                    id = he(&s.id),
-                    name = he(&s.name),
-                    base_url = he(&s.base_url),
-                    enabled_true = enabled_true,
-                    enabled_false = enabled_false,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-
     let project_rows = if projects.is_empty() {
-        r#"<tr><td colspan="6" class="nd-text-muted nd-text-center">No projects registered yet.</td></tr>"#.to_string()
+        r#"<tr><td colspan="4" class="nd-text-muted nd-text-center">No projects registered yet.</td></tr>"#.to_string()
     } else {
         projects
             .iter()
             .map(|p| {
                 let provider = p.repo_provider.as_deref().unwrap_or("github");
                 let namespace = p.repo_namespace.as_deref().unwrap_or("");
-                let repo_name = p.repo_name.as_deref().unwrap_or(&p.ident);
-                let mapped = p
-                    .repo_full_name
-                    .as_ref()
-                    .map(|r| {
-                        if eventic_projects.iter().any(|candidate| candidate == r) {
-                            format!(r#"<span class="nd-badge nd-badge-sm">{}</span>"#, he(r))
-                        } else {
-                            format!(r#"<span class="nd-text-muted">{}</span>"#, he(r))
-                        }
-                    })
-                    .unwrap_or_else(|| r#"<span class="nd-text-muted">unmapped</span>"#.into());
+                let repo_name = p.repo_name.as_deref().unwrap_or("");
+                let archived = p.archived_at.is_some();
+                let state_badge = if archived {
+                    r#"<span class="nd-badge nd-badge-sm">archived</span>"#
+                } else if p.kind == db::PROJECT_KIND_ADHOC {
+                    r#"<span class="nd-badge nd-badge-sm nd-text-muted">adhoc</span>"#
+                } else {
+                    r#"<span class="nd-badge nd-badge-sm">repo</span>"#
+                };
+                let remote = p
+                    .canonical_remote
+                    .as_deref()
+                    .map(|r| format!(r#"<div class="nd-text-xs nd-text-muted">{}</div>"#, he(r)))
+                    .unwrap_or_default();
+                let lifecycle = if archived {
+                    format!(
+                        r#"<button type="button" class="nd-btn-secondary nd-btn-sm" data-nd-action="POST /v1/projects/{ident}/restore" data-nd-success="reload">Restore</button>"#,
+                        ident = he(&p.ident)
+                    )
+                } else {
+                    format!(
+                        r#"<button type="button" class="nd-btn-ghost nd-btn-sm" data-nd-action="POST /v1/projects/{ident}/archive" data-nd-success="reload">Archive</button>"#,
+                        ident = he(&p.ident)
+                    )
+                };
                 format!(
-                    r#"<tr>
-  <td><strong>{ident}</strong></td>
-  <td>{mapped}</td>
-  <td colspan="4">
+                    r#"<tr{row_class}>
+  <td><strong>{ident}</strong>{remote}</td>
+  <td>{state_badge}</td>
+  <td>
     <form class="settings-inline-form" data-nd-action="PATCH /v1/projects/{ident}/repo" data-nd-success="reload">
       <select name="provider" aria-label="Provider">
         <option value="github"{github_selected}>github</option>
@@ -7854,19 +7583,22 @@ pub async fn settings_page(State(state): State<AppState>) -> Result<Html<String>
         <option value="bitbucket"{bitbucket_selected}>bitbucket</option>
       </select>
       <input name="namespace" value="{namespace}" placeholder="namespace" aria-label="Namespace">
-      <input name="repo_name" value="{repo_name}" placeholder="repo" aria-label="Repository">
+      <input name="repo_name" value="{repo_name}" placeholder="repository" aria-label="Repository">
       <button type="submit" class="nd-btn-primary nd-btn-sm">Save</button>
-      <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/build">Build</a>
     </form>
   </td>
+  <td>{lifecycle}</td>
 </tr>"#,
+                    row_class = if archived { r#" class="nd-text-muted""# } else { "" },
                     ident = he(&p.ident),
-                    mapped = mapped,
+                    remote = remote,
+                    state_badge = state_badge,
                     namespace = he(namespace),
                     repo_name = he(repo_name),
                     github_selected = if provider == "github" { " selected" } else { "" },
                     gitlab_selected = if provider == "gitlab" { " selected" } else { "" },
                     bitbucket_selected = if provider == "bitbucket" { " selected" } else { "" },
+                    lifecycle = lifecycle,
                 )
             })
             .collect::<Vec<_>>()
@@ -7874,44 +7606,16 @@ pub async fn settings_page(State(state): State<AppState>) -> Result<Html<String>
     };
 
     let content = format!(
-        r#"  <section class="nd-card nd-mb-lg">
-    <div class="nd-card-header"><strong>Eventic Servers</strong></div>
+        r#"  <section class="nd-card">
+    <div class="nd-card-header"><strong>Projects</strong></div>
     <div class="nd-card-body">
-      <form class="settings-inline-form nd-mb-md" data-nd-action="POST /v1/eventic/servers" data-nd-success="reload">
-        <input name="name" value="Local Eventic" aria-label="Server name" required>
-        <input name="base_url" value="http://127.0.0.1:16384" aria-label="Base URL" required>
-        <select name="enabled" aria-label="Enabled">
-          <option value="true" selected>enabled</option>
-          <option value="false">disabled</option>
-        </select>
-        <button type="submit" class="nd-btn-primary nd-btn-sm">Add server</button>
-      </form>
+      <p class="nd-text-sm nd-text-muted nd-mb-md">Repository mappings are filled automatically when a client registers a project from a git remote. Edit a row only to correct a mapping; leave both fields blank to clear it. Archived projects keep their data and URLs but leave the default lists.</p>
       <table class="nd-table nd-table-hover">
-        <thead><tr><th>ID</th><th colspan="3">Server</th><th></th></tr></thead>
-        <tbody>{server_rows}</tbody>
-      </table>
-    </div>
-  </section>
-
-  <section class="nd-card">
-    <div class="nd-card-header"><strong>Repository Mapping</strong></div>
-    <div class="nd-card-body">
-      <form class="settings-inline-form nd-mb-md" data-nd-action="POST /v1/projects/repo-mappings/bulk" data-nd-success="reload">
-        <select name="provider" aria-label="Provider">
-          <option value="github" selected>github</option>
-          <option value="gitlab">gitlab</option>
-          <option value="bitbucket">bitbucket</option>
-        </select>
-        <input name="namespace" placeholder="namespace" aria-label="Namespace" required>
-        <button type="submit" class="nd-btn-secondary nd-btn-sm">Fill unmapped legacy projects</button>
-      </form>
-      <table class="nd-table nd-table-hover">
-        <thead><tr><th>Project</th><th>Current mapping</th><th colspan="4">Repository</th></tr></thead>
+        <thead><tr><th>Project</th><th>Kind</th><th>Repository</th><th></th></tr></thead>
         <tbody>{project_rows}</tbody>
       </table>
     </div>
   </section>"#,
-        server_rows = server_rows,
         project_rows = project_rows,
     );
 
@@ -7929,137 +7633,12 @@ pub async fn settings_page(State(state): State<AppState>) -> Result<Html<String>
 }
 .settings-inline-form input,
 .settings-inline-form select {
-  min-width: 10rem;
-  max-width: 18rem;
+  min-width: 8rem;
+  max-width: 16rem;
 }
 </style>"#,
         ),
         open = control_panel_open("Settings", "settings"),
-        content = content,
-        close = control_panel_close(),
-    );
-    Ok(Html(html))
-}
-
-pub async fn project_build_page(
-    State(state): State<AppState>,
-    Path(ident): Path<String>,
-) -> Result<Html<String>> {
-    let db = state.db.clone();
-    let (theme, project, servers) = spawn_blocking(move || -> anyhow::Result<_> {
-        let conn = db.lock().unwrap();
-        let project = db::get_project(&conn, &ident)?
-            .ok_or_else(|| anyhow::anyhow!("project '{ident}' not found"))?;
-        Ok((db::get_theme(&conn)?, project, load_eventic_servers(&conn)?))
-    })
-    .await??;
-
-    let mut hint = None;
-    let mut server_name = String::new();
-    let mut status = None;
-    if let Some(repo) = project.repo_full_name.as_deref() {
-        for server in servers.iter().filter(|s| s.enabled) {
-            match fetch_eventic_project_status(server, repo).await {
-                Ok(value) => {
-                    server_name = server.name.clone();
-                    status = Some(value);
-                    break;
-                }
-                Err(err) => {
-                    hint = Some(format!("{}: {err:#}", server.name));
-                }
-            }
-        }
-        if status.is_none() && hint.is_none() {
-            hint = Some("No enabled Eventic server returned status for this repository.".into());
-        }
-    } else {
-        hint = Some(
-            "No repository mapping is configured for this project. Add one in Settings.".into(),
-        );
-    }
-
-    let summary = status
-        .as_ref()
-        .map(|value: &Value| {
-            let state = value
-                .get("state")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            let hash = value.get("hash").and_then(Value::as_str).unwrap_or("");
-            let event = value.get("event").and_then(Value::as_str).unwrap_or("");
-            let action = value.get("action").and_then(Value::as_str).unwrap_or("");
-            format!(
-                r#"<div class="nd-alert nd-alert-info">
-  <strong>{state}</strong> {event}.{action} <span class="nd-text-muted">{hash}</span>
-</div>"#,
-                state = he(state),
-                event = he(event),
-                action = he(action),
-                hash = he(hash),
-            )
-        })
-        .unwrap_or_default();
-    let latest_output = status
-        .as_ref()
-        .and_then(|value: &Value| value.get("latest_output"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let raw_json = status
-        .as_ref()
-        .map(|value| serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".into()))
-        .unwrap_or_else(|| "{}".into());
-    let hint_html = hint
-        .map(|h| format!(r#"<div class="nd-alert nd-alert-warning">{}</div>"#, he(&h)))
-        .unwrap_or_default();
-
-    let content = format!(
-        r#"  <div class="nd-flex nd-gap-md nd-mb-md">
-    <a class="nd-btn-ghost nd-btn-sm" href="/">Back to dashboard</a>
-    <a class="nd-btn-secondary nd-btn-sm" href="/settings">Settings</a>
-  </div>
-  <p class="nd-text-muted nd-text-sm">Repository: {repo} {server}</p>
-  {hint}
-  {summary}
-  <section class="nd-card nd-mb-lg">
-    <div class="nd-card-header"><strong>Latest output</strong></div>
-    <div class="nd-card-body"><pre class="nd-text-sm build-output">{latest_output}</pre></div>
-  </section>
-  <section class="nd-card">
-    <div class="nd-card-header"><strong>Raw Eventic status</strong></div>
-    <div class="nd-card-body"><pre class="nd-text-sm build-output">{raw_json}</pre></div>
-  </section>"#,
-        repo = project
-            .repo_full_name
-            .as_deref()
-            .map(he)
-            .unwrap_or_else(|| "unmapped".into()),
-        server = if server_name.is_empty() {
-            String::new()
-        } else {
-            format!("via {}", he(&server_name))
-        },
-        hint = hint_html,
-        summary = summary,
-        latest_output = he(latest_output),
-        raw_json = he(&raw_json),
-    );
-
-    let page_title = format!("Build - {}", project.ident);
-    let html = format!(
-        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
-        head = control_panel_head(
-            &page_title,
-            &theme,
-            r#"<style>
-.build-output {
-  overflow: auto;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-</style>"#,
-        ),
-        open = control_panel_open(&page_title, "dashboard"),
         content = content,
         close = control_panel_close(),
     );
@@ -10736,6 +10315,7 @@ pub async fn reply_to_message(
             )
         })?
         .clone();
+    let room_id = ensure_project_room(&state, &ident, plugin.as_ref(), room_id).await?;
 
     let body_text = req.body.or(req.content).unwrap_or_default();
     if body_text.trim().is_empty() {
@@ -10850,6 +10430,7 @@ pub async fn taking_action_on(
             )
         })?
         .clone();
+    let room_id = ensure_project_room(&state, &ident, plugin.as_ref(), room_id).await?;
 
     let body_text = req.body.or(req.message).unwrap_or_default();
     if body_text.trim().is_empty() {
@@ -11228,6 +10809,75 @@ mod tests {
         assert!(!html.contains("test-key"));
     }
 
+    #[tokio::test]
+    async fn register_project_without_remote_is_adhoc_and_creates_no_room() {
+        let state = test_state();
+        let Json(resp) = register_project(
+            State(state.clone()),
+            Json(RegisterProjectRequest {
+                ident: "/home/someone/tmp".into(),
+                channel: None,
+                repo_url: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.ident, "tmp");
+        assert_eq!(resp.kind, db::PROJECT_KIND_ADHOC);
+        assert_eq!(resp.room_id, "");
+        assert!(resp.repo_full_name.is_none());
+
+        // Re-registering with the remote heals the mapping without a plugin.
+        let Json(healed) = register_project(
+            State(state),
+            Json(RegisterProjectRequest {
+                ident: "tmp".into(),
+                channel: None,
+                repo_url: Some("git@github.com:nitecon/tmp.git".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(healed.kind, db::PROJECT_KIND_REPO);
+        assert_eq!(healed.repo_full_name.as_deref(), Some("nitecon/tmp"));
+    }
+
+    #[tokio::test]
+    async fn archive_and_restore_toggle_default_listing() {
+        let state = test_state();
+        let Json(archived) = archive_project(State(state.clone()), Path("demo".into()))
+            .await
+            .unwrap();
+        assert!(archived.archived_at.is_some());
+        {
+            let conn = state.db.lock().unwrap();
+            assert!(db::list_project_stats(&conn).unwrap().is_empty());
+            assert_eq!(
+                db::list_project_stats_filtered(&conn, true).unwrap().len(),
+                1
+            );
+        }
+        let Json(restored) = restore_project(State(state.clone()), Path("demo".into()))
+            .await
+            .unwrap();
+        assert!(restored.archived_at.is_none());
+        let conn = state.db.lock().unwrap();
+        assert_eq!(db::list_project_stats(&conn).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn settings_page_lists_archived_projects_and_no_eventic() {
+        let state = test_state();
+        let _ = archive_project(State(state.clone()), Path("demo".into()))
+            .await
+            .unwrap();
+        let Html(html) = settings_page(State(state)).await.unwrap();
+        assert!(html.contains("archived"));
+        assert!(html.contains(r#"data-nd-action="POST /v1/projects/demo/restore""#));
+        assert!(!html.contains("Eventic"));
+        assert!(!html.contains("/build"));
+    }
+
     #[test]
     fn control_panel_nav_exposes_documentation() {
         let html = control_panel_open("Documentation", "documentation");
@@ -11268,6 +10918,9 @@ mod tests {
                     repo_namespace: None,
                     repo_name: None,
                     repo_full_name: None,
+                    kind: db::PROJECT_KIND_REPO.to_string(),
+                    archived_at: None,
+                    canonical_remote: None,
                 },
             )
             .unwrap();
@@ -12783,6 +12436,9 @@ mod tests {
                     repo_namespace: None,
                     repo_name: None,
                     repo_full_name: None,
+                    kind: db::PROJECT_KIND_REPO.to_string(),
+                    archived_at: None,
+                    canonical_remote: None,
                 },
             )
             .unwrap();

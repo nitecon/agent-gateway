@@ -75,7 +75,6 @@ An artifact is a durable, project-scoped body of work.
 Examples:
 
 - "Gateway Artifact System Design Review"
-- "Eventic Build Status Spec"
 - "Agent Tools Task API Documentation"
 - "Skill Sync Canonical Transform Decision"
 

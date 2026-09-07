@@ -65,7 +65,7 @@ Binary: `target/release/gateway`
 ## Prerequisites
 
 - The gateway reachable from all machines running agent clients (LAN, VPN, or public host)
-- A Discord account and server you control only if you want Discord-backed comms. Without Discord credentials, the gateway still starts and serves API/UI/Eventic routes, but channel send/receive is unavailable.
+- A Discord account and server you control only if you want Discord-backed comms. Without Discord credentials, the gateway still starts and serves the API and UI, but channel send/receive is unavailable.
 
 ---
 
@@ -186,7 +186,10 @@ The API context is the canonical agent handoff surface for artifact workflows. I
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/v1/projects` | Register a project. Creates the channel if needed. Idempotent. Body: `{"ident": "...", "channel": "discord"}` |
+| `POST` | `/v1/projects` | Register a project. Idempotent. Body: `{"ident": "...", "channel": "discord", "repo_url": "github.com/org/repo.git"}`. With `repo_url` the project is a `repo` project: its repository mapping is derived from the remote and its channel room is created immediately. Without it the project is `adhoc`: no room is created until the first message is sent. Re-registering an unmapped project with `repo_url` fills in the mapping. |
+| `POST` | `/v1/projects/:ident/archive` | Hide a project from default listings (data and URLs stay). |
+| `POST` | `/v1/projects/:ident/restore` | Undo archive. |
+| `PATCH` | `/v1/projects/:ident/repo` | Correct a project's repository mapping. Body: `{provider, namespace, repo_name}`; namespace and repo_name must be given together, both blank clears the mapping. |
 | `POST` | `/v1/projects/:ident/messages` | Send an agent message. Body: message envelope (see below). |
 | `GET` | `/v1/projects/:ident/messages/unread` | Get unread messages for this agent. |
 | `POST` | `/v1/projects/:ident/messages/:id/confirm` | Confirm (acknowledge) a message for this agent. |
@@ -453,33 +456,24 @@ Pattern comments are intentionally opt-in. Normal pattern pulls should use
 `GET /v1/patterns/:id`; comments are collaboration/review state and should only
 be fetched when a user asks an agent to address comments on that pattern.
 
-### Eventic build status
+### Project registry
 
-Gateway can proxy client-local Eventic build information when Eventic web
-consoles are configured under `/settings`. Projects keep their existing short
-gateway identity (for example `eventic`) and can also store provider-aware repo
-metadata (`github`, `gitlab`, `bitbucket`, etc. plus `namespace/repo`) for
-matching Eventic's `/projects` output.
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/v1/eventic/servers` | List configured Eventic server entries. |
-| `POST` | `/v1/eventic/servers` | Add a server. Body: `{name, base_url, enabled}`. Defaults usually point at `http://127.0.0.1:16384`. |
-| `PUT` | `/v1/eventic/servers` | Replace the full server list. |
-| `PATCH` | `/v1/eventic/servers/:id` | Update one configured server. |
-| `DELETE` | `/v1/eventic/servers/:id` | Remove one configured server. |
-| `GET` | `/v1/eventic/projects` | Aggregate `/projects` from enabled Eventic servers. |
-| `PATCH` | `/v1/projects/:ident/repo` | Set a project's repo mapping. Body: `{provider, namespace, repo_name}`. |
-| `POST` | `/v1/projects/repo-mappings/bulk` | Fill unmapped legacy projects with one provider/namespace and `repo_name = ident`. |
-| `GET` | `/v1/projects/:ident/eventic` | Return the mapped project's current Eventic status or an actionable hint when mapping/server config is missing. |
+Projects are identified by a short ident (the repository or directory name).
+When a client registers with `repo_url`, the gateway derives `repo_provider`
+(`github`, `gitlab`, `bitbucket`, or the bare host for self-hosted remotes),
+`repo_namespace`, `repo_name`, and `repo_full_name`, and records the normalized
+`canonical_remote`. Projects registered from a bare directory are `adhoc`, get
+no channel room until they first send a message, and can be archived from
+`/settings`. There is no CI integration; link out to your own CI from the
+project instead.
 
 ### Dashboard
 
-`GET /` -- no auth required. HTML page showing project counts, message stats, skill inventory, and build-status links for repo-mapped projects.
+All HTML pages require a browser session (`/login`, see `GATEWAY_UI_AUTH`).
 
-`GET /settings` -- no auth required. HTML settings page for Eventic server configuration and bulk repository mapping.
+`GET /` -- HTML page showing project counts, message stats, and per-project task, documentation, and memory links.
 
-`GET /projects/:ident/build` -- no auth required. HTML build-status page backed by Eventic project output.
+`GET /settings` -- HTML project registry: kind, repository mapping, archive/restore.
 
 ---
 
