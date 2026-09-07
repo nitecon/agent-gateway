@@ -1,7 +1,42 @@
 # Gateway UI Redesign Plan
 
-Status: proposal (2026-09-06). Companion to `gateway-features.md`, which owns the
-artifact substrate. This document owns the human-facing control panel.
+Status: implemented on branch `ui-redesign` (2026-09-07). Companion to
+`gateway-features.md`, which owns the artifact substrate. This document owns
+the human-facing control panel.
+
+## Implementation Status
+
+Shipped (see the commit series on `ui-redesign`):
+
+- Phase 0: session-cookie login for pages (`/login`, `GATEWAY_UI_AUTH`), API
+  key no longer embedded in pages, "unanswered" derived from agent
+  confirmations, Discord author classification (`author_kind`), retention
+  that actually purges. API key rotation was declined by the owner.
+- Phase 1: Eventic/build removed; `repo_url` on registration derives the
+  repository mapping; `kind` (repo/adhoc), `archived_at`, `canonical_remote`;
+  adhoc projects create no channel room until first send; archive/restore.
+  agent-tools sends `canonical_ident` and re-registers once (marker v2).
+- Phase 2: askama shell (Work / Library / Gateway sidebar, breadcrumb,
+  project tab strip), Home inbox, `/projects` registry, project overview and
+  settings, gateway settings, message resolve/reopen/bulk, project links.
+- Phase 3: `/projects/:ident/inbox` with thread list, thread pane, composer
+  posting to the channel, alerts filter, bulk resolve; thread list and
+  thread APIs; `agent-tools comms list|resolve`.
+- Phase 4: `/activity`, cross-project `/tasks` list, canonical task detail
+  route with `/task-link` redirect, artifact section anchors.
+- Phase 5 (partial): live refresh on Home, Activity, Inbox (page diff +
+  reload, opt-in per page), keyboard navigation (`g h/a/p/t/s`, `j/k`,
+  Enter, `r`, `e`, `?`), empty states with CLI hints.
+
+Deferred, in priority order:
+
+1. Server-Sent Events instead of polling for live pages.
+2. Moving the remaining `format!`-rendered pages (documentation, memories,
+   artifacts, patterns, skills/commands/agents, task board) out of
+   `routes.rs` into `ui/` templates. They already render inside the new shell.
+3. Command palette for project switching.
+4. Reclassifying pre-existing Discord rows as bot/webhook (the Discord author
+   id was never stored; new rows are classified on ingest).
 
 ## Summary
 

@@ -20,7 +20,7 @@
       <thead><tr><th>Task</th><th>Project</th><th>Status</th><th>Owner</th><th>Updated</th><th>Comments</th></tr></thead>
       <tbody>
         {% for t in rows %}
-        <tr>
+        <tr data-gw-nav>
           <td>
             <a href="/projects/{{ t.project_ident }}/tasks/{{ t.id }}"><strong>{{ t.title }}</strong></a>
             {% if t.kind == "delegated" %}<span class="gw-chip gw-chip-warn">delegated</span>{% endif %}

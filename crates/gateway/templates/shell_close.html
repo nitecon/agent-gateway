@@ -1,6 +1,19 @@
     </main>
   </div>
 </div>
+<div class="gw-help" id="gw-help" hidden>
+  <div class="nd-card"><div class="nd-card-header"><strong>Keyboard shortcuts</strong></div>
+  <div class="nd-card-body">
+    <dl class="gw-kv">
+      <dt>g h / g a / g p / g t / g s</dt><dd>Home · Activity · Projects · Tasks · Settings</dd>
+      <dt>j / k</dt><dd>Move selection down / up</dd>
+      <dt>Enter</dt><dd>Open the selected item</dd>
+      <dt>r</dt><dd>Focus the reply box</dd>
+      <dt>e</dt><dd>Resolve the selected thread</dd>
+      <dt>?</dt><dd>Toggle this help</dd>
+    </dl>
+  </div></div>
+</div>
 <script src="{{ ndesign_base }}/ndesign.min.js"></script>
 <script>
 NDesign.configure({ headers: { 'X-Gateway-UI': '1' } });
@@ -13,6 +26,82 @@ document.addEventListener('nd:theme-change', (e) => {
     body: JSON.stringify({ theme })
   }).catch(() => {});
 });
+(() => {
+  // ── Live refresh: pages opt in with <meta name="gw-live" content="seconds">.
+  const live = document.querySelector('meta[name="gw-live"]');
+  if (live) {
+    const seconds = Math.max(10, parseInt(live.content, 10) || 30);
+    const dirty = () => {
+      const el = document.activeElement;
+      if (el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT' || el.tagName === 'SELECT')) return true;
+      return Array.from(document.querySelectorAll('textarea')).some(t => t.value.trim().length > 0);
+    };
+    const tick = async () => {
+      if (document.hidden || dirty()) return;
+      try {
+        const res = await fetch(location.href, { headers: { 'X-Gateway-UI': '1' }, credentials: 'same-origin' });
+        if (!res.ok) return;
+        const html = await res.text();
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const next = doc.querySelector('main.app-content');
+        const cur = document.querySelector('main.app-content');
+        if (next && cur && next.innerHTML !== cur.innerHTML) location.reload();
+      } catch (_) { /* offline or auth expired; try again next tick */ }
+    };
+    setInterval(tick, seconds * 1000);
+  }
+
+  // ── Keyboard navigation over [data-gw-nav] items.
+  const items = () => Array.from(document.querySelectorAll('[data-gw-nav]'));
+  let index = -1;
+  const select = (i) => {
+    const list = items();
+    if (!list.length) return;
+    index = Math.max(0, Math.min(list.length - 1, i));
+    list.forEach((el, n) => el.classList.toggle('gw-nav-active', n === index));
+    list[index].scrollIntoView({ block: 'nearest' });
+  };
+  const current = () => { const list = items(); return index >= 0 && index < list.length ? list[index] : null; };
+  const editing = () => {
+    const el = document.activeElement;
+    return el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT' || el.tagName === 'SELECT' || el.isContentEditable);
+  };
+  let pendingG = false;
+  document.addEventListener('keydown', (e) => {
+    if (editing() || e.metaKey || e.ctrlKey || e.altKey) return;
+    const help = document.getElementById('gw-help');
+    if (e.key === '?') { help.hidden = !help.hidden; e.preventDefault(); return; }
+    if (e.key === 'Escape' && help && !help.hidden) { help.hidden = true; return; }
+    if (pendingG) {
+      pendingG = false;
+      const go = { h: '/', a: '/activity', p: '/projects', t: '/tasks', s: '/settings' }[e.key];
+      if (go) { location.href = go; e.preventDefault(); }
+      return;
+    }
+    switch (e.key) {
+      case 'g': pendingG = true; setTimeout(() => { pendingG = false; }, 1200); return;
+      case 'j': select(index + 1); e.preventDefault(); return;
+      case 'k': select(index - 1); e.preventDefault(); return;
+      case 'Enter': {
+        const el = current();
+        const a = el && (el.matches('a') ? el : el.querySelector('a[href]'));
+        if (a) { location.href = a.href; e.preventDefault(); }
+        return;
+      }
+      case 'r': {
+        const box = document.querySelector('.gw-composer textarea');
+        if (box) { box.focus(); e.preventDefault(); }
+        return;
+      }
+      case 'e': {
+        const el = current() || document;
+        const btn = el.querySelector('[data-nd-action$="/resolve"]') || document.querySelector('.gw-inbox-thread [data-nd-action$="/resolve"]');
+        if (btn) { btn.click(); e.preventDefault(); }
+        return;
+      }
+    }
+  });
+})();
 </script>
 </body>
 </html>

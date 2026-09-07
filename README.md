@@ -467,13 +467,28 @@ no channel room until they first send a message, and can be archived from
 `/settings`. There is no CI integration; link out to your own CI from the
 project instead.
 
-### Dashboard
+### Control panel
 
-All HTML pages require a browser session (`/login`, see `GATEWAY_UI_AUTH`).
+All HTML pages require a browser session: `/login` accepts the gateway API key
+once and sets an HttpOnly cookie (`GATEWAY_UI_AUTH=off` disables the login for
+loopback-only hosts). Pages never embed the API key.
 
-`GET /` -- HTML page showing project counts, message stats, and per-project task, documentation, and memory links.
+| Page | What it is for |
+|------|----------------|
+| `/` | Home inbox: what needs a human (latest agent updates, unacknowledged questions, stalled tasks, artifacts awaiting a decision), agents at work, recent activity. Every row has an Open and, where it applies, a Resolve action. |
+| `/activity` | Agents seen in the last 24 hours with their current task, plus the latest events across projects. |
+| `/projects` | Project registry: kind (repo/adhoc), channel room, open inbox items, tasks, last activity, archive/restore. Filter by state and kind. |
+| `/projects/:ident` | Project overview: inbox counts, in-progress tasks, recent artifacts, links, agents, activity. |
+| `/projects/:ident/inbox` | Threaded conversation view: filter by author kind (conversation, humans, agents, alerts, system) and state; read a thread; reply from the browser (posted to the channel and to every agent's unread queue); resolve one or many threads. |
+| `/projects/:ident/tasks` | Kanban board; `/tasks` is the cross-project list and `/projects/:ident/tasks/:id` the task detail. `/task-link/:prefix` redirects to the detail page. |
+| `/projects/:ident/artifacts`, `/documentation`, `/memories` | Existing artifact, documentation, and memory views inside the project tab strip. |
+| `/projects/:ident/settings` | Identity, repository mapping, channel room, external links (CI, runbooks), archive. |
+| `/patterns`, `/skills`, `/commands`, `/agents` | Library pages (unchanged). |
+| `/settings` | Gateway-level: version, login state, channel plugins, retention windows, theme. |
 
-`GET /settings` -- HTML project registry: kind, repository mapping, archive/restore.
+Keyboard: `g h/a/p/t/s` jumps between sections, `j`/`k` move the selection,
+Enter opens it, `r` focuses the reply box, `e` resolves, `?` shows the help
+overlay. Home, Activity, and the Inbox refresh themselves while idle.
 
 ---
 

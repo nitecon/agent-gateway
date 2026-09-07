@@ -115,7 +115,13 @@ pub async fn home_page(State(state): State<AppState>) -> Result<Html<String>> {
     .await??;
     let _ = theme(&state).await;
     let update_available = state.update_available.lock().unwrap().clone();
-    let chrome = PageChrome::global("agent-gateway — Home", "Home", "home", &theme_name, "");
+    let chrome = PageChrome::global(
+        "agent-gateway — Home",
+        "Home",
+        "home",
+        &theme_name,
+        &super::live_meta(30),
+    );
     render(&HomeTemplate {
         head: chrome.head,
         shell_open: chrome.shell_open,

@@ -71,6 +71,11 @@ pub fn fmt_datetime(at_ms: i64) -> String {
         .unwrap_or_default()
 }
 
+/// `<head>` extra that turns on live refresh every `seconds` seconds.
+pub(crate) fn live_meta(seconds: u32) -> String {
+    format!(r#"<meta name="gw-live" content="{seconds}">"#)
+}
+
 /// Base fields every templated page needs.
 pub(crate) struct PageChrome {
     pub head: String,

@@ -42,6 +42,9 @@ pub const GATEWAY_CSS: &str = r#"<style>
 .gw-kv dt { opacity: 0.7; }
 .gw-kv dd { margin: 0; overflow-wrap: anywhere; }
 .gw-muted { opacity: 0.7; }
+.gw-nav-active { outline: 2px solid var(--nd-primary, #2563eb); outline-offset: -2px; border-radius: 0.25rem; }
+.gw-help { position: fixed; inset: auto 1rem 1rem auto; z-index: 50; max-width: 24rem; }
+.gw-help .nd-card { box-shadow: 0 10px 30px rgba(0,0,0,.3); }
 @media (max-width: 640px) {
   .gw-list > li { grid-template-columns: 1fr; }
   .gw-list .gw-item-actions { justify-content: flex-start; }
@@ -234,5 +237,7 @@ mod tests {
         let close = control_panel_close();
         assert!(!close.contains("Bearer"));
         assert!(close.contains("'X-Gateway-UI': '1'"));
+        assert!(close.contains("gw-live"));
+        assert!(close.contains("data-gw-nav"));
     }
 }

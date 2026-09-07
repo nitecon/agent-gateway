@@ -36,7 +36,7 @@
       {% else %}
       <ul class="gw-list gw-threads">
         {% for t in threads %}
-        <li{% if t.selected %} class="gw-thread-selected"{% endif %}>
+        <li data-gw-nav{% if t.selected %} class="gw-thread-selected"{% endif %}>
           <a class="gw-thread-link" href="/projects/{{ ident }}/inbox?kind={{ kind_filter }}&state={{ state_filter }}&thread={{ t.id }}">
             <div class="gw-item-title">
               <span class="gw-chip {{ t.state_class }}">{{ t.state }}</span>

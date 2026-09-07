@@ -65,7 +65,7 @@ pub async fn activity_page(
         "Activity",
         "activity",
         &theme,
-        "",
+        &super::live_meta(30),
     );
     render(&ActivityTemplate {
         head: chrome.head,

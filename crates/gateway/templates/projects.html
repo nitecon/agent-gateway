@@ -17,7 +17,7 @@
       <thead><tr><th>Project</th><th>Channel</th><th>Inbox</th><th>Tasks</th><th>Last activity</th><th></th></tr></thead>
       <tbody>
         {% for p in rows %}
-        <tr{% if p.archived %} class="nd-text-muted"{% endif %}>
+        <tr data-gw-nav{% if p.archived %} class="nd-text-muted"{% endif %}>
           <td>
             <a href="/projects/{{ p.ident }}"><strong>{{ p.ident }}</strong></a>
             {% if p.kind == "adhoc" %}<span class="gw-chip gw-chip-warn" title="Registered from a directory name, no repository">adhoc</span>{% endif %}

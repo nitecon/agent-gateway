@@ -40,7 +40,7 @@
       <thead><tr><th>When</th><th>Project</th><th>What</th><th>State</th><th>Who</th></tr></thead>
       <tbody>
         {% for ev in activity %}
-        <tr>
+        <tr data-gw-nav>
           <td class="nd-text-muted nd-text-xs" title="{{ ev.when }}">{{ ev.age }}</td>
           <td><a href="/projects/{{ ev.project_ident }}">{{ ev.project_ident }}</a></td>
           <td><span class="gw-chip">{{ ev.kind }}</span> <a href="{{ ev.href }}">{{ ev.summary }}</a></td>

@@ -287,7 +287,7 @@ pub async fn inbox_page(
         head: super::control_panel_head(
             &format!("agent-gateway — {ident} inbox"),
             &theme,
-            INBOX_CSS,
+            &format!("{}{}", INBOX_CSS, super::live_meta(20)),
         ),
         shell_open: super::control_panel_open_project("Inbox", &ident, "inbox"),
         shell_close: super::control_panel_close(),
