@@ -3916,6 +3916,8 @@ pub struct BulkResolveRequest {
     pub before_ms: Option<i64>,
     /// Restrict to one author kind: human | bot | webhook | agent | system.
     pub author_kind: Option<String>,
+    /// Restrict to several author kinds at once.
+    pub author_kinds: Option<Vec<String>>,
 }
 
 fn resolver_identity(headers: &HeaderMap) -> String {
@@ -3965,17 +3967,283 @@ pub async fn resolve_messages_bulk(
     let req = body.map(|Json(b)| b).unwrap_or_default();
     let by = resolver_identity(&headers);
     let before = req.before_ms.unwrap_or_else(now_ms);
-    let kind = req
-        .author_kind
+    let mut kinds: Vec<String> = req
+        .author_kinds
+        .unwrap_or_default()
+        .into_iter()
         .map(|k| k.trim().to_lowercase())
-        .filter(|k| !k.is_empty());
+        .filter(|k| !k.is_empty())
+        .collect();
+    if let Some(k) = req.author_kind.map(|k| k.trim().to_lowercase()) {
+        if !k.is_empty() {
+            kinds.push(k);
+        }
+    }
     let db = state.db.clone();
     let resolved = spawn_blocking(move || {
         let conn = db.lock().unwrap();
-        db::resolve_messages_before(&conn, &ident, before, kind.as_deref(), &by)
+        let kind_refs: Vec<&str> = kinds.iter().map(String::as_str).collect();
+        db::resolve_messages_before(&conn, &ident, before, &kind_refs, &by)
     })
     .await??;
     Ok(Json(BulkResolveResponse { resolved }))
+}
+
+// ── Inbox API (threads, human composer) ──────────────────────────────────────
+
+#[derive(Deserialize, Default)]
+pub struct ListThreadsQuery {
+    /// open | acknowledged | answered | resolved | unresolved (default) | all
+    pub state: Option<String>,
+    /// Comma-separated author kinds: human,agent,bot,webhook,system
+    pub kind: Option<String>,
+    pub agent_id: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+#[derive(Serialize)]
+pub struct ListThreadsResponse {
+    pub threads: Vec<db::ThreadSummary>,
+    pub counts: db::InboxCounts,
+}
+
+/// GET /v1/projects/:ident/messages — thread list with derived state.
+pub async fn list_message_threads(
+    State(state): State<AppState>,
+    Path(ident): Path<String>,
+    Query(q): Query<ListThreadsQuery>,
+) -> Result<Json<ListThreadsResponse>> {
+    let db = state.db.clone();
+    let kinds: Vec<String> = q
+        .kind
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|k| k.trim().to_lowercase())
+        .filter(|k| !k.is_empty())
+        .collect();
+    let response = spawn_blocking(move || -> anyhow::Result<ListThreadsResponse> {
+        let conn = db.lock().unwrap();
+        if db::get_project(&conn, &ident)?.is_none() {
+            anyhow::bail!("project '{ident}' not found");
+        }
+        let kind_refs: Vec<&str> = kinds.iter().map(String::as_str).collect();
+        let threads = db::list_message_threads(
+            &conn,
+            &ident,
+            &db::ThreadFilter {
+                state: q.state.as_deref(),
+                kinds: &kind_refs,
+                agent_id: q.agent_id.as_deref(),
+                limit: q.limit.unwrap_or(50).min(500),
+                offset: q.offset.unwrap_or(0),
+            },
+        )?;
+        Ok(ListThreadsResponse {
+            threads,
+            counts: db::inbox_counts(&conn, &ident)?,
+        })
+    })
+    .await?
+    .map_err(|e| AppError(StatusCode::NOT_FOUND, format!("{e:#}")))?;
+    Ok(Json(response))
+}
+
+/// GET /v1/projects/:ident/messages/:id/thread
+pub async fn get_message_thread(
+    State(state): State<AppState>,
+    Path((ident, id)): Path<(String, i64)>,
+) -> Result<Json<db::ThreadView>> {
+    let db = state.db.clone();
+    let thread = spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::get_thread(&conn, &ident, id)
+    })
+    .await??
+    .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "message not found".into()))?;
+    Ok(Json(thread))
+}
+
+#[derive(Deserialize)]
+pub struct HumanMessageRequest {
+    pub content: String,
+    /// Thread root to reply to; omitted for a new root message.
+    pub parent_message_id: Option<Value>,
+    /// Display name for the channel post. Defaults to "user".
+    pub author: Option<String>,
+    /// Resolve the thread after posting (form checkbox sends "true"/"on").
+    pub resolve: Option<Value>,
+}
+
+#[derive(Serialize)]
+pub struct HumanMessageResponse {
+    pub message_id: i64,
+    pub parent_message_id: Option<i64>,
+    pub delivered: bool,
+    pub delivery_error: Option<String>,
+}
+
+fn value_as_i64(v: &Value) -> Option<i64> {
+    match v {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+fn value_as_bool(v: &Value) -> bool {
+    match v {
+        Value::Bool(b) => *b,
+        Value::String(s) => matches!(
+            s.trim().to_lowercase().as_str(),
+            "true" | "on" | "1" | "yes"
+        ),
+        Value::Number(n) => n.as_i64().unwrap_or(0) != 0,
+        _ => false,
+    }
+}
+
+/// POST /v1/projects/:ident/messages/human — a human posts from the browser.
+///
+/// The row is stored first (source `user`, author kind `human`) so agents pick
+/// it up on their next poll even if channel delivery fails; delivery to the
+/// project room is attempted afterwards and reported in the response.
+pub async fn post_human_message(
+    State(state): State<AppState>,
+    Path(ident): Path<String>,
+    Json(req): Json<HumanMessageRequest>,
+) -> Result<Json<HumanMessageResponse>> {
+    let content = req.content.trim().to_string();
+    if content.is_empty() {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "content must not be empty".into(),
+        ));
+    }
+    let parent_id = req
+        .parent_message_id
+        .as_ref()
+        .and_then(value_as_i64)
+        .filter(|id| *id > 0);
+    let resolve_after = req.resolve.as_ref().map(value_as_bool).unwrap_or(false);
+    let author = req
+        .author
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+        .unwrap_or_else(|| "user".to_string());
+
+    // Store first.
+    let db = state.db.clone();
+    let ident_for_db = ident.clone();
+    let content_for_db = content.clone();
+    let (project, parent, message_id) = spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = db.lock().unwrap();
+        let project = db::get_project(&conn, &ident_for_db)?
+            .ok_or_else(|| anyhow::anyhow!("project '{ident_for_db}' not found"))?;
+        let parent = match parent_id {
+            Some(pid) => {
+                let p = db::get_message_by_id(&conn, &project.ident, pid)?
+                    .ok_or_else(|| anyhow::anyhow!("parent message {pid} not found"))?;
+                // Always attach to the thread root.
+                match p.parent_message_id {
+                    Some(root) => db::get_message_by_id(&conn, &project.ident, root)?,
+                    None => Some(p),
+                }
+            }
+            None => None,
+        };
+        let message_id = db::insert_message(
+            &conn,
+            &Message {
+                id: 0,
+                project_ident: project.ident.clone(),
+                source: "user".into(),
+                external_message_id: None,
+                content: content_for_db,
+                sent_at: now_ms(),
+                confirmed_at: None,
+                parent_message_id: parent.as_ref().map(|p| p.id),
+                agent_id: None,
+                message_type: if parent.is_some() {
+                    "reply".into()
+                } else {
+                    "message".into()
+                },
+                subject: None,
+                hostname: None,
+                event_at: None,
+                deliver_to_agents: true,
+                author_kind: Some("human".into()),
+                resolved_at: None,
+                resolved_by: None,
+            },
+        )?;
+        if resolve_after {
+            if let Some(root) = parent.as_ref() {
+                db::resolve_message(&conn, &project.ident, root.id, "user")?;
+            }
+        }
+        Ok((project, parent, message_id))
+    })
+    .await?
+    .map_err(|e| AppError(StatusCode::NOT_FOUND, format!("{e:#}")))?;
+
+    // Then deliver to the channel, best effort.
+    let text = format!("**{author}** (via gateway): {content}");
+    let delivery: std::result::Result<String, String> =
+        match state.plugins.get(&project.channel_name) {
+            None => Err(format!(
+                "channel plugin '{}' is not configured",
+                project.channel_name
+            )),
+            Some(plugin) => {
+                let plugin = plugin.clone();
+                match ensure_project_room(
+                    &state,
+                    &project.ident,
+                    plugin.as_ref(),
+                    project.room_id.clone(),
+                )
+                .await
+                {
+                    Err(e) => Err(e.1),
+                    Ok(room_id) => {
+                        let result =
+                            match parent.as_ref().and_then(|p| p.external_message_id.clone()) {
+                                Some(ext) => plugin.reply(&room_id, &ext, &text).await,
+                                None => plugin.send(&room_id, &text).await,
+                            };
+                        result.map_err(|e| format!("{e:#}"))
+                    }
+                }
+            }
+        };
+    let (delivered, delivery_error) = match delivery {
+        Ok(external_id) => {
+            let db = state.db.clone();
+            spawn_blocking(move || {
+                let conn = db.lock().unwrap();
+                conn.execute(
+                    "UPDATE messages SET external_message_id = ?1 WHERE id = ?2",
+                    rusqlite::params![external_id, message_id],
+                )
+            })
+            .await??;
+            (true, None)
+        }
+        Err(e) => {
+            tracing::warn!("human message {message_id} stored but not delivered: {e}");
+            (false, Some(e))
+        }
+    };
+
+    Ok(Json(HumanMessageResponse {
+        message_id,
+        parent_message_id: parent.map(|p| p.id),
+        delivered,
+        delivery_error,
+    }))
 }
 
 // ── Project links + rooms ────────────────────────────────────────────────────
@@ -5061,6 +5329,8 @@ pub async fn send_message(
         event_at: Some(outbound.event_at),
         deliver_to_agents: false,
         author_kind: Some("agent".to_string()),
+        resolved_at: None,
+        resolved_by: None,
     };
 
     let db = state.db.clone();
@@ -8132,6 +8402,8 @@ fn system_nudge(
             event_at: Some(now_ms()),
             deliver_to_agents: true,
             author_kind: Some("system".to_string()),
+            resolved_at: None,
+            resolved_by: None,
         },
     )
 }
@@ -10111,6 +10383,8 @@ pub async fn reply_to_message(
         event_at: Some(outbound.event_at),
         deliver_to_agents: false,
         author_kind: Some("agent".to_string()),
+        resolved_at: None,
+        resolved_by: None,
     };
 
     let db = state.db.clone();
@@ -10226,6 +10500,8 @@ pub async fn taking_action_on(
         event_at: Some(outbound.event_at),
         deliver_to_agents: false,
         author_kind: Some("agent".to_string()),
+        resolved_at: None,
+        resolved_by: None,
     };
 
     let db = state.db.clone();
@@ -10607,6 +10883,107 @@ mod tests {
         assert!(restored.archived_at.is_none());
         let conn = state.db.lock().unwrap();
         assert_eq!(db::list_project_stats(&conn).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn human_message_is_stored_even_when_channel_is_unavailable() {
+        let state = test_state();
+        let Json(first) = post_human_message(
+            State(state.clone()),
+            Path("demo".into()),
+            Json(HumanMessageRequest {
+                content: "Please look at the widget".into(),
+                parent_message_id: None,
+                author: Some("will".into()),
+                resolve: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!first.delivered);
+        assert!(first.delivery_error.is_some());
+        assert!(first.parent_message_id.is_none());
+
+        // Reply into the thread using the form-shaped payload and resolve it.
+        let Json(reply) = post_human_message(
+            State(state.clone()),
+            Path("demo".into()),
+            Json(HumanMessageRequest {
+                content: "Never mind, done.".into(),
+                parent_message_id: Some(Value::String(first.message_id.to_string())),
+                author: None,
+                resolve: Some(Value::String("on".into())),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply.parent_message_id, Some(first.message_id));
+
+        let Json(list) = list_message_threads(
+            State(state.clone()),
+            Path("demo".into()),
+            Query(ListThreadsQuery {
+                state: Some("all".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(list.threads.len(), 1);
+        assert_eq!(list.threads[0].state, "resolved");
+        assert_eq!(list.threads[0].reply_count, 1);
+        assert_eq!(list.threads[0].author_kind, "human");
+
+        // Agents see the human message in their unread queue.
+        {
+            let conn = state.db.lock().unwrap();
+            let unread = db::get_unconfirmed_for_agent(&conn, "demo", "agent-x").unwrap();
+            assert_eq!(unread.len(), 2);
+        }
+
+        // Empty content is rejected.
+        let err = post_human_message(
+            State(state),
+            Path("demo".into()),
+            Json(HumanMessageRequest {
+                content: "   ".into(),
+                parent_message_id: None,
+                author: None,
+                resolve: None,
+            }),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn inbox_page_renders_threads_and_composer() {
+        let state = test_state();
+        let _ = post_human_message(
+            State(state.clone()),
+            Path("demo".into()),
+            Json(HumanMessageRequest {
+                content: "Ship it?".into(),
+                parent_message_id: None,
+                author: None,
+                resolve: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let Html(html) = crate::ui::inbox::inbox_page(
+            State(state),
+            Path("demo".into()),
+            Query(crate::ui::inbox::InboxQuery::default()),
+        )
+        .await
+        .unwrap();
+        assert!(html.contains("Ship it?"));
+        assert!(html.contains(r#"data-nd-action="POST /v1/projects/demo/messages/human""#));
+        assert!(html.contains("gw-tab-active"));
+        assert!(html.contains("Resolve all shown"));
     }
 
     #[test]

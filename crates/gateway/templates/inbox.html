@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="gw-filters">
+  <span class="nd-text-xs nd-text-muted">Show:</span>
+  <a href="/projects/{{ ident }}/inbox?kind=conversation&state={{ state_filter }}"{% if kind_filter == "conversation" %} class="gw-filter-active"{% endif %}>Conversation ({{ counts.human_open + counts.agent_open }})</a>
+  <a href="/projects/{{ ident }}/inbox?kind=human&state={{ state_filter }}"{% if kind_filter == "human" %} class="gw-filter-active"{% endif %}>Humans ({{ counts.human_open }})</a>
+  <a href="/projects/{{ ident }}/inbox?kind=agent&state={{ state_filter }}"{% if kind_filter == "agent" %} class="gw-filter-active"{% endif %}>Agents ({{ counts.agent_open }})</a>
+  <a href="/projects/{{ ident }}/inbox?kind=alerts&state={{ state_filter }}"{% if kind_filter == "alerts" %} class="gw-filter-active"{% endif %}>Alerts ({{ counts.alerts_open }})</a>
+  <a href="/projects/{{ ident }}/inbox?kind=system&state={{ state_filter }}"{% if kind_filter == "system" %} class="gw-filter-active"{% endif %}>System ({{ counts.system_open }})</a>
+  <span class="nd-text-xs nd-text-muted" style="margin-left:1rem">State:</span>
+  <a href="/projects/{{ ident }}/inbox?kind={{ kind_filter }}&state=unresolved"{% if state_filter == "unresolved" %} class="gw-filter-active"{% endif %}>Unresolved</a>
+  <a href="/projects/{{ ident }}/inbox?kind={{ kind_filter }}&state=open"{% if state_filter == "open" %} class="gw-filter-active"{% endif %}>Open</a>
+  <a href="/projects/{{ ident }}/inbox?kind={{ kind_filter }}&state=acknowledged"{% if state_filter == "acknowledged" %} class="gw-filter-active"{% endif %}>Acknowledged</a>
+  <a href="/projects/{{ ident }}/inbox?kind={{ kind_filter }}&state=answered"{% if state_filter == "answered" %} class="gw-filter-active"{% endif %}>Answered</a>
+  <a href="/projects/{{ ident }}/inbox?kind={{ kind_filter }}&state=resolved"{% if state_filter == "resolved" %} class="gw-filter-active"{% endif %}>Resolved ({{ counts.resolved }})</a>
+  <span style="margin-left:auto" class="gw-item-actions">
+    {% if state_filter != "resolved" && !threads.is_empty() %}
+    <button type="button" class="nd-btn-ghost nd-btn-sm"
+            data-nd-action="POST /v1/projects/{{ ident }}/messages/resolve"
+            data-nd-body='{"author_kinds":[{{ bulk_kinds_json|safe }}]}'
+            data-nd-confirm="Resolve every unresolved thread in this view?"
+            data-nd-success="reload">Resolve all shown</button>
+    <button type="button" class="nd-btn-ghost nd-btn-sm"
+            data-nd-action="POST /v1/projects/{{ ident }}/messages/resolve"
+            data-nd-body='{"author_kinds":[{{ bulk_kinds_json|safe }}],"before_ms":{{ week_ago_ms }}}'
+            data-nd-success="reload">Resolve older than 7 days</button>
+    {% endif %}
+  </span>
+</div>
+
+<div class="gw-inbox">
+  <section class="nd-card gw-inbox-list">
+    <div class="nd-card-body nd-p-0">
+      {% if threads.is_empty() %}
+      <div class="gw-empty">No threads match. Agents post with <code>agent-tools comms send</code>; humans post in the channel or with the composer on the right.</div>
+      {% else %}
+      <ul class="gw-list gw-threads">
+        {% for t in threads %}
+        <li{% if t.selected %} class="gw-thread-selected"{% endif %}>
+          <a class="gw-thread-link" href="/projects/{{ ident }}/inbox?kind={{ kind_filter }}&state={{ state_filter }}&thread={{ t.id }}">
+            <div class="gw-item-title">
+              <span class="gw-chip {{ t.state_class }}">{{ t.state }}</span>
+              <span class="gw-chip">{{ t.author_kind }}</span>
+              {{ t.title }}
+            </div>
+            <div class="gw-item-meta">{{ t.author }} · {{ t.age }}{% if t.reply_count > 0 %} · {{ t.reply_count }} repl{% if t.reply_count == 1 %}y{% else %}ies{% endif %}{% endif %}{% if t.ack_count > 0 %} · seen by {{ t.ack_count }}{% endif %}</div>
+          </a>
+        </li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="nd-card gw-inbox-thread">
+    {% if let Some(thread) = thread %}
+    <div class="nd-card-header nd-flex nd-justify-between nd-items-center">
+      <div>
+        <span class="gw-chip {{ thread.state_class }}">{{ thread.state }}</span>
+        <strong>{{ thread.title }}</strong>
+      </div>
+      <div class="gw-item-actions">
+        {% if thread.resolved %}
+        <button type="button" class="nd-btn-ghost nd-btn-sm" data-nd-action="POST /v1/projects/{{ ident }}/messages/{{ thread.id }}/reopen" data-nd-success="reload">Reopen</button>
+        {% else %}
+        <button type="button" class="nd-btn-secondary nd-btn-sm" data-nd-action="POST /v1/projects/{{ ident }}/messages/{{ thread.id }}/resolve" data-nd-success="reload">Resolve</button>
+        {% endif %}
+      </div>
+    </div>
+    <div class="nd-card-body">
+      <ol class="gw-messages">
+        {% for m in thread.messages %}
+        <li class="gw-msg gw-msg-{{ m.author_kind }}">
+          <div class="gw-msg-head">
+            <span class="gw-chip">{{ m.author_kind }}</span>
+            <strong>{{ m.author }}</strong>
+            {% if let Some(host) = m.hostname %}<span class="gw-muted">on {{ host }}</span>{% endif %}
+            {% if m.kind != "message" %}<span class="gw-chip">{{ m.kind }}</span>{% endif %}
+            <span class="gw-muted" title="{{ m.when }}">{{ m.age }}</span>
+          </div>
+          {% if let Some(subject) = m.subject %}<div class="gw-msg-subject">{{ subject }}</div>{% endif %}
+          <pre class="gw-msg-body">{{ m.content }}</pre>
+        </li>
+        {% endfor %}
+      </ol>
+      {% if !thread.confirmations.is_empty() %}
+      <div class="nd-text-xs nd-text-muted nd-mt-sm">Acknowledged by {% for c in thread.confirmations %}{{ c }}{% if !loop.last %}, {% endif %}{% endfor %}</div>
+      {% endif %}
+      {% if let Some(by) = thread.resolved_by %}
+      <div class="nd-text-xs nd-text-muted nd-mt-sm">Resolved by {{ by }}</div>
+      {% endif %}
+    </div>
+    <div class="nd-card-footer">
+      <form class="gw-composer" data-nd-action="POST /v1/projects/{{ ident }}/messages/human" data-nd-success="reload">
+        <input type="hidden" name="parent_message_id" value="{{ thread.id }}">
+        <textarea class="nd-input" name="content" rows="3" placeholder="Reply in this thread — agents see it on their next poll and it is posted to the channel" required></textarea>
+        <div class="gw-item-actions nd-mt-sm">
+          <label class="nd-text-xs nd-text-muted"><input type="checkbox" name="resolve" value="true"> Resolve after sending</label>
+          <button type="submit" class="nd-btn-primary nd-btn-sm">Reply</button>
+        </div>
+      </form>
+    </div>
+    {% else %}
+    <div class="nd-card-header"><strong>New message to agents</strong></div>
+    <div class="nd-card-body">
+      <p class="nd-text-xs nd-text-muted nd-mb-sm">Posts to the project channel and lands in every agent's unread queue.</p>
+      <form class="gw-composer" data-nd-action="POST /v1/projects/{{ ident }}/messages/human" data-nd-success="reload">
+        <textarea class="nd-input" name="content" rows="4" placeholder="What should the agents know or do?" required></textarea>
+        <div class="gw-item-actions nd-mt-sm"><button type="submit" class="nd-btn-primary nd-btn-sm">Send</button></div>
+      </form>
+    </div>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

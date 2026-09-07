@@ -166,6 +166,8 @@ fn spawn_inbound_processor(db: Db, mut rx: mpsc::Receiver<PluginEvent>) {
                     event_at: None,
                     deliver_to_agents: false,
                     author_kind: Some(message.author_kind.clone()),
+                    resolved_at: None,
+                    resolved_by: None,
                 };
                 db::insert_message(&conn, &m)?;
                 db::update_last_msg_id(&conn, &project.ident, &message.id)?;
@@ -464,7 +466,18 @@ async fn main() -> Result<()> {
             "/v1/projects",
             get(routes::list_projects_handler).post(routes::register_project),
         )
-        .route("/v1/projects/{ident}/messages", post(routes::send_message))
+        .route(
+            "/v1/projects/{ident}/messages",
+            get(routes::list_message_threads).post(routes::send_message),
+        )
+        .route(
+            "/v1/projects/{ident}/messages/human",
+            post(routes::post_human_message),
+        )
+        .route(
+            "/v1/projects/{ident}/messages/{id}/thread",
+            get(routes::get_message_thread),
+        )
         .route(
             "/v1/projects/{ident}/messages/resolve",
             post(routes::resolve_messages_bulk),
@@ -724,6 +737,7 @@ async fn main() -> Result<()> {
             "/projects/{ident}",
             get(ui::projects::project_overview_page),
         )
+        .route("/projects/{ident}/inbox", get(ui::inbox::inbox_page))
         .route(
             "/projects/{ident}/settings",
             get(ui::projects::project_settings_page),

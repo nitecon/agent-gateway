@@ -7,6 +7,7 @@
 //! defined once.
 
 pub mod home;
+pub mod inbox;
 pub mod projects;
 pub mod settings;
 pub mod shell;

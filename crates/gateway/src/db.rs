@@ -919,6 +919,11 @@ pub struct Message {
     /// Who authored the message: "human" | "bot" | "webhook" | "agent" | "system".
     /// `None` for rows ingested before classification existed (treated as human).
     pub author_kind: Option<String>,
+    /// Set when a human (or agent) marked the thread resolved.
+    #[serde(default)]
+    pub resolved_at: Option<i64>,
+    #[serde(default)]
+    pub resolved_by: Option<String>,
 }
 
 pub fn open(path: &str) -> Result<Db> {
@@ -5815,7 +5820,7 @@ pub fn get_unconfirmed_for_agent(
                 m.content, m.sent_at, m.confirmed_at,
                 m.parent_message_id, m.agent_id, m.message_type,
                 m.subject, m.hostname, m.event_at, m.deliver_to_agents,
-                m.author_kind
+                m.author_kind, m.resolved_at, m.resolved_by
          FROM messages m
          WHERE m.project_ident = ?1
            AND (m.source = 'user' OR m.deliver_to_agents = 1)
@@ -5864,7 +5869,7 @@ pub fn get_message_by_id(
     let mut stmt = conn.prepare_cached(
         "SELECT id, project_ident, source, external_message_id, content, sent_at, confirmed_at,
                 parent_message_id, agent_id, message_type, subject, hostname, event_at, deliver_to_agents,
-                author_kind
+                author_kind, resolved_at, resolved_by
          FROM messages
          WHERE id = ?1 AND project_ident = ?2",
     )?;
@@ -5891,6 +5896,8 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         event_at: row.get(12)?,
         deliver_to_agents: row.get(13)?,
         author_kind: row.get(14)?,
+        resolved_at: row.get(15)?,
+        resolved_by: row.get(16)?,
     })
 }
 
@@ -11203,24 +11210,31 @@ pub fn resolve_messages_before(
     conn: &Connection,
     project_ident: &str,
     before_ms: i64,
-    author_kind: Option<&str>,
+    author_kinds: &[&str],
     resolved_by: &str,
 ) -> Result<usize> {
     let project_ident = normalize_project_ident(project_ident);
-    let n = conn.execute(
+    let kinds_clause = if author_kinds.is_empty() {
+        String::new()
+    } else {
+        let quoted: Vec<String> = author_kinds
+            .iter()
+            .map(|k| format!("'{}'", k.replace('\'', "")))
+            .collect();
+        format!(" AND {} IN ({})", AUTHOR_KIND_SQL, quoted.join(","))
+    };
+    let sql = format!(
         "UPDATE messages SET resolved_at = ?1, resolved_by = ?2
-         WHERE project_ident = ?3
-           AND resolved_at IS NULL
-           AND parent_message_id IS NULL
-           AND sent_at < ?4
-           AND (?5 IS NULL OR COALESCE(author_kind, CASE source WHEN 'user' THEN 'human' ELSE source END) = ?5)",
-        params![
-            now_ms(),
-            resolved_by,
-            project_ident.as_str(),
-            before_ms,
-            author_kind
-        ],
+         WHERE id IN (
+             SELECT m.id FROM messages m
+             WHERE m.project_ident = ?3
+               AND m.resolved_at IS NULL
+               AND m.parent_message_id IS NULL
+               AND m.sent_at < ?4{kinds_clause})"
+    );
+    let n = conn.execute(
+        &sql,
+        params![now_ms(), resolved_by, project_ident.as_str(), before_ms],
     )?;
     Ok(n)
 }
@@ -11382,6 +11396,230 @@ pub fn project_overview(
         links,
         agents,
         activity,
+    }))
+}
+
+// ── Inbox threads ────────────────────────────────────────────────────────────
+
+/// SQL expression yielding the effective author kind of a message row.
+const AUTHOR_KIND_SQL: &str =
+    "COALESCE(m.author_kind, CASE m.source WHEN 'user' THEN 'human' ELSE m.source END)";
+
+/// SQL expression deriving a root message's thread state.
+const THREAD_STATE_SQL: &str = "CASE
+        WHEN m.resolved_at IS NOT NULL THEN 'resolved'
+        WHEN EXISTS (SELECT 1 FROM messages c WHERE c.parent_message_id = m.id) THEN 'answered'
+        WHEN m.source = 'user' AND (
+            m.confirmed_at IS NOT NULL
+            OR EXISTS (SELECT 1 FROM agent_confirmations ac
+                       WHERE ac.project_ident = m.project_ident AND ac.message_id = m.id)
+        ) THEN 'acknowledged'
+        ELSE 'open' END";
+
+/// One root message with derived thread state, for the inbox list.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ThreadSummary {
+    pub id: i64,
+    pub project_ident: String,
+    pub source: String,
+    /// human | bot | webhook | agent | system
+    pub author_kind: String,
+    pub agent_id: Option<String>,
+    pub hostname: Option<String>,
+    pub subject: Option<String>,
+    pub preview: String,
+    pub sent_at: i64,
+    pub last_activity_at: i64,
+    pub reply_count: i64,
+    pub ack_count: i64,
+    /// open | acknowledged | answered | resolved
+    pub state: String,
+    pub resolved_at: Option<i64>,
+    pub resolved_by: Option<String>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ThreadFilter<'a> {
+    /// open | acknowledged | answered | resolved | unresolved | all (default unresolved)
+    pub state: Option<&'a str>,
+    /// Author kinds to include; empty means all.
+    pub kinds: &'a [&'a str],
+    pub agent_id: Option<&'a str>,
+    pub limit: usize,
+    pub offset: usize,
+}
+
+fn thread_state_predicate(state: Option<&str>) -> &'static str {
+    match state {
+        Some("open") => " AND state = 'open'",
+        Some("acknowledged") => " AND state = 'acknowledged'",
+        Some("answered") => " AND state = 'answered'",
+        Some("resolved") => " AND state = 'resolved'",
+        Some("all") => "",
+        _ => " AND state != 'resolved'",
+    }
+}
+
+/// Root messages (threads) of a project, newest activity first.
+pub fn list_message_threads(
+    conn: &Connection,
+    project_ident: &str,
+    filter: &ThreadFilter<'_>,
+) -> Result<Vec<ThreadSummary>> {
+    let project_ident = normalize_project_ident(project_ident);
+    let kinds_clause = if filter.kinds.is_empty() {
+        String::new()
+    } else {
+        let quoted: Vec<String> = filter
+            .kinds
+            .iter()
+            .map(|k| format!("'{}'", k.replace('\'', "")))
+            .collect();
+        format!(" AND author_kind IN ({})", quoted.join(","))
+    };
+    let sql = format!(
+        "SELECT * FROM (
+            SELECT m.id, m.project_ident, m.source, {AUTHOR_KIND_SQL} AS author_kind,
+                   m.agent_id, m.hostname, m.subject, substr(m.content, 1, 200) AS preview,
+                   m.sent_at,
+                   COALESCE((SELECT MAX(c.sent_at) FROM messages c WHERE c.parent_message_id = m.id), m.sent_at) AS last_activity_at,
+                   (SELECT COUNT(*) FROM messages c WHERE c.parent_message_id = m.id) AS reply_count,
+                   (SELECT COUNT(*) FROM agent_confirmations ac WHERE ac.project_ident = m.project_ident AND ac.message_id = m.id) AS ack_count,
+                   {THREAD_STATE_SQL} AS state,
+                   m.resolved_at, m.resolved_by
+            FROM messages m
+            WHERE m.project_ident = ?1 AND m.parent_message_id IS NULL
+              AND (?2 IS NULL OR m.agent_id = ?2)
+         ) t
+         WHERE 1 = 1{state_clause}{kinds_clause}
+         ORDER BY last_activity_at DESC
+         LIMIT ?3 OFFSET ?4",
+        state_clause = thread_state_predicate(filter.state),
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let limit = if filter.limit == 0 { 100 } else { filter.limit } as i64;
+    let rows = stmt
+        .query_map(
+            params![
+                project_ident.as_str(),
+                filter.agent_id,
+                limit,
+                filter.offset as i64
+            ],
+            |r| {
+                Ok(ThreadSummary {
+                    id: r.get(0)?,
+                    project_ident: r.get(1)?,
+                    source: r.get(2)?,
+                    author_kind: r.get(3)?,
+                    agent_id: r.get(4)?,
+                    hostname: r.get(5)?,
+                    subject: r.get(6)?,
+                    preview: r.get(7)?,
+                    sent_at: r.get(8)?,
+                    last_activity_at: r.get(9)?,
+                    reply_count: r.get(10)?,
+                    ack_count: r.get(11)?,
+                    state: r.get(12)?,
+                    resolved_at: r.get(13)?,
+                    resolved_by: r.get(14)?,
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Unresolved thread counts per author-kind bucket, for the inbox filter bar.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct InboxCounts {
+    pub human_open: i64,
+    pub agent_open: i64,
+    pub alerts_open: i64,
+    pub system_open: i64,
+    pub resolved: i64,
+}
+
+pub fn inbox_counts(conn: &Connection, project_ident: &str) -> Result<InboxCounts> {
+    let project_ident = normalize_project_ident(project_ident);
+    let sql = format!(
+        "SELECT
+            SUM(CASE WHEN resolved_at IS NULL AND kind = 'human' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN resolved_at IS NULL AND kind = 'agent' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN resolved_at IS NULL AND kind IN ('bot','webhook') THEN 1 ELSE 0 END),
+            SUM(CASE WHEN resolved_at IS NULL AND kind = 'system' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN resolved_at IS NOT NULL THEN 1 ELSE 0 END)
+         FROM (SELECT m.resolved_at, {AUTHOR_KIND_SQL} AS kind FROM messages m
+               WHERE m.project_ident = ?1 AND m.parent_message_id IS NULL)"
+    );
+    let counts = conn.query_row(&sql, params![project_ident.as_str()], |r| {
+        Ok(InboxCounts {
+            human_open: r.get::<_, Option<i64>>(0)?.unwrap_or(0),
+            agent_open: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+            alerts_open: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+            system_open: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+            resolved: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+        })
+    })?;
+    Ok(counts)
+}
+
+/// A full thread: the root, its replies in order, and who acknowledged it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ThreadView {
+    pub root: Message,
+    pub state: String,
+    pub replies: Vec<Message>,
+    pub confirmations: Vec<(String, i64)>,
+}
+
+pub fn get_thread(
+    conn: &Connection,
+    project_ident: &str,
+    root_id: i64,
+) -> Result<Option<ThreadView>> {
+    let project_ident = normalize_project_ident(project_ident);
+    let Some(root) = get_message_by_id(conn, &project_ident, root_id)? else {
+        return Ok(None);
+    };
+    // Follow up to a parent so any message id resolves to its thread.
+    let root = match root.parent_message_id {
+        Some(parent) => get_message_by_id(conn, &project_ident, parent)?.unwrap_or(root),
+        None => root,
+    };
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, project_ident, source, external_message_id, content, sent_at, confirmed_at,
+                parent_message_id, agent_id, message_type, subject, hostname, event_at, deliver_to_agents,
+                author_kind, resolved_at, resolved_by
+         FROM messages WHERE parent_message_id = ?1 ORDER BY id ASC",
+    )?;
+    let replies = stmt
+        .query_map(params![root.id], row_to_message)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut ack = conn.prepare_cached(
+        "SELECT agent_id, confirmed_at FROM agent_confirmations
+         WHERE project_ident = ?1 AND message_id = ?2 ORDER BY confirmed_at ASC",
+    )?;
+    let confirmations = ack
+        .query_map(params![project_ident.as_str(), root.id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let state = if root.resolved_at.is_some() {
+        "resolved"
+    } else if !replies.is_empty() {
+        "answered"
+    } else if root.source == "user" && (root.confirmed_at.is_some() || !confirmations.is_empty()) {
+        "acknowledged"
+    } else {
+        "open"
+    }
+    .to_string();
+    Ok(Some(ThreadView {
+        root,
+        state,
+        replies,
+        confirmations,
     }))
 }
 
@@ -11708,6 +11946,8 @@ mod tests {
             event_at: None,
             deliver_to_agents: source == "user",
             author_kind: None,
+            resolved_at: None,
+            resolved_by: None,
         }
     }
 
@@ -11765,7 +12005,7 @@ mod tests {
 
         // Bulk resolve everything before "now + 1" clears both root messages.
         assert_eq!(
-            resolve_messages_before(&conn, "proj", now_ms() + 1_000, None, "user").unwrap(),
+            resolve_messages_before(&conn, "proj", now_ms() + 1_000, &[], "user").unwrap(),
             2
         );
         assert!(list_needs_you(&conn, now, 50)
@@ -11806,6 +12046,96 @@ mod tests {
         assert_eq!(links[0].id, link.id);
         assert!(delete_project_link(&conn, "proj", link.id).unwrap());
         assert!(!delete_project_link(&conn, "proj", link.id).unwrap());
+    }
+
+    #[test]
+    fn thread_listing_derives_states_and_filters_by_kind() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("proj")).unwrap();
+        upsert_agent(&conn, "proj", "agent-a").unwrap();
+
+        let open_q = insert_message(&conn, &test_message("proj", "user", "open?", None)).unwrap();
+        let acked_q = insert_message(&conn, &test_message("proj", "user", "acked?", None)).unwrap();
+        confirm_message_for_agent(&conn, "proj", "agent-a", acked_q).unwrap();
+        let answered_q =
+            insert_message(&conn, &test_message("proj", "user", "answered?", None)).unwrap();
+        insert_message(
+            &conn,
+            &Message {
+                parent_message_id: Some(answered_q),
+                message_type: "reply".into(),
+                ..test_message("proj", "agent", "yes", Some("agent-a"))
+            },
+        )
+        .unwrap();
+        let alert = insert_message(
+            &conn,
+            &Message {
+                author_kind: Some("webhook".into()),
+                ..test_message("proj", "user", "FIRING: disk", None)
+            },
+        )
+        .unwrap();
+        let resolved = insert_message(&conn, &test_message("proj", "user", "old", None)).unwrap();
+        resolve_message(&conn, "proj", resolved, "user").unwrap();
+
+        let all = list_message_threads(
+            &conn,
+            "proj",
+            &ThreadFilter {
+                state: Some("all"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(all.len(), 5, "replies are not roots");
+        let state_of = |id: i64| all.iter().find(|t| t.id == id).unwrap().state.clone();
+        assert_eq!(state_of(open_q), "open");
+        assert_eq!(state_of(acked_q), "acknowledged");
+        assert_eq!(state_of(answered_q), "answered");
+        assert_eq!(state_of(resolved), "resolved");
+        assert_eq!(
+            all.iter().find(|t| t.id == answered_q).unwrap().reply_count,
+            1
+        );
+        assert_eq!(
+            all.iter().find(|t| t.id == alert).unwrap().author_kind,
+            "webhook"
+        );
+
+        let unresolved_humans = list_message_threads(
+            &conn,
+            "proj",
+            &ThreadFilter {
+                state: None,
+                kinds: &["human"],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let ids: Vec<i64> = unresolved_humans.iter().map(|t| t.id).collect();
+        assert!(ids.contains(&open_q) && ids.contains(&acked_q) && ids.contains(&answered_q));
+        assert!(!ids.contains(&alert) && !ids.contains(&resolved));
+
+        let counts = inbox_counts(&conn, "proj").unwrap();
+        assert_eq!(counts.human_open, 3);
+        assert_eq!(counts.alerts_open, 1);
+        assert_eq!(counts.resolved, 1);
+
+        // A reply id resolves to its thread root.
+        let reply_id = all.iter().find(|t| t.id == answered_q).unwrap().id;
+        let thread = get_thread(&conn, "proj", reply_id).unwrap().unwrap();
+        assert_eq!(thread.root.id, answered_q);
+        assert_eq!(thread.replies.len(), 1);
+        assert_eq!(thread.state, "answered");
+
+        // Bulk resolve restricted to alerts touches only the webhook row.
+        assert_eq!(
+            resolve_messages_before(&conn, "proj", now_ms() + 1_000, &["bot", "webhook"], "user")
+                .unwrap(),
+            1
+        );
+        assert_eq!(inbox_counts(&conn, "proj").unwrap().alerts_open, 0);
     }
 
     #[test]
@@ -11855,6 +12185,8 @@ mod tests {
         });
         let bot_recent = aged(Message {
             author_kind: Some("webhook".into()),
+            resolved_at: None,
+            resolved_by: None,
             ..test_message("proj", "user", "FIRING: alert", None)
         });
         confirm_message_for_agent(&conn, "proj", "agent-a", human_acked).unwrap();
@@ -11895,6 +12227,8 @@ mod tests {
             &conn,
             &Message {
                 author_kind: Some("bot".into()),
+                resolved_at: None,
+                resolved_by: None,
                 ..test_message("proj", "user", "beep", None)
             },
         )
