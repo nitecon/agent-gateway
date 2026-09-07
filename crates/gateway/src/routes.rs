@@ -5111,6 +5111,7 @@ pub async fn send_message(
         hostname: Some(outbound.hostname.clone()),
         event_at: Some(outbound.event_at),
         deliver_to_agents: false,
+        author_kind: Some("agent".to_string()),
     };
 
     let db = state.db.clone();
@@ -5722,7 +5723,7 @@ async fn render_kind_page(state: &AppState, kind: &str) -> Result<Html<String>> 
         head = control_panel_head(&full_title, &theme, ""),
         open = control_panel_open(page_title, active),
         content = content,
-        close = control_panel_close(&state.api_key),
+        close = control_panel_close(),
     );
     Ok(Html(html))
 }
@@ -5888,7 +5889,7 @@ async fn render_skill_detail_page(
         head = control_panel_head(&full_title, &theme, ""),
         open = control_panel_open(&page_title, active),
         content = content,
-        close = control_panel_close(&state.api_key),
+        close = control_panel_close(),
     );
     Ok(Html(html))
 }
@@ -6526,7 +6527,7 @@ pub async fn dashboard(State(state): State<AppState>) -> Result<Html<String>> {
         head = control_panel_head("agent-gateway — Dashboard", &theme, ""),
         open = control_panel_open("Dashboard", "dashboard"),
         content = content,
-        close = control_panel_close(&state.api_key),
+        close = control_panel_close(),
     );
 
     Ok(Html(html))
@@ -6592,7 +6593,7 @@ pub async fn api_docs_index_page(State(state): State<AppState>) -> Result<Html<S
         head = control_panel_head("agent-gateway - Documentation", &theme, ""),
         open = control_panel_open("Documentation", "documentation"),
         content = content,
-        close = control_panel_close(&state.api_key),
+        close = control_panel_close(),
     );
     Ok(Html(html))
 }
@@ -6657,7 +6658,7 @@ pub async fn memories_index_page(State(state): State<AppState>) -> Result<Html<S
         head = control_panel_head("agent-gateway - Memories", &theme, ""),
         open = control_panel_open("Memories", "memories"),
         content = content,
-        close = control_panel_close(&state.api_key),
+        close = control_panel_close(),
     );
     Ok(Html(html))
 }
@@ -6851,7 +6852,7 @@ pub async fn memories_page(
         head = control_panel_head("agent-gateway - Memories", &theme, ""),
         open = control_panel_open(&page_title, "memories"),
         content = content,
-        close = control_panel_close(&state.api_key),
+        close = control_panel_close(),
     );
     Ok(Html(html))
 }
@@ -6976,7 +6977,7 @@ pub async fn api_docs_page(
         ),
         open = control_panel_open(&page_title, "documentation"),
         content = content,
-        close = control_panel_close(&state.api_key),
+        close = control_panel_close(),
     );
     Ok(Html(html))
 }
@@ -7176,7 +7177,7 @@ pub async fn api_doc_detail_page(
         ),
         open = control_panel_open(&page_title, "documentation"),
         content = content,
-        close = control_panel_close(&state.api_key),
+        close = control_panel_close(),
     );
     Ok(Html(html))
 }
@@ -7235,7 +7236,7 @@ pub async fn artifacts_index_page(State(state): State<AppState>) -> Result<Html<
         head = control_panel_head("agent-gateway - Advanced records", &theme, ""),
         open = control_panel_open("Advanced Records", "documentation"),
         content = content,
-        close = control_panel_close(&state.api_key),
+        close = control_panel_close(),
     );
     Ok(Html(html))
 }
@@ -7408,7 +7409,7 @@ pub async fn artifact_workspace_page(
         head = control_panel_head("agent-gateway - Advanced records", &theme, ""),
         open = control_panel_open(&page_title, "documentation"),
         content = content,
-        close = control_panel_close(&state.api_key),
+        close = control_panel_close(),
     );
     Ok(Html(html))
 }
@@ -7759,7 +7760,7 @@ pub async fn artifact_detail_page(
         head = control_panel_head("agent-gateway - Advanced record", &theme, ""),
         open = control_panel_open(&page_title, "documentation"),
         content = content,
-        close = control_panel_close(&state.api_key),
+        close = control_panel_close(),
     );
     Ok(Html(html))
 }
@@ -7935,7 +7936,7 @@ pub async fn settings_page(State(state): State<AppState>) -> Result<Html<String>
         ),
         open = control_panel_open("Settings", "settings"),
         content = content,
-        close = control_panel_close(&state.api_key),
+        close = control_panel_close(),
     );
     Ok(Html(html))
 }
@@ -8060,7 +8061,7 @@ pub async fn project_build_page(
         ),
         open = control_panel_open(&page_title, "dashboard"),
         content = content,
-        close = control_panel_close(&state.api_key),
+        close = control_panel_close(),
     );
     Ok(Html(html))
 }
@@ -8644,6 +8645,7 @@ fn system_nudge(
             hostname: Some("agent-gateway".into()),
             event_at: Some(now_ms()),
             deliver_to_agents: true,
+            author_kind: Some("system".to_string()),
         },
     )
 }
@@ -9522,7 +9524,7 @@ pub async fn patterns_page(State(state): State<AppState>) -> Result<Html<String>
         head = control_panel_head("agent-gateway — Patterns", &theme, "",),
         open = control_panel_open("Patterns", "patterns"),
         content = content,
-        close = control_panel_close(&state.api_key),
+        close = control_panel_close(),
     );
     Ok(Html(html))
 }
@@ -9687,7 +9689,7 @@ pub async fn pattern_detail_page(
         head = control_panel_head("agent-gateway — Pattern", &theme, ""),
         open = control_panel_open(&detail_title, "patterns"),
         content = content,
-        close = control_panel_close(&state.api_key),
+        close = control_panel_close(),
     );
     Ok(Html(html))
 }
@@ -9750,7 +9752,7 @@ pub async fn tasks_picker(State(state): State<AppState>) -> Result<Html<String>>
         head = control_panel_head("agent-gateway — Tasks", &theme, ""),
         open = control_panel_open("Tasks", "tasks"),
         content = content,
-        close = control_panel_close(&state.api_key),
+        close = control_panel_close(),
     );
     Ok(Html(html))
 }
@@ -9815,7 +9817,7 @@ pub async fn new_task_page(
         head = control_panel_head("agent-gateway - New task", &theme, ""),
         open = control_panel_open(&page_title, "tasks"),
         content = content,
-        close = control_panel_close(&state.api_key),
+        close = control_panel_close(),
     );
     Ok(Html(html))
 }
@@ -9877,10 +9879,10 @@ pub async fn task_link_page(
     .await??
     .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "task no longer exists".into()))?;
 
-    Ok(Html(render_task_link_page(&detail, &theme, &state.api_key)))
+    Ok(Html(render_task_link_page(&detail, &theme)))
 }
 
-fn render_task_link_page(detail: &db::TaskDetail, theme: &str, api_key: &str) -> String {
+fn render_task_link_page(detail: &db::TaskDetail, theme: &str) -> String {
     let task = &detail.task;
     let page_title = format!("Task — {}", task.title);
     let ident_path = path_segment(&task.project_ident);
@@ -10040,7 +10042,7 @@ fn render_task_link_page(detail: &db::TaskDetail, theme: &str, api_key: &str) ->
         ),
         open = control_panel_open(&page_title, "tasks"),
         content = content,
-        close = control_panel_close(api_key),
+        close = control_panel_close(),
     )
 }
 
@@ -10305,7 +10307,7 @@ pub async fn tasks_board(
         ),
         open = control_panel_open(&page_title, "tasks"),
         content = content,
-        close = control_panel_close(&state.api_key),
+        close = control_panel_close(),
     );
     Ok(Html(html))
 }
@@ -10405,6 +10407,7 @@ fn control_panel_open(page_title: &str, active: &str) -> String {
       </div>
       <div class="app-header-right">
         {theme_toggle}
+        <a class="nd-btn-ghost nd-btn-sm" href="/logout" title="Sign out">Sign out</a>
       </div>
     </header>
     <main class="app-content">"#,
@@ -10424,36 +10427,30 @@ fn control_panel_open(page_title: &str, active: &str) -> String {
 
 /// Close the control-panel body: close `<main>`, `<div class="app-body">`,
 /// and `<div class="app-layout">`, then emit the ndesign runtime script and
-/// an inline config block that (a) wires bearer-auth for XHR and (b)
-/// persists `nd:theme-change` events back to the server.
+/// an inline config block that (a) tags same-origin XHR with the
+/// `X-Gateway-UI` header so the bearer middleware accepts the session cookie
+/// and (b) persists `nd:theme-change` events back to the server.
 ///
-/// The theme-change listener was historically emitted by `ndesign_scripts`
-/// for the old `/manage` page. When the dashboard was refactored onto this
-/// shared shell (commit `538d374`), the listener was dropped and theme
-/// toggles stopped surviving reloads. Re-registering it here fixes that
-/// regression for every page built on the control-panel shell.
+/// The API key is deliberately *not* embedded: pages authenticate with the
+/// HttpOnly session cookie issued by `/login` (see `crate::ui_auth`).
 ///
 /// Output is deliberately limited to two `<script>` tags (the ndesign
 /// runtime + this inline config block) to keep the per-page script budget
 /// predictable.
-///
-/// The bearer token is JSON-escaped via `serde_json::to_string` so it is safe
-/// to interpolate inside the inline script literal.
-fn control_panel_close(api_key: &str) -> String {
-    let api_key_json = serde_json::to_string(api_key).unwrap_or_else(|_| "\"\"".to_string());
+fn control_panel_close() -> String {
     format!(
         r#"    </main>
   </div>
 </div>
 <script src="{base}/ndesign.min.js"></script>
 <script>
-NDesign.configure({{ headers: {{ 'Authorization': 'Bearer ' + {api_key_json} }} }});
+NDesign.configure({{ headers: {{ 'X-Gateway-UI': '1' }} }});
 document.addEventListener('nd:theme-change', (e) => {{
   const theme = e.detail && e.detail.theme;
   if (!theme) return;
   fetch('/theme', {{
     method: 'POST',
-    headers: {{ 'Content-Type': 'application/json' }},
+    headers: {{ 'Content-Type': 'application/json', 'X-Gateway-UI': '1' }},
     body: JSON.stringify({{ theme }})
   }}).catch(() => {{}});
 }});
@@ -10461,8 +10458,146 @@ document.addEventListener('nd:theme-change', (e) => {{
 </body>
 </html>"#,
         base = NDESIGN_BASE,
-        api_key_json = api_key_json,
     )
+}
+
+// ── Login / logout ───────────────────────────────────────────────────────────
+
+/// Percent-encode a string for use inside a query-string value.
+pub(crate) fn url_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// Only allow same-site relative redirect targets.
+fn safe_next_path(next: Option<&str>) -> String {
+    match next {
+        Some(p) if p.starts_with('/') && !p.starts_with("//") && !p.starts_with("/login") => {
+            p.to_string()
+        }
+        _ => "/".to_string(),
+    }
+}
+
+#[derive(Deserialize, Default)]
+pub struct LoginQuery {
+    pub next: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct LoginForm {
+    pub key: String,
+    pub next: Option<String>,
+}
+
+fn render_login_page(theme: &str, next: &str, error: Option<&str>) -> String {
+    let head = control_panel_head("agent-gateway — Sign in", theme, "");
+    let error_html = match error {
+        Some(msg) => format!(
+            r#"<div class="nd-alert nd-alert-danger nd-mb-md" role="alert">{}</div>"#,
+            he(msg)
+        ),
+        None => String::new(),
+    };
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+{head}
+</head>
+<body class="app-page">
+<main class="nd-container nd-py-xl" style="max-width:26rem;margin:10vh auto 0;">
+  <div class="nd-card">
+    <div class="nd-card-header"><strong>agent-gateway</strong></div>
+    <div class="nd-card-body">
+      <p class="nd-text-muted nd-text-sm nd-mb-md">Enter the gateway API key to open the control panel.</p>
+      {error_html}
+      <form method="post" action="/login" class="nd-stack nd-gap-sm">
+        <input type="hidden" name="next" value="{next}">
+        <label class="nd-label" for="login-key">API key</label>
+        <input class="nd-input" id="login-key" name="key" type="password" autocomplete="current-password" autofocus required>
+        <button class="nd-btn-primary nd-mt-sm" type="submit">Sign in</button>
+      </form>
+    </div>
+  </div>
+</main>
+</body>
+</html>"#,
+        head = head,
+        error_html = error_html,
+        next = he(next),
+    )
+}
+
+/// GET /login
+pub async fn login_page(
+    State(state): State<AppState>,
+    Query(q): Query<LoginQuery>,
+) -> Result<Response> {
+    if !state.ui_auth_enabled {
+        return Ok(axum::response::Redirect::to("/").into_response());
+    }
+    let theme = load_theme(&state).await;
+    let next = safe_next_path(q.next.as_deref());
+    let error = q.error.as_deref().map(|_| "That key was not accepted.");
+    Ok(Html(render_login_page(&theme, &next, error)).into_response())
+}
+
+/// POST /login
+pub async fn login_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Form(form): axum::Form<LoginForm>,
+) -> Result<Response> {
+    let next = safe_next_path(form.next.as_deref());
+    if !state.ui_auth_enabled {
+        return Ok(axum::response::Redirect::to(&next).into_response());
+    }
+    if form.key.trim() != state.api_key {
+        let target = format!("/login?error=1&next={}", url_encode(&next));
+        return Ok(axum::response::Redirect::to(&target).into_response());
+    }
+    let expires = now_ms() + crate::ui_auth::SESSION_TTL_MS;
+    let token = crate::ui_auth::session_token(&state.api_key, expires);
+    let cookie = crate::ui_auth::set_cookie_header(
+        &token,
+        crate::ui_auth::request_is_https(&headers),
+        crate::ui_auth::SESSION_TTL_MS / 1000,
+    );
+    let mut response = axum::response::Redirect::to(&next).into_response();
+    response
+        .headers_mut()
+        .insert(header::SET_COOKIE, HeaderValue::from_str(&cookie)?);
+    Ok(response)
+}
+
+/// GET|POST /logout
+pub async fn logout() -> Result<Response> {
+    let mut response = axum::response::Redirect::to("/login").into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&crate::ui_auth::clear_cookie_header())?,
+    );
+    Ok(response)
+}
+
+async fn load_theme(state: &AppState) -> String {
+    let db = state.db.clone();
+    spawn_blocking(move || {
+        let conn = db.lock().unwrap();
+        db::get_theme(&conn).unwrap_or_else(|_| "dark".to_string())
+    })
+    .await
+    .unwrap_or_else(|_| "dark".to_string())
 }
 
 // ── GET /v1/projects/:ident/messages/unread ───────────────────────────────────
@@ -10637,6 +10772,7 @@ pub async fn reply_to_message(
         hostname: Some(outbound.hostname.clone()),
         event_at: Some(outbound.event_at),
         deliver_to_agents: false,
+        author_kind: Some("agent".to_string()),
     };
 
     let db = state.db.clone();
@@ -10750,6 +10886,7 @@ pub async fn taking_action_on(
         hostname: Some(outbound.hostname.clone()),
         event_at: Some(outbound.event_at),
         deliver_to_agents: false,
+        author_kind: Some("agent".to_string()),
     };
 
     let db = state.db.clone();
@@ -10966,7 +11103,7 @@ mod tests {
             }],
         };
 
-        let html = render_task_link_page(&detail, "dark", "secret");
+        let html = render_task_link_page(&detail, "dark");
 
         assert!(html.contains("Direct &lt;task&gt;"));
         assert!(html.contains("demo-project"));
@@ -10982,6 +11119,113 @@ mod tests {
         assert!(html.contains(">Done</button>"));
         assert!(html.contains(">Reopen</button>"));
         assert!(!html.contains("Please check <this>"));
+    }
+
+    #[test]
+    fn control_panel_close_never_embeds_the_api_key() {
+        let html = control_panel_close();
+        assert!(!html.contains("Bearer"));
+        assert!(!html.contains("Authorization"));
+        assert!(html.contains("'X-Gateway-UI': '1'"));
+    }
+
+    #[test]
+    fn control_panel_header_offers_sign_out() {
+        let html = control_panel_open("Dashboard", "dashboard");
+        assert!(html.contains(r#"href="/logout""#));
+    }
+
+    #[test]
+    fn safe_next_path_rejects_offsite_and_login_loops() {
+        assert_eq!(safe_next_path(Some("/tasks")), "/tasks");
+        assert_eq!(safe_next_path(Some("//evil.example")), "/");
+        assert_eq!(safe_next_path(Some("https://evil.example")), "/");
+        assert_eq!(safe_next_path(Some("/login?next=/")), "/");
+        assert_eq!(safe_next_path(None), "/");
+    }
+
+    #[test]
+    fn url_encode_escapes_query_characters() {
+        assert_eq!(
+            url_encode("/projects/a b?x=1&y=2"),
+            "/projects/a%20b%3Fx%3D1%26y%3D2"
+        );
+    }
+
+    #[tokio::test]
+    async fn login_submit_sets_session_cookie_for_correct_key() {
+        let state = test_state();
+        let form = LoginForm {
+            key: "test-key".into(),
+            next: Some("/tasks".into()),
+        };
+        let response = login_submit(State(state), HeaderMap::new(), axum::Form(form))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get("location").unwrap(), "/tasks");
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(cookie.starts_with("gw_session="));
+        assert!(cookie.contains("HttpOnly"));
+        let token = cookie
+            .trim_start_matches("gw_session=")
+            .split(';')
+            .next()
+            .unwrap();
+        assert!(crate::ui_auth::verify_session_token(
+            "test-key",
+            token,
+            now_ms()
+        ));
+    }
+
+    #[tokio::test]
+    async fn login_submit_rejects_wrong_key_without_cookie() {
+        let state = test_state();
+        let form = LoginForm {
+            key: "nope".into(),
+            next: None,
+        };
+        let response = login_submit(State(state), HeaderMap::new(), axum::Form(form))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(response
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("/login?error=1"));
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
+    }
+
+    #[tokio::test]
+    async fn login_page_renders_form_and_escapes_next() {
+        let state = test_state();
+        let response = login_page(
+            State(state),
+            Query(LoginQuery {
+                next: Some("/tasks".into()),
+                error: Some("1".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains(r#"<form method="post" action="/login""#));
+        assert!(html.contains(r#"name="next" value="/tasks""#));
+        assert!(html.contains("not accepted"));
+        assert!(!html.contains("test-key"));
     }
 
     #[test]
@@ -11035,6 +11279,7 @@ mod tests {
             whatsapp: None,
             default_channel: "discord".to_string(),
             api_key: "test-key".to_string(),
+            ui_auth_enabled: true,
             artifact_operations,
             artifact_body_schema_enabled: true,
             artifact_auth_enforced: false,

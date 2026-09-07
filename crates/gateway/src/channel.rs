@@ -12,6 +12,15 @@ pub struct InboundMessage {
     pub content: String,
     /// Human-readable sender (username, email address, etc.).
     pub sender: String,
+    /// Author classification: "human", "bot", or "webhook". Plugins that
+    /// cannot tell should report "human".
+    pub author_kind: String,
+}
+
+impl InboundMessage {
+    pub const HUMAN: &'static str = "human";
+    pub const BOT: &'static str = "bot";
+    pub const WEBHOOK: &'static str = "webhook";
 }
 
 // ── Outbound types ────────────────────────────────────────────────────────────

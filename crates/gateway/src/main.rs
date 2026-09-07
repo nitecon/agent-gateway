@@ -3,13 +3,14 @@ mod channels;
 mod db;
 mod projects;
 mod routes;
+mod ui_auth;
 
 use anyhow::{Context, Result};
 use axum::{
     extract::{Request, State},
     http::StatusCode,
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
     routing::{get, patch, post, put},
     Router,
 };
@@ -50,6 +51,9 @@ pub struct AppState {
     pub whatsapp: Option<Arc<channels::whatsapp::WhatsAppPlugin>>,
     pub default_channel: String,
     pub api_key: String,
+    /// When false (`GATEWAY_UI_AUTH=off`), control-panel pages are served
+    /// without a browser session. Intended for loopback-only deployments.
+    pub ui_auth_enabled: bool,
     pub artifact_operations: db::ArtifactOperationsEnvelope,
     pub artifact_body_schema_enabled: bool,
     pub artifact_auth_enforced: bool,
@@ -67,10 +71,45 @@ async fn bearer_auth(State(state): State<AppState>, request: Request, next: Next
         .and_then(|v| v.strip_prefix("Bearer "));
 
     if token.map(|t| t == state.api_key).unwrap_or(false) {
-        next.run(request).await
-    } else {
-        StatusCode::UNAUTHORIZED.into_response()
+        return next.run(request).await;
     }
+    // Same-origin XHR from the control panel: session cookie + custom header.
+    if ui_auth::has_valid_ui_xhr(&state.api_key, request.headers(), db::now_ms()) {
+        return next.run(request).await;
+    }
+    StatusCode::UNAUTHORIZED.into_response()
+}
+
+// ── Control-panel session middleware ─────────────────────────────────────────
+
+/// Gate every control-panel page behind the browser session cookie.
+///
+/// Unauthenticated page loads are redirected to `/login?next=…`; other
+/// requests (XHR, POST) get a bare 401. Disabled entirely when
+/// `GATEWAY_UI_AUTH=off`.
+async fn ui_page_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    if !state.ui_auth_enabled
+        || ui_auth::has_valid_session(&state.api_key, request.headers(), db::now_ms())
+    {
+        return next.run(request).await;
+    }
+    let wants_html = request.method() == axum::http::Method::GET
+        && request
+            .headers()
+            .get("accept")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.contains("text/html") || v.contains("*/*"))
+            .unwrap_or(true);
+    if wants_html {
+        let next_path = request
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        let target = format!("/login?next={}", routes::url_encode(&next_path));
+        return Redirect::to(&target).into_response();
+    }
+    StatusCode::UNAUTHORIZED.into_response()
 }
 
 // ── Inbound message processor ─────────────────────────────────────────────────
@@ -122,6 +161,7 @@ fn spawn_inbound_processor(db: Db, mut rx: mpsc::Receiver<PluginEvent>) {
                     hostname: None,
                     event_at: None,
                     deliver_to_agents: false,
+                    author_kind: Some(message.author_kind.clone()),
                 };
                 db::insert_message(&conn, &m)?;
                 db::update_last_msg_id(&conn, &project.ident, &message.id)?;
@@ -242,6 +282,14 @@ async fn main() -> Result<()> {
         db::ArtifactOperationsEnvelope::from_env().context("load artifact operations envelope")?;
     let artifact_body_schema_enabled = env_flag("GATEWAY_ARTIFACT_BODY_SCHEMA_ENABLED", true)?;
     let artifact_auth_enforced = env_flag("GATEWAY_ARTIFACT_AUTH_ENFORCED", false)?;
+    let ui_auth_enabled = env_flag("GATEWAY_UI_AUTH", true)?;
+    if !ui_auth_enabled {
+        warn!("GATEWAY_UI_AUTH=off: control-panel pages are served without a login");
+    }
+    let bot_retention_days: u64 = std::env::var("BOT_MESSAGE_RETENTION_DAYS")
+        .unwrap_or_else(|_| "7".into())
+        .parse()
+        .context("BOT_MESSAGE_RETENTION_DAYS must be a u64")?;
 
     // ── Database ──────────────────────────────────────────────────────────────
     if let Some(path) = db_config.sqlite_path() {
@@ -363,15 +411,18 @@ async fn main() -> Result<()> {
     {
         let db = db.clone();
         let retention_ms = retention_days as i64 * 24 * 60 * 60 * 1000;
+        let bot_retention_ms = bot_retention_days as i64 * 24 * 60 * 60 * 1000;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(86_400));
             loop {
                 interval.tick().await;
                 let db = db.clone();
-                let cutoff = db::now_ms() - retention_ms;
+                let now = db::now_ms();
+                let cutoff = now - retention_ms;
+                let bot_cutoff = now - bot_retention_ms;
                 let result = spawn_blocking(move || {
                     let conn = db.lock().unwrap();
-                    db::purge_old_messages(&conn, cutoff)
+                    db::purge_old_messages_with_policy(&conn, cutoff, bot_cutoff)
                 })
                 .await;
                 match result {
@@ -391,6 +442,7 @@ async fn main() -> Result<()> {
         whatsapp: whatsapp_plugin,
         default_channel,
         api_key,
+        ui_auth_enabled,
         artifact_operations,
         artifact_body_schema_enabled,
         artifact_auth_enforced,
@@ -640,10 +692,10 @@ async fn main() -> Result<()> {
         )
         .layer(middleware::from_fn_with_state(state.clone(), bearer_auth));
 
-    // Dashboard and admin list pages are public (local admin pages, no auth
-    // required). The three /skills, /commands, /agents pages replace the
-    // old /manage tab hub.
-    let app = Router::new()
+    // Control-panel pages sit behind the browser session cookie (see
+    // `ui_page_auth`). The three /skills, /commands, /agents pages replace
+    // the old /manage tab hub.
+    let pages = Router::new()
         .route("/", get(routes::dashboard))
         .route("/documentation", get(routes::api_docs_index_page))
         .route("/api-docs", get(routes::api_docs_index_page))
@@ -687,7 +739,14 @@ async fn main() -> Result<()> {
         .route("/agents/new", get(routes::new_agent_page))
         .route("/agents/{name}", get(routes::agent_detail_page))
         .route("/settings", get(routes::settings_page))
-        .route("/theme", get(routes::get_theme).post(routes::set_theme));
+        .route("/theme", get(routes::get_theme).post(routes::set_theme))
+        .layer(middleware::from_fn_with_state(state.clone(), ui_page_auth));
+
+    // Login/logout and inbound webhooks are reachable without a session.
+    let app = Router::new()
+        .route("/login", get(routes::login_page).post(routes::login_submit))
+        .route("/logout", get(routes::logout).post(routes::logout))
+        .merge(pages);
 
     #[cfg(feature = "whatsapp")]
     let app = app.route(

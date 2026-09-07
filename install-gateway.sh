@@ -191,8 +191,12 @@ GATEWAY_PORT=7913
 # Database
 DATABASE_PATH=/opt/agentic/gateway/agent-gateway.db
 
-# Message retention (days)
+# Message retention (days): acknowledged messages / bot and webhook noise
 MESSAGE_RETENTION_DAYS=30
+BOT_MESSAGE_RETENTION_DAYS=7
+
+# Browser login for the control panel (on|off)
+GATEWAY_UI_AUTH=on
 
 # Default channel plugin
 DEFAULT_CHANNEL=discord

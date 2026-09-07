@@ -124,10 +124,21 @@ DATABASE_PATH=/opt/agentic/gateway/agent-gateway.db
 # DATABASE_URL=postgres://gateway:secret@localhost/gateway
 # DATABASE_URL=mysql://gateway:secret@localhost/gateway
 MESSAGE_RETENTION_DAYS=30
+BOT_MESSAGE_RETENTION_DAYS=7
+GATEWAY_UI_AUTH=on
 RUST_LOG=info
 ```
 
 > `GATEWAY_API_KEY` is the shared secret between the gateway and all clients. Use a long random string (e.g. `openssl rand -hex 32`).
+
+> The control-panel pages are protected by a browser session: `/login` accepts the
+> API key once and sets an HttpOnly cookie. Pages never embed the key. Set
+> `GATEWAY_UI_AUTH=off` only for loopback-only deployments.
+
+> Retention deletes messages older than `MESSAGE_RETENTION_DAYS` once an agent has
+> acknowledged them (or they were authored by an agent or the gateway). Messages
+> from Discord bots and webhooks (alerting, CI) are classified on ingest and purged
+> after `BOT_MESSAGE_RETENTION_DAYS`. Human messages nobody has acknowledged are kept.
 
 When `DISCORD_BOT_TOKEN` and `DISCORD_GUILD_ID` are not both set, the Discord plugin is skipped at startup. Existing pages and non-channel APIs still run; attempts to send through a project whose channel plugin is unavailable return `503 Service Unavailable`.
 

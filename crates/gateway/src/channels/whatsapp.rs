@@ -231,6 +231,7 @@ impl WhatsAppPlugin {
                     id: event.id,
                     content: event.content,
                     sender: event.sender,
+                    author_kind: InboundMessage::HUMAN.to_string(),
                 },
             })
             .await

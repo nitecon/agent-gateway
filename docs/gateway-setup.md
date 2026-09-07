@@ -74,8 +74,14 @@ DATABASE_PATH=/opt/agentic/gateway/agent-gateway.db
 # DATABASE_URL=postgres://gateway:secret@localhost/gateway
 # DATABASE_URL=mysql://gateway:secret@localhost/gateway
 
-# Delete messages older than N days that are behind the read cursor
+# Delete acknowledged / agent-authored messages older than N days
 MESSAGE_RETENTION_DAYS=30
+
+# Delete bot and webhook messages (alerting, CI) older than N days
+BOT_MESSAGE_RETENTION_DAYS=7
+
+# Browser login for the control panel (on|off). Off is for loopback-only hosts.
+GATEWAY_UI_AUTH=on
 
 # Log level: error | warn | info | debug | trace
 RUST_LOG=info

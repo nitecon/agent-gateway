@@ -62,6 +62,19 @@ fn is_gateway_authored(author_id: u64, bot_id: Option<u64>) -> bool {
     bot_id == Some(author_id)
 }
 
+/// Classify a Discord author for the gateway's `author_kind` column.
+/// Webhook posts (Alertmanager, CI, etc.) take precedence over the bot flag
+/// because webhook authors are also flagged as bots by Discord.
+fn classify_author(is_webhook: bool, is_bot: bool) -> &'static str {
+    if is_webhook {
+        InboundMessage::WEBHOOK
+    } else if is_bot {
+        InboundMessage::BOT
+    } else {
+        InboundMessage::HUMAN
+    }
+}
+
 fn push_trimmed_part(parts: &mut Vec<String>, value: &str) {
     let trimmed = value.trim();
     if !trimmed.is_empty() {
@@ -345,10 +358,12 @@ impl ChannelPlugin for DiscordPlugin {
             })
             .map(|m| {
                 let content = discord_message_content(&m);
+                let author_kind = classify_author(m.webhook_id.is_some(), m.author.bot).to_string();
                 InboundMessage {
                     id: m.id.to_string(),
                     content,
                     sender: m.author.name,
+                    author_kind,
                 }
             })
             .collect())
@@ -397,6 +412,8 @@ impl EventHandler for DiscordHandler {
                         .filter(|m| !is_gateway_authored(m.author.id.get(), bot_id))
                     {
                         let content = discord_message_content(&msg);
+                        let author_kind =
+                            classify_author(msg.webhook_id.is_some(), msg.author.bot).to_string();
                         let event = PluginEvent::Message {
                             channel_name: "discord".into(),
                             room_id: channel_id.to_string(),
@@ -404,6 +421,7 @@ impl EventHandler for DiscordHandler {
                                 id: msg.id.to_string(),
                                 content,
                                 sender: msg.author.name,
+                                author_kind,
                             },
                         };
                         if self.tx.send(event).await.is_err() {
@@ -452,6 +470,7 @@ impl EventHandler for DiscordHandler {
         }
 
         let content = discord_message_content(&msg);
+        let author_kind = classify_author(msg.webhook_id.is_some(), msg.author.bot).to_string();
         let event = PluginEvent::Message {
             channel_name: "discord".into(),
             room_id: channel_id.to_string(),
@@ -459,6 +478,7 @@ impl EventHandler for DiscordHandler {
                 id: msg.id.to_string(),
                 content,
                 sender: msg.author.name,
+                author_kind,
             },
         };
 

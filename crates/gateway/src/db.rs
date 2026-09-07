@@ -906,6 +906,9 @@ pub struct Message {
     pub event_at: Option<i64>,
     /// System messages are only delivered to agents when explicitly enabled.
     pub deliver_to_agents: bool,
+    /// Who authored the message: "human" | "bot" | "webhook" | "agent" | "system".
+    /// `None` for rows ingested before classification existed (treated as human).
+    pub author_kind: Option<String>,
 }
 
 pub fn open(path: &str) -> Result<Db> {
@@ -1034,6 +1037,15 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         [],
     );
     migrate_messages_for_system_delivery(conn)?;
+
+    // ── Migration: message author classification ─────────────────────────────
+    // "human" | "bot" | "webhook" | "agent" | "system". NULL for legacy rows.
+    let _ = conn.execute("ALTER TABLE messages ADD COLUMN author_kind TEXT", []);
+    conn.execute(
+        "UPDATE messages SET author_kind = source
+         WHERE author_kind IS NULL AND source IN ('agent','system')",
+        [],
+    )?;
 
     // ── Migration: optional provider-aware repository mapping for projects ───
     let _ = conn.execute("ALTER TABLE projects ADD COLUMN repo_provider TEXT", []);
@@ -5643,6 +5655,7 @@ pub fn insert_message(conn: &Connection, m: &Message) -> Result<i64> {
             crud_col("hostname", m.hostname.as_deref()),
             crud_col("event_at", m.event_at),
             crud_col("deliver_to_agents", m.deliver_to_agents),
+            crud_col("author_kind", m.author_kind.as_deref()),
         ],
     )?;
     let msg_id = conn.last_insert_rowid();
@@ -5710,7 +5723,8 @@ pub fn get_unconfirmed_for_agent(
         "SELECT m.id, m.project_ident, m.source, m.external_message_id,
                 m.content, m.sent_at, m.confirmed_at,
                 m.parent_message_id, m.agent_id, m.message_type,
-                m.subject, m.hostname, m.event_at, m.deliver_to_agents
+                m.subject, m.hostname, m.event_at, m.deliver_to_agents,
+                m.author_kind
          FROM messages m
          WHERE m.project_ident = ?1
            AND (m.source = 'user' OR m.deliver_to_agents = 1)
@@ -5758,7 +5772,8 @@ pub fn get_message_by_id(
     let project_ident = normalize_project_ident(project_ident);
     let mut stmt = conn.prepare_cached(
         "SELECT id, project_ident, source, external_message_id, content, sent_at, confirmed_at,
-                parent_message_id, agent_id, message_type, subject, hostname, event_at, deliver_to_agents
+                parent_message_id, agent_id, message_type, subject, hostname, event_at, deliver_to_agents,
+                author_kind
          FROM messages
          WHERE id = ?1 AND project_ident = ?2",
     )?;
@@ -5784,21 +5799,59 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         hostname: row.get(11)?,
         event_at: row.get(12)?,
         deliver_to_agents: row.get(13)?,
+        author_kind: row.get(14)?,
     })
 }
 
 // ── Retention ─────────────────────────────────────────────────────────────────
 
+/// Retention policy for [`purge_old_messages`].
+///
+/// A row is eligible for deletion when it is older than the matching cutoff
+/// and one of the following holds:
+///
+/// * it was authored by an agent or the gateway itself (`source` = agent or
+///   system), or
+/// * it carries a global `confirmed_at`, or
+/// * at least one agent has acknowledged it via `agent_confirmations`, or
+/// * it is bot/webhook noise (`author_kind` in bot, webhook), which uses the
+///   shorter `bot_cutoff_ms`.
+///
+/// Human-authored messages nobody has acknowledged are kept regardless of age:
+/// they are the only rows still awaiting a human or agent decision.
 pub fn purge_old_messages(conn: &Connection, cutoff_ms: i64) -> Result<usize> {
+    purge_old_messages_with_policy(conn, cutoff_ms, cutoff_ms)
+}
+
+pub fn purge_old_messages_with_policy(
+    conn: &Connection,
+    cutoff_ms: i64,
+    bot_cutoff_ms: i64,
+) -> Result<usize> {
     // agent_confirmations cleaned up via ON DELETE CASCADE on messages(id).
     let ids = {
         let mut stmt = conn.prepare(
-            "SELECT id FROM messages
-             WHERE sent_at < ?1
-               AND confirmed_at IS NOT NULL",
+            "SELECT m.id FROM messages m
+             WHERE (
+                 m.sent_at < ?1
+                 AND (
+                     m.source IN ('agent','system')
+                     OR m.confirmed_at IS NOT NULL
+                     OR EXISTS (
+                         SELECT 1 FROM agent_confirmations ac
+                         WHERE ac.project_ident = m.project_ident
+                           AND ac.message_id = m.id)
+                 )
+             )
+             OR (
+                 m.sent_at < ?2
+                 AND m.author_kind IN ('bot','webhook')
+             )",
         )?;
         let rows = stmt
-            .query_map(params![cutoff_ms], |row| row.get::<_, i64>(0))?
+            .query_map(params![cutoff_ms, bot_cutoff_ms], |row| {
+                row.get::<_, i64>(0)
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
@@ -7124,8 +7177,12 @@ pub fn list_project_stats(conn: &Connection) -> Result<Vec<ProjectStats>> {
                 COUNT(m.id),
                 (SELECT COUNT(*) FROM messages m2
                  WHERE m2.project_ident = p.ident
+                   AND m2.source = 'user'
                    AND m2.confirmed_at IS NULL
-                   AND m2.source = 'user'),
+                   AND NOT EXISTS (
+                       SELECT 1 FROM agent_confirmations ac
+                       WHERE ac.project_ident = m2.project_ident
+                         AND ac.message_id = m2.id)),
                 (SELECT COUNT(*) FROM tasks t
                  WHERE t.project_ident = p.ident
                    AND t.status = 'todo'),
@@ -7153,8 +7210,12 @@ pub fn list_project_stats(conn: &Connection) -> Result<Vec<ProjectStats>> {
                AND t.status = 'todo') DESC,
             (SELECT COUNT(*) FROM messages m2
              WHERE m2.project_ident = p.ident
+               AND m2.source = 'user'
                AND m2.confirmed_at IS NULL
-               AND m2.source = 'user') DESC,
+               AND NOT EXISTS (
+                   SELECT 1 FROM agent_confirmations ac
+                   WHERE ac.project_ident = m2.project_ident
+                     AND ac.message_id = m2.id)) DESC,
             p.created_at DESC",
     );
     let mut stmt = conn.prepare_cached(&sql)?;
@@ -10896,7 +10957,103 @@ mod tests {
             hostname: None,
             event_at: None,
             deliver_to_agents: source == "user",
+            author_kind: None,
         }
+    }
+
+    #[test]
+    fn project_stats_unanswered_ignores_agent_confirmed_messages() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("proj")).unwrap();
+        upsert_agent(&conn, "proj", "agent-a").unwrap();
+
+        let answered =
+            insert_message(&conn, &test_message("proj", "user", "handled", None)).unwrap();
+        let _pending =
+            insert_message(&conn, &test_message("proj", "user", "still open", None)).unwrap();
+        insert_message(
+            &conn,
+            &test_message("proj", "agent", "noise", Some("agent-a")),
+        )
+        .unwrap();
+
+        assert_eq!(list_project_stats(&conn).unwrap()[0].unread_count, 2);
+        assert!(confirm_message_for_agent(&conn, "proj", "agent-a", answered).unwrap());
+        assert_eq!(list_project_stats(&conn).unwrap()[0].unread_count, 1);
+    }
+
+    #[test]
+    fn purge_policy_keeps_unacknowledged_human_messages_only() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("proj")).unwrap();
+        upsert_agent(&conn, "proj", "agent-a").unwrap();
+        let old = now_ms() - 100_000;
+        let aged = |m: Message| -> i64 {
+            let id = insert_message(&conn, &m).unwrap();
+            conn.execute(
+                "UPDATE messages SET sent_at = ?1 WHERE id = ?2",
+                params![old, id],
+            )
+            .unwrap();
+            id
+        };
+
+        let human_open = aged(test_message("proj", "user", "open question", None));
+        let human_acked = aged(test_message("proj", "user", "acked", None));
+        let agent_msg = aged(test_message("proj", "agent", "status", Some("agent-a")));
+        let system_msg = aged(Message {
+            source: "system".into(),
+            deliver_to_agents: true,
+            ..test_message("proj", "user", "nudge", None)
+        });
+        let bot_recent = aged(Message {
+            author_kind: Some("webhook".into()),
+            ..test_message("proj", "user", "FIRING: alert", None)
+        });
+        confirm_message_for_agent(&conn, "proj", "agent-a", human_acked).unwrap();
+
+        // Bot cutoff older than the rows: bot noise is retained for now.
+        let deleted = purge_old_messages_with_policy(&conn, now_ms(), old - 1).unwrap();
+        assert_eq!(deleted, 3);
+        let remaining: Vec<i64> = conn
+            .prepare("SELECT id FROM messages ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(remaining, vec![human_open, bot_recent]);
+        for gone in [human_acked, agent_msg, system_msg] {
+            assert!(!remaining.contains(&gone));
+        }
+
+        // Bot cutoff now covers the webhook row; the open human question stays.
+        let deleted = purge_old_messages_with_policy(&conn, now_ms(), now_ms()).unwrap();
+        assert_eq!(deleted, 1);
+        let remaining: Vec<i64> = conn
+            .prepare("SELECT id FROM messages ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(remaining, vec![human_open]);
+    }
+
+    #[test]
+    fn author_kind_round_trips_and_backfills_for_agent_rows() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("proj")).unwrap();
+        let id = insert_message(
+            &conn,
+            &Message {
+                author_kind: Some("bot".into()),
+                ..test_message("proj", "user", "beep", None)
+            },
+        )
+        .unwrap();
+        let stored = get_message_by_id(&conn, "proj", id).unwrap().unwrap();
+        assert_eq!(stored.author_kind.as_deref(), Some("bot"));
     }
 
     #[test]
