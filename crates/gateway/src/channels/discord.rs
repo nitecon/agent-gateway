@@ -22,8 +22,7 @@ use crate::channel::{ChannelPlugin, InboundMessage, OutboundMessage, PluginEvent
 
 /// Discord embed title limit (per API docs).
 const EMBED_TITLE_MAX: usize = 256;
-/// Discord embed description limit. We reserve room for the surrounding
-/// triple-backtick fence and an ellipsis.
+/// Keep descriptions below Discord's 4096-character limit.
 const EMBED_BODY_MAX: usize = 4000;
 /// Brand color for agent posts (Discord blurple).
 const EMBED_COLOR: u32 = 0x5865F2;
@@ -40,10 +39,8 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 fn build_embed(msg: &OutboundMessage) -> CreateEmbed {
     let title = truncate_chars(&msg.subject, EMBED_TITLE_MAX);
-    // Sanitize triple-backticks so user content cannot escape the fence.
-    let safe_body = msg.body.replace("```", "``\u{200B}`");
-    let body = truncate_chars(&safe_body, EMBED_BODY_MAX);
-    let description = format!("```\n{}\n```", body);
+    // Let Discord render Markdown, including any intentional code blocks.
+    let description = truncate_chars(&msg.body, EMBED_BODY_MAX);
     let author_name = format!("{} · {}", msg.agent_id, msg.hostname);
 
     let mut embed = CreateEmbed::new()
