@@ -1,8 +1,13 @@
 mod channel;
 mod channels;
 mod db;
+mod execution;
+mod execution_api;
+mod execution_client;
+mod execution_queue;
 mod projects;
 mod routes;
+mod subtasks;
 mod ui;
 mod ui_auth;
 
@@ -529,6 +534,12 @@ async fn main() -> Result<()> {
 
     // API routes require bearer auth.
     let api = Router::new()
+        .route("/v1/projects/{ident}/tasks/{id}/subtasks", get(subtasks::get).post(subtasks::create))
+        .route("/v1/execution/clients", get(execution_api::clients))
+        .route("/v1/execution/templates", get(execution_api::templates))
+        .route("/v1/projects/{ident}/execution/runs", get(execution_api::runs))
+        .route("/v1/execution/settings", get(execution_api::get_settings).put(execution_api::put_settings))
+        .route("/v1/projects/{ident}/execution", get(execution_api::get_project).put(execution_api::put_project))
         .route(
             "/v1/projects",
             get(routes::list_projects_handler).post(routes::register_project),
@@ -862,6 +873,7 @@ async fn main() -> Result<()> {
         .route("/agents/new", get(routes::new_agent_page))
         .route("/agents/{name}", get(routes::agent_detail_page))
         .route("/settings", get(ui::settings::settings_page))
+        .route("/execution", get(ui::execution::page))
         .route("/theme", get(routes::get_theme).post(routes::set_theme))
         .layer(middleware::from_fn_with_state(state.clone(), ui_page_auth));
 
@@ -877,7 +889,7 @@ async fn main() -> Result<()> {
         get(channels::whatsapp::verify_webhook).post(channels::whatsapp::receive_webhook),
     );
 
-    let app = app.merge(api).with_state(state);
+    let app = app.merge(api).with_state(state.clone());
 
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
@@ -885,6 +897,15 @@ async fn main() -> Result<()> {
     info!("Gateway listening on http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let mut execution_addr = listener.local_addr()?;
+    if execution_addr.ip().is_unspecified() {
+        execution_addr.set_ip(if execution_addr.is_ipv4() {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        } else {
+            std::net::Ipv6Addr::LOCALHOST.into()
+        });
+    }
+    execution_queue::start(state, format!("http://{execution_addr}"))?;
     axum::serve(listener, app).await?;
 
     Ok(())

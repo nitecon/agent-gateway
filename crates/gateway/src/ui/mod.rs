@@ -7,6 +7,7 @@
 //! defined once.
 
 pub mod activity;
+pub mod execution;
 pub mod home;
 pub mod inbox;
 pub mod projects;

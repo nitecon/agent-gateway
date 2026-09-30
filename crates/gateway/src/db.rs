@@ -1175,6 +1175,7 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         [],
     );
     let _ = conn.execute("ALTER TABLE tasks ADD COLUMN delegated_to_task_id TEXT", []);
+    crate::execution_queue::initialize(conn)?;
 
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS task_delegations (

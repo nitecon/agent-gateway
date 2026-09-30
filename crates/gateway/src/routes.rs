@@ -8492,7 +8492,7 @@ fn decode_nullable_string(
 
 /// Resolve the reporter/author identity from an explicit body field, the
 /// X-Agent-Id header, or fall back to `"user"`.
-fn resolve_identity(explicit: Option<String>, headers: &HeaderMap) -> String {
+pub(crate) fn resolve_identity(explicit: Option<String>, headers: &HeaderMap) -> String {
     if let Some(s) = explicit.and_then(|s| {
         let t = s.trim().to_string();
         if t.is_empty() {
@@ -9637,6 +9637,21 @@ pub(crate) fn render_task_link_page(detail: &db::TaskDetail, theme: &str) -> Str
   </div>
 </section>
 
+<section class="nd-card nd-mb-lg">
+  <div class="nd-card-header"><strong>Subtasks and reviews</strong></div>
+  <div class="nd-card-body">
+    <div id="task-subtasks" data-nd-bind="{api_url}/subtasks" data-nd-template="task-subtask-template">
+      <template id="task-subtask-template"><p><a href="/task-link/{{{{id}}}}">{{{{title}}}}</a> — {{{{project_ident}}}} — {{{{status}}}}</p></template>
+      <template data-nd-empty><p>No subtasks yet.</p></template>
+    </div>
+    <form class="nd-stack nd-gap-sm" data-nd-action="POST {api_url}/subtasks" data-nd-success="refresh:#task-subtasks,reset">
+      <label>Title <input name="title" required placeholder="Security review"></label>
+      <label>Target project <input name="target_project_ident" value="{ident}" required></label>
+      <label>Specification <textarea name="specification" rows="3" placeholder="Scope, acceptance criteria, and validation"></textarea></label>
+      <div><button type="submit" class="nd-btn-secondary nd-btn-sm">Add subtask</button></div>
+    </form>
+  </div>
+</section>
 <section class="nd-card">
   <div class="nd-card-header"><strong>Comments</strong></div>
   <div class="nd-card-body">
@@ -10293,7 +10308,7 @@ pub struct ChangePasswordRequest {
 }
 
 /// Bearer-key callers are administrators; browser sessions must be admins.
-fn require_admin(headers: &HeaderMap) -> Result<()> {
+pub(crate) fn require_admin(headers: &HeaderMap) -> Result<()> {
     match crate::ui_auth::request_user(headers) {
         None => Ok(()),
         Some(user) if user.is_admin() => Ok(()),

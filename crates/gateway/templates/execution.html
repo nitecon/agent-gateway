@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="nd-card">
+  <div class="nd-card-header"><strong>Agent execution{% if !project.is_empty() %} — {{ project }}{% endif %}</strong></div>
+  <div class="nd-card-body">
+    <p>Agents run on the gateway host, one run at a time. Clients use the gateway service account’s credentials and repository instructions.</p>
+    <ul>{% for client in clients %}<li>{{ client }}</li>{% endfor %}</ul>
+    <form id="execution-form" class="nd-stack nd-gap-sm" data-project="{{ project }}" data-settings="{{ settings_json }}">
+      {% if project.is_empty() %}
+      <label>Data directory <input class="nd-input" name="data_directory" placeholder="/srv/agent-repositories"></label>
+      <p class="gw-muted">Unmapped repositories are cloned here only when their project explicitly permits checkout. Select projects from the registry to configure mappings and triggers.</p>
+      {% else %}
+      <label>Local repository path <input class="nd-input" name="local_path" placeholder="/srv/checkouts/project"></label>
+      <p class="gw-muted">Use the absolute repository root. An invalid mapping stops execution; it never triggers a replacement checkout.</p>
+      <label><input type="checkbox" name="allow_checkout"> Allow checkout when no local mapping is set</label>
+      <label>Clone URL <input class="nd-input" name="clone_url" placeholder="git@github.com:organization/repository.git"></label>
+      <label><input type="checkbox" name="enabled"> Enable agent execution for this project</label>
+      <label><input type="checkbox" name="on_task_received"> Run when tasks are received</label>
+      <p class="gw-muted">Enabling the task trigger includes existing unclaimed tasks. Failed runs remain available for review and are not retried automatically.</p>
+      <label>Review cadence in seconds <input class="nd-input" name="cadence_seconds" type="number" min="60" max="31536000" placeholder="Leave blank to disable"></label>
+      <p><a href="/execution">Gateway data directory and default clients</a></p>
+      {% endif %}
+      <fieldset><legend>Client and model fallback order</legend>
+        <p class="gw-muted">Attempts run from top to bottom. Leave a model blank for the client’s default. Empty project lists inherit gateway defaults; empty gateway defaults try Claude then Codex.</p>
+        <div id="candidates" class="nd-stack nd-gap-sm"></div>
+        <button type="button" id="add-candidate" class="nd-btn-secondary nd-btn-sm">Add fallback</button>
+      </fieldset>
+      <div><button type="submit" class="nd-btn-primary">Save settings</button></div>
+      <p id="execution-result" role="status" aria-live="polite"></p>
+    </form>
+  </div>
+</section>
+<section class="nd-card nd-mt-md"><div class="nd-card-header"><strong>Base instructions</strong></div><div class="nd-card-body">
+  <details><summary>Task received</summary><pre style="white-space:pre-wrap">{{ task_template }}</pre></details>
+  <details><summary>Scheduled review</summary><pre style="white-space:pre-wrap">{{ cadence_template }}</pre></details>
+</div></section>
+{% if !project.is_empty() %}
+<section class="nd-card nd-mt-md">
+  <div class="nd-card-header"><strong>Recent runs</strong> <a href="">Refresh</a></div>
+  <div class="nd-card-body">
+    {% if runs.is_empty() %}<p>No executions recorded.</p>{% endif %}
+    {% for run in runs %}
+    <details class="nd-mb-sm">
+      <summary>{{ run.trigger }} — {{ run.status }} — {{ run.id }}</summary>
+      {% if let Some(task) = run.task_id %}<p><a href="/projects/{{ project }}/tasks/{{ task }}">Open task</a></p>{% endif %}
+      <pre style="white-space:pre-wrap;overflow-wrap:anywhere">{{ run.output }}</pre>
+      {% for attempt in run.attempts %}<pre style="white-space:pre-wrap;overflow-wrap:anywhere">{{ attempt }}</pre>{% endfor %}
+    </details>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+<script>
+(() => {
+  const form = document.getElementById('execution-form');
+  const settings = JSON.parse(form.dataset.settings);
+  const project = form.dataset.project;
+  const container = document.getElementById('candidates');
+  const result = document.getElementById('execution-result');
+  for (const [key, value] of Object.entries(settings)) {
+    const field = form.elements.namedItem(key);
+    if (!field) continue;
+    if (field.type === 'checkbox') field.checked = value;
+    else field.value = value ?? '';
+  }
+  function addCandidate(candidate = {client: 'claude', model: ''}) {
+    const row = document.createElement('div');
+    row.className = 'gw-inline-form';
+    const select = document.createElement('select');
+    select.setAttribute('aria-label', 'Client');
+    for (const client of ['claude', 'codex']) {
+      const option = document.createElement('option'); option.value = client; option.textContent = client; select.append(option);
+    }
+    select.value = candidate.client;
+    const input = document.createElement('input'); input.placeholder = 'Default model'; input.setAttribute('aria-label', 'Model'); input.value = candidate.model ?? '';
+    const up = document.createElement('button'); up.type = 'button'; up.textContent = 'Move up'; up.onclick = () => { if (row.previousElementSibling) container.insertBefore(row, row.previousElementSibling); };
+    const remove = document.createElement('button'); remove.type = 'button'; remove.textContent = 'Remove'; remove.onclick = () => row.remove();
+    row.append(select, input, up, remove); container.append(row);
+  }
+  settings.candidates.forEach(addCandidate);
+  document.getElementById('add-candidate').onclick = () => addCandidate();
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    const value = {};
+    for (const key of Object.keys(settings)) {
+      const field = form.elements.namedItem(key); if (!field) continue;
+      value[key] = field.type === 'checkbox' ? field.checked : (field.value.trim() || null);
+    }
+    if (project && value.cadence_seconds !== null) value.cadence_seconds = Number(value.cadence_seconds);
+    value.candidates = [...container.children].map(row => ({client: row.querySelector('select').value, model: row.querySelector('input').value.trim() || null}));
+    const button = form.querySelector('[type=submit]'); button.disabled = true; result.textContent = 'Saving…';
+    try {
+      const response = await fetch(project ? `/v1/projects/${encodeURIComponent(project)}/execution` : '/v1/execution/settings', {method: 'PUT', headers: {'Content-Type': 'application/json', 'X-Gateway-UI': '1'}, body: JSON.stringify(value)});
+      if (!response.ok) throw new Error((await response.json()).error || 'Could not save settings');
+      result.textContent = 'Settings saved.';
+    } catch (error) { result.textContent = error.message; }
+    finally { button.disabled = false; }
+  });
+})();
+</script>
+{% endblock %}
