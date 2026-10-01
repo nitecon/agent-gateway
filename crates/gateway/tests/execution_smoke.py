@@ -9,11 +9,13 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.request
+import uuid
 
 ROOT = Path(__file__).resolve().parents[3]
 FIXTURE = Path(tempfile.mkdtemp(prefix="execution-smoke-", dir=ROOT / "target"))
@@ -35,14 +37,18 @@ def api(path, body=None, method=None):
         return json.load(response)
 
 
-def wait_run(project, task=None):
+def wait_run(project, task=None, run_id=None):
     deadline = time.monotonic() + 25
     while time.monotonic() < deadline:
         for run in api(f"/v1/projects/{project}/execution/runs"):
-            if (task is None or run["task_id"] == task) and run["status"] not in ("queued", "running"):
+            if (task is None or run["task_id"] == task) and (run_id is None or run["id"] == run_id) and run["status"] not in ("queued", "running"):
                 return run
         time.sleep(0.2)
     raise AssertionError(f"execution did not finish: {project}")
+
+
+def delegated_task(project, title):
+    return api("/v1/projects/source/tasks/delegate", {"target_project_ident": project, "title": title})["target_task"]
 
 
 def git(*args, cwd):
@@ -106,40 +112,60 @@ if match:
         assert all(item["path"].startswith(str(binaries)) for item in clients)
         candidates = [{"client": "claude", "model": "primary"}, {"client": "claude", "model": "secondary"}, {"client": "codex", "model": "fallback"}]
         api("/v1/execution/settings", {"data_directory": str(FIXTURE / "managed"), "candidates": candidates}, "PUT")
-        for project in ["mapped", "cloned", "source", "disabled", "cadence", "failure", "unfinished"]:
+        for project in ["mapped", "cloned", "source", "disabled", "cadence", "failure", "unfinished", "legacy"]:
             api("/v1/projects", {"ident": project})
         api("/v1/projects/mapped/execution", {"local_path": str(checkout), "enabled": True, "on_task_received": True}, "PUT")
-        task = api("/v1/projects/mapped/tasks", {"title": "Mapped execution"})
+        api("/v1/projects/source/execution", {"local_path": str(checkout), "enabled": True, "on_task_received": True}, "PUT")
+        planning = api("/v1/projects/mapped/tasks", {"title": "Ordinary planning must not execute"})
+        with sqlite3.connect(FIXTURE / "gateway.db") as conn:
+            conn.execute("UPDATE tasks SET created_at=0 WHERE id=?", (planning["id"],))
+        task = delegated_task("mapped", "Mapped delegated execution")
         run = wait_run("mapped", task["id"])
         assert run["status"] == "completed", run
         assert [a["candidate"] for a in run["attempts"]] == candidates
         assert [a["success"] for a in run["attempts"]] == [False, False, True]
         assert str(checkout) in run["attempts"][-1]["output"]
         api("/v1/projects/cloned/execution", {"allow_checkout": True, "clone_url": "https://fixture.invalid/repository.git", "enabled": True, "on_task_received": True}, "PUT")
-        cloned_task = api("/v1/projects/cloned/tasks", {"title": "Checkout execution"})
+        cloned_task = delegated_task("cloned", "Checkout execution")
         assert wait_run("cloned", cloned_task["id"])["status"] == "completed"
         assert len(list((FIXTURE / "managed").iterdir())) == 1
-        second = api("/v1/projects/cloned/tasks", {"title": "Reuse managed checkout"})
+        second = delegated_task("cloned", "Reuse managed checkout")
         assert wait_run("cloned", second["id"])["status"] == "completed"
         assert len(list((FIXTURE / "managed").iterdir())) == 1
         delegated = api("/v1/projects/source/tasks/delegate", {"target_project_ident": "mapped", "title": "Delegated incident"})
         assert wait_run("mapped", delegated["target_task"]["id"])["status"] == "completed"
         parent = api("/v1/projects/source/tasks", {"title": "Parent work"})
         child = api(f'/v1/projects/source/tasks/{parent["id"]}/subtasks', {"title": "Security review", "target_project_ident": "mapped"})
-        assert wait_run("mapped", child["id"])["status"] == "completed"
         children = api(f'/v1/projects/source/tasks/{parent["id"]}/subtasks')
-        assert children[0]["status"] == "done"
+        assert children[0]["status"] == "todo"
         api("/v1/projects/cadence/execution", {"local_path": str(checkout), "enabled": True, "cadence_seconds": 60}, "PUT")
-        assert wait_run("cadence")["status"] == "completed"
+        ordinary_cadence = api("/v1/projects/cadence/tasks", {"title": "Cadence must ignore planning"})
+        cadence_task = delegated_task("cadence", "Scheduled delegated work")
+        assert wait_run("cadence", cadence_task["id"])["status"] == "completed"
         api("/v1/projects/disabled/tasks", {"title": "Do not execute"})
         for project, status in [("failure", "failed"), ("unfinished", "needs_attention")]:
             api(f"/v1/projects/{project}/execution", {"local_path": str(checkout), "enabled": True, "on_task_received": True}, "PUT")
-            task = api(f"/v1/projects/{project}/tasks", {"title": "Leave open on unsuccessful work"})
+            task = delegated_task(project, "Leave open on unsuccessful work")
             run = wait_run(project, task["id"])
             assert run["status"] == status, run
             assert api(f'/v1/projects/{project}/tasks/{task["id"]}')["status"] == "todo"
         assert api("/v1/projects/disabled/execution/runs") == []
-        assert len(api("/v1/projects/mapped/execution/runs")) == 3
+        assert len(api("/v1/projects/mapped/execution/runs")) == 2
+        assert api("/v1/projects/source/execution/runs") == []
+        assert api(f'/v1/projects/mapped/tasks/{planning["id"]}')["status"] == "todo"
+        assert api(f'/v1/projects/mapped/tasks/{child["id"]}')["status"] == "todo"
+        assert api(f'/v1/projects/cadence/tasks/{ordinary_cadence["id"]}')["status"] == "todo"
+        assert len(api("/v1/projects/cadence/execution/runs")) == 1
+        # Old-version queue entries must not bypass delegation checks after upgrade.
+        api("/v1/projects/legacy/execution", {"local_path": str(checkout), "enabled": True, "on_task_received": True, "cadence_seconds": 60}, "PUT")
+        old_task = api("/v1/projects/legacy/tasks", {"title": "Previously queued planning task"})
+        for task_id, trigger in [(old_task["id"], "task"), (None, "cadence")]:
+            run_id = str(uuid.uuid4())
+            with sqlite3.connect(FIXTURE / "gateway.db") as conn:
+                conn.execute("INSERT INTO execution_runs(id,project_ident,task_id,trigger,dedup_key,status,created_at) VALUES (?,'legacy',?,?,?,'queued',?)", (run_id,task_id,trigger,run_id,int(time.time()*1000)))
+            run = wait_run("legacy", run_id=run_id)
+            assert run["status"] == "cancelled", run
+            assert run["attempts"] == [], run
         print(json.dumps({"result": "passed", "url": URL, "fixture": str(FIXTURE), "parent_task": parent["id"]}), flush=True)
         if "--hold" in sys.argv:
             (ROOT / "target/execution-smoke.json").write_text(json.dumps({"url": URL, "fixture": str(FIXTURE), "parent_task": parent["id"]}))

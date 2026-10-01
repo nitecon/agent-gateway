@@ -15,9 +15,10 @@
       <label><input type="checkbox" name="allow_checkout"> Allow checkout when no local mapping is set</label>
       <label>Clone URL <input class="nd-input" name="clone_url" placeholder="git@github.com:organization/repository.git"></label>
       <label><input type="checkbox" name="enabled"> Enable agent execution for this project</label>
-      <label><input type="checkbox" name="on_task_received"> Run when tasks are received</label>
-      <p class="gw-muted">Enabling the task trigger includes existing unclaimed tasks. Failed runs remain available for review and are not retried automatically.</p>
-      <label>Review cadence in seconds <input class="nd-input" name="cadence_seconds" type="number" min="60" max="31536000" placeholder="Leave blank to disable"></label>
+      <label><input type="checkbox" name="on_task_received"> Run when delegated tasks are received</label>
+      <p class="gw-muted">Only open, unclaimed tasks delegated in from another project can start execution. Ordinary planning tasks and subtasks do not, regardless of age. Failed runs are not retried automatically.</p>
+      <label>Delegation check cadence in seconds <input class="nd-input" name="cadence_seconds" type="number" min="60" max="31536000" placeholder="Leave blank to disable"></label>
+      <p class="gw-muted">Cadence checks the same incoming delegated tasks; it never launches a general task-board review.</p>
       <p><a href="/execution">Gateway data directory and default clients</a></p>
       {% endif %}
       <fieldset><legend>Client and model fallback order</legend>

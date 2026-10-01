@@ -93,8 +93,32 @@ fn enqueue(
     Ok(())
 }
 
-/// Poll durable tasks, including delegated and artifact-generated tasks; no delivery can
-/// be lost between committing a task and notifying an in-memory worker.
+/// Incoming delegated targets are stored as normal tasks. The delegation row,
+/// not the task kind or title, establishes that another project allocated work.
+fn eligible_delegated_tasks(
+    conn: &Connection,
+    project: &str,
+    task: Option<&str>,
+) -> Result<Vec<String>> {
+    let mut statement = conn.prepare(
+        "SELECT t.id FROM tasks t
+         WHERE t.project_ident=?1 AND (?2 IS NULL OR t.id=?2)
+           AND t.status='todo' AND t.kind='normal' AND t.owner_agent_id IS NULL
+           AND EXISTS (
+             SELECT 1 FROM task_delegations d
+             WHERE d.target_project_ident=t.project_ident AND d.target_task_id=t.id
+               AND d.source_project_ident != d.target_project_ident
+               AND d.completed_at IS NULL)
+         ORDER BY t.created_at,t.id",
+    )?;
+    let tasks = statement
+        .query_map(params![project, task], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(tasks)
+}
+
+/// Poll durable incoming delegations. Ordinary planning tasks and subtasks do
+/// not authorize another unattended agent, regardless of their age.
 pub fn schedule(conn: &Connection, now: i64) -> Result<()> {
     for project in db::all_projects(conn)? {
         if project.archived_at.is_some() {
@@ -104,39 +128,32 @@ pub fn schedule(conn: &Connection, now: i64) -> Result<()> {
         if !policy.enabled {
             continue;
         }
-        if policy.on_task_received {
-            let mut statement = conn.prepare("SELECT id FROM tasks WHERE project_ident=?1 AND status='todo' AND kind='normal' AND owner_agent_id IS NULL ORDER BY created_at")?;
-            let tasks = statement
-                .query_map([&project.ident], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            for task in tasks {
-                enqueue(
-                    conn,
-                    &project.ident,
-                    Some(&task),
-                    "task",
-                    &format!("task:{task}"),
-                    now,
-                )?;
-            }
-        }
-        if let Some(seconds) = policy.cadence_seconds {
+        let trigger = if policy.on_task_received {
+            "task"
+        } else if let Some(seconds) = policy.cadence_seconds {
             let last: Option<i64> = conn.query_row("SELECT MAX(created_at) FROM execution_runs WHERE project_ident=?1 AND trigger='cadence'", [&project.ident], |r| r.get(0))?;
             let pending: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM execution_runs WHERE project_ident=?1 AND status IN ('queued','running'))", [&project.ident], |r| r.get(0))?;
-            if !pending
-                && last.is_none_or(|last| {
-                    now.saturating_sub(last) >= (seconds as i64).saturating_mul(1000)
+            if pending
+                || last.is_some_and(|last| {
+                    now.saturating_sub(last) < (seconds as i64).saturating_mul(1000)
                 })
             {
-                enqueue(
-                    conn,
-                    &project.ident,
-                    None,
-                    "cadence",
-                    &format!("cadence:{}:{now}", project.ident),
-                    now,
-                )?;
+                continue;
             }
+            "cadence"
+        } else {
+            continue;
+        };
+        for task in eligible_delegated_tasks(conn, &project.ident, None)? {
+            // Both triggers share one dedup key; cadence cannot replay failed work.
+            enqueue(
+                conn,
+                &project.ident,
+                Some(&task),
+                trigger,
+                &format!("task:{task}"),
+                now,
+            )?;
         }
     }
     Ok(())
@@ -152,8 +169,8 @@ fn finish(conn: &Connection, id: &str, status: &str, message: &str) -> Result<()
 
 pub fn prompt(project: &str, task: Option<&str>) -> String {
     let assignment = match task {
-        Some(task) => format!("A new task {task} was allocated to project {project}. Fetch its current detail and comments, evaluate whether completion is feasible within this repository's scope, and claim it before making changes. If another agent owns it or it is done, stop."),
-        None => format!("Perform the scheduled task review for project {project}. Inspect its task board, evaluate pending work within this repository's scope, claim feasible work and complete it. If there is no actionable work, report that and stop."),
+        Some(task) => format!("A new task {task} was allocated to project {project}. Fetch its current detail and comments, evaluate whether completion is feasible within this repository's scope, and claim it before making changes. If another agent owns it or it is done, stop. This run is limited to this incoming delegated task. Do not claim unrelated ordinary planning tasks or launch work from a general task-board scan."),
+        None => format!("Scheduled execution for project {project} is restricted to incoming delegated target tasks selected by the gateway. Each actual run receives a specific task ID. Without an assigned delegated task ID, stop; do not scan or claim ordinary planning tasks or subtasks."),
     };
     format!("{assignment}\nYou are running in the project's repository root. Read and obey AGENTS.md and repository instructions. Use agent-tools and memory from this directory for project context. Verify that those tools point to this gateway and project before mutating tickets. The authoritative gateway URL is in GATEWAY_EXECUTION_URL and bearer token in GATEWAY_EXECUTION_API_KEY; never print the token. If CLI configuration does not match, use the gateway REST API at /v1/projects/{project}/tasks and /tasks/{{id}}, with Authorization: Bearer and a consistent X-Agent-Id. Claim using PATCH status=in_progress. Add progress with POST /tasks/{{id}}/comments. Evaluate scope and feasibility first. For work belonging elsewhere, use cross-project task delegation rather than modifying another repository. Create additional review/testing tasks with POST /v1/projects/{project}/tasks/{{parent_id}}/subtasks using title, description, specification, optional target_project_ident and labels. GET that same subtask endpoint to check reviews; wait for required reviews/testing before closing the parent. On a blocker, leave the task open with an actionable comment. After implementation and relevant verification, mark the ticket done using agent-tools tasks done or PATCH status=done; never mark unfinished work complete. A prior execution attempt may have partially changed files: inspect current state and avoid repeating completed side effects. Stay within the requested task; do not push, deploy or publish unless the task authorizes it.")
 }
@@ -183,19 +200,17 @@ async fn execute(
                 "Project execution or trigger disabled",
             );
         }
-        if let Some(task) = task {
-            let detail =
-                db::get_task_detail(&conn, project, task)?.context("task no longer exists")?;
-            if detail.task.status != "todo" || detail.task.owner_agent_id.is_some() {
-                return finish(
-                    &conn,
-                    id,
-                    "cancelled",
-                    "Task is already claimed or complete",
-                );
-            }
-        } else if trigger == "task" {
-            return finish(&conn, id, "cancelled", "Task was deleted");
+        let eligible = match task {
+            Some(task) => !eligible_delegated_tasks(&conn, project, Some(task))?.is_empty(),
+            None => false,
+        };
+        if !eligible {
+            return finish(
+                &conn,
+                id,
+                "cancelled",
+                "Run requires an unclaimed, open incoming delegated task",
+            );
         }
         (execution::settings(&conn)?, policy)
     };
@@ -217,14 +232,29 @@ async fn execute(
         ]
     };
     for (position, candidate) in candidates.iter().enumerate() {
-        // Re-check opt-in before every fallback, too.
-        if !execution::project_settings(&state.db.lock().unwrap(), project)?.enabled {
-            return finish(
-                &state.db.lock().unwrap(),
-                id,
-                "cancelled",
-                "Execution disabled",
-            );
+        // Checkout can take time. Recheck eligibility before starting a client;
+        // a fallback may continue a task claimed by the preceding attempt.
+        {
+            let conn = state.db.lock().unwrap();
+            let current = execution::project_settings(&conn, project)?;
+            let incoming = task
+                .map(|task| db::get_delegation_by_target(&conn, project, task))
+                .transpose()?
+                .flatten()
+                .is_some_and(|d| d.source_project_ident != project && d.completed_at.is_none());
+            if !current.enabled
+                || (trigger == "task" && !current.on_task_received)
+                || (trigger == "cadence" && current.cadence_seconds.is_none())
+                || !incoming
+                || (position == 0 && eligible_delegated_tasks(&conn, project, task)?.is_empty())
+            {
+                return finish(
+                    &conn,
+                    id,
+                    "cancelled",
+                    "Execution disabled or incoming delegation no longer eligible",
+                );
+            }
         }
         let outcome = match execution_client::executable_on_path(candidate.client.executable()) {
             Some(path) => {
@@ -334,61 +364,173 @@ pub fn start(state: AppState, url: String) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn durable_task_trigger_is_opt_in_and_deduplicated() {
+    fn fixture() -> db::Db {
         let database = db::open(":memory:").unwrap();
-        let conn = database.lock().unwrap();
-        conn.execute("INSERT INTO projects(ident,channel_name,room_id,created_at) VALUES ('sre','discord','',0)", []).unwrap();
-        let task = db::insert_task(
-            &conn,
-            "sre",
-            "Review assigned incident",
+        {
+            let conn = database.lock().unwrap();
+            for project in ["source", "sre"] {
+                conn.execute("INSERT INTO projects(ident,channel_name,room_id,created_at) VALUES (?1,'discord','',0)", [project]).unwrap();
+            }
+        }
+        database
+    }
+
+    fn ordinary(conn: &Connection, project: &str) -> db::Task {
+        db::insert_task(
+            conn,
+            project,
+            "Agent planning task",
             None,
             None,
             &[],
             None,
-            "source",
+            "agent",
+        )
+        .unwrap()
+    }
+
+    fn incoming(conn: &Connection) -> db::Task {
+        let target = ordinary(conn, "sre");
+        let source = db::insert_delegated_task(
+            conn,
+            &db::DelegatedTaskInsert {
+                project_ident: "source",
+                title: "Delegated incident",
+                description: None,
+                details: None,
+                labels: &[],
+                hostname: None,
+                reporter: "agent",
+                target_project_ident: "sre",
+                target_task_id: &target.id,
+            },
         )
         .unwrap();
+        db::insert_task_delegation(conn, "source", &source.id, "sre", &target.id, None, None)
+            .unwrap();
+        target
+    }
+
+    fn enable(conn: &Connection, on_task_received: bool, cadence_seconds: Option<u64>) {
+        for project in ["sre", "source"] {
+            execution::save_project_settings(
+                conn,
+                project,
+                &execution::ProjectSettings {
+                    enabled: true,
+                    on_task_received,
+                    cadence_seconds,
+                    local_path: Some("/srv/repo".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn ordinary_tasks_and_subtasks_never_trigger_even_when_old() {
+        let database = fixture();
+        let conn = database.lock().unwrap();
+        let parent = ordinary(&conn, "source");
+        let child = ordinary(&conn, "sre");
+        conn.execute(
+            "INSERT INTO task_subtasks(parent_id,child_id) VALUES (?1,?2)",
+            params![parent.id, child.id],
+        )
+        .unwrap();
+        conn.execute("UPDATE tasks SET created_at=0", []).unwrap();
+        for received in [true, false] {
+            enable(&conn, received, Some(60));
+            schedule(&conn, 2 * 86_400_000).unwrap();
+            assert!(runs(&conn, "sre").unwrap().is_empty());
+            assert!(runs(&conn, "source").unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn incoming_trigger_is_opt_in_and_shared_across_triggers() {
+        let database = fixture();
+        let conn = database.lock().unwrap();
+        let task = incoming(&conn);
         schedule(&conn, 1000).unwrap();
         assert!(runs(&conn, "sre").unwrap().is_empty());
-        let policy = execution::ProjectSettings {
-            enabled: true,
-            on_task_received: true,
-            local_path: Some("/srv/sre".into()),
-            ..Default::default()
-        };
-        execution::save_project_settings(&conn, "sre", &policy).unwrap();
+        enable(&conn, true, None);
         schedule(&conn, 2000).unwrap();
         schedule(&conn, 3000).unwrap();
         let queued = runs(&conn, "sre").unwrap();
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].task_id.as_deref(), Some(task.id.as_str()));
+        assert!(runs(&conn, "source").unwrap().is_empty());
         finish(&conn, &queued[0].id, "failed", "client unavailable").unwrap();
-        schedule(&conn, 4000).unwrap();
+        enable(&conn, false, Some(60));
+        schedule(&conn, 100_000).unwrap();
         assert_eq!(runs(&conn, "sre").unwrap().len(), 1);
     }
 
     #[test]
-    fn cadence_respects_interval_and_outstanding_work() {
-        let database = db::open(":memory:").unwrap();
+    fn eligibility_requires_current_open_unclaimed_incoming_relationship() {
+        let database = fixture();
         let conn = database.lock().unwrap();
-        conn.execute("INSERT INTO projects(ident,channel_name,room_id,created_at) VALUES ('sre','discord','',0)", []).unwrap();
-        let policy = execution::ProjectSettings {
-            enabled: true,
-            cadence_seconds: Some(60),
-            local_path: Some("/srv/sre".into()),
-            ..Default::default()
-        };
-        execution::save_project_settings(&conn, "sre", &policy).unwrap();
+        let task = incoming(&conn);
+        assert_eq!(
+            eligible_delegated_tasks(&conn, "sre", Some(&task.id)).unwrap(),
+            vec![task.id.clone()]
+        );
+        assert!(eligible_delegated_tasks(&conn, "source", Some(&task.id))
+            .unwrap()
+            .is_empty());
+        for assignment in [
+            "status='done'",
+            "status='in_progress'",
+            "status='todo',owner_agent_id='working-agent'",
+        ] {
+            conn.execute(
+                &format!("UPDATE tasks SET {assignment} WHERE id=?1"),
+                [&task.id],
+            )
+            .unwrap();
+            assert!(eligible_delegated_tasks(&conn, "sre", Some(&task.id))
+                .unwrap()
+                .is_empty());
+        }
+        conn.execute(
+            "UPDATE tasks SET status='todo',owner_agent_id=NULL WHERE id=?1",
+            [&task.id],
+        )
+        .unwrap();
+        conn.execute("UPDATE task_delegations SET completed_at=1", [])
+            .unwrap();
+        assert!(eligible_delegated_tasks(&conn, "sre", Some(&task.id))
+            .unwrap()
+            .is_empty());
+        conn.execute("DELETE FROM task_delegations", []).unwrap();
+        assert!(eligible_delegated_tasks(&conn, "sre", Some(&task.id))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn cadence_requires_delegated_task_and_respects_interval_and_pending_work() {
+        let database = fixture();
+        let conn = database.lock().unwrap();
+        enable(&conn, false, Some(60));
         schedule(&conn, 1000).unwrap();
+        assert!(runs(&conn, "sre").unwrap().is_empty());
+        let first = incoming(&conn);
+        schedule(&conn, 1000).unwrap();
+        let second = incoming(&conn);
         schedule(&conn, 100_000).unwrap();
         let queued = runs(&conn, "sre").unwrap();
         assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].trigger, "cadence");
+        assert_eq!(queued[0].task_id.as_deref(), Some(first.id.as_str()));
         finish(&conn, &queued[0].id, "completed", "reviewed").unwrap();
         schedule(&conn, 59_000).unwrap();
         assert_eq!(runs(&conn, "sre").unwrap().len(), 1);
         schedule(&conn, 61_000).unwrap();
-        assert_eq!(runs(&conn, "sre").unwrap().len(), 2);
+        let queued = runs(&conn, "sre").unwrap();
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[0].task_id.as_deref(), Some(second.id.as_str()));
     }
 }
