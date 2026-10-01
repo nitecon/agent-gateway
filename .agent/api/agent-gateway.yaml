@@ -4,7 +4,7 @@ summary: Agent coordination gateway for project-scoped comms, task boards, proje
 kind: agent_context
 source_format: agent_context
 source_ref: .agent/api/agent-gateway.yaml
-version: v1.16.1
+version: v1.16.2
 labels:
   - gateway
   - agents

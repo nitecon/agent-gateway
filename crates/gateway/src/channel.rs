@@ -93,6 +93,8 @@ pub enum PluginEvent {
 ///   2. `start()` — called once after all rooms are registered; the plugin
 ///      begins receiving inbound messages and pushes them into `tx`.
 ///   3. `ensure_room()` / `send()` / `fetch_since()` — called by HTTP handlers.
+// async_trait adds must_use to boxed futures, which Rust 1.99 already marks must_use.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ChannelPlugin: Send + Sync {
     /// Short lowercase identifier used in config and the database ("discord", "slack", …).
