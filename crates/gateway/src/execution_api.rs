@@ -11,12 +11,23 @@ use axum::{
 
 type Result<T> = std::result::Result<Json<T>, AppError>;
 
-pub async fn templates(headers: HeaderMap) -> Result<serde_json::Value> {
+pub async fn templates(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<execution::Templates> {
     require_admin(&headers)?;
-    Ok(Json(serde_json::json!({
-        "task": crate::execution_queue::prompt("PROJECT", Some("TASK_ID")),
-        "cadence": crate::execution_queue::prompt("PROJECT", None),
-    })))
+    Ok(Json(execution::templates(&state.db.lock().unwrap())?))
+}
+
+pub async fn put_templates(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(value): Json<execution::Templates>,
+) -> Result<execution::Templates> {
+    require_admin(&headers)?;
+    execution::save_templates(&state.db.lock().unwrap(), &value)
+        .map_err(|e| AppError(StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(value))
 }
 
 pub async fn runs(
@@ -90,8 +101,27 @@ pub async fn put_project(
 mod tests {
     use super::*;
 
+    fn state() -> AppState {
+        AppState {
+            db: crate::db::open(":memory:").unwrap(),
+            plugins: Default::default(),
+            #[cfg(feature = "whatsapp")]
+            whatsapp: None,
+            default_channel: String::new(),
+            api_key: String::new(),
+            ui_auth_enabled: true,
+            retention_days: 30,
+            bot_retention_days: 7,
+            artifact_operations: Default::default(),
+            artifact_body_schema_enabled: false,
+            artifact_auth_enforced: false,
+            update_available: Default::default(),
+        }
+    }
+
     #[tokio::test]
     async fn execution_metadata_requires_admin_for_browser_sessions() {
+        let state = state();
         let mut headers = HeaderMap::new();
         headers.insert(
             crate::ui_auth::USER_HEADER,
@@ -103,10 +133,86 @@ mod tests {
             StatusCode::FORBIDDEN
         );
         assert_eq!(
-            templates(headers.clone()).await.err().unwrap().0,
+            templates(State(state.clone()), headers.clone())
+                .await
+                .err()
+                .unwrap()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            put_templates(
+                State(state.clone()),
+                headers.clone(),
+                Json(execution::Templates::default())
+            )
+            .await
+            .err()
+            .unwrap()
+            .0,
             StatusCode::FORBIDDEN
         );
         headers.insert(crate::ui_auth::USER_ROLE_HEADER, "admin".parse().unwrap());
-        assert!(templates(headers).await.is_ok());
+        assert!(templates(State(state), headers).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn instructions_round_trip_and_reject_empty_updates() {
+        let state = state();
+        let defaults = templates(State(state.clone()), HeaderMap::new())
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(defaults, execution::Templates::default());
+        let value = execution::Templates {
+            task: "\nTask {{task_id}} in {{project}}: preserve <text> & whitespace.\n".into(),
+            cadence: "Scheduled {{project}} / {{task_id}}".into(),
+        };
+        assert_eq!(
+            put_templates(State(state.clone()), HeaderMap::new(), Json(value.clone()))
+                .await
+                .unwrap()
+                .0,
+            value
+        );
+        let saved = templates(State(state.clone()), HeaderMap::new())
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(saved, value);
+        assert_eq!(
+            saved.render("fixture", "123", "task"),
+            "\nTask 123 in fixture: preserve <text> & whitespace.\n"
+        );
+        assert_eq!(
+            saved.render("fixture", "123", "cadence"),
+            "Scheduled fixture / 123"
+        );
+        for invalid in [
+            execution::Templates {
+                task: " \n".into(),
+                ..value.clone()
+            },
+            execution::Templates {
+                cadence: String::new(),
+                ..value.clone()
+            },
+        ] {
+            assert_eq!(
+                put_templates(State(state.clone()), HeaderMap::new(), Json(invalid))
+                    .await
+                    .err()
+                    .unwrap()
+                    .0,
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(
+                templates(State(state.clone()), HeaderMap::new())
+                    .await
+                    .unwrap()
+                    .0,
+                value
+            );
+        }
     }
 }

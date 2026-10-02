@@ -167,7 +167,7 @@ fn finish(conn: &Connection, id: &str, status: &str, message: &str) -> Result<()
     Ok(())
 }
 
-pub fn prompt(project: &str, task: Option<&str>) -> String {
+pub fn default_prompt(project: &str, task: Option<&str>) -> String {
     let assignment = match task {
         Some(task) => format!("A new task {task} was allocated to project {project}. Fetch its current detail and comments, evaluate whether completion is feasible within this repository's scope, and claim it before making changes. If another agent owns it or it is done, stop. This run is limited to this incoming delegated task. Do not claim unrelated ordinary planning tasks or launch work from a general task-board scan."),
         None => format!("Scheduled execution for project {project} is restricted to incoming delegated target tasks selected by the gateway. Each actual run receives a specific task ID. Without an assigned delegated task ID, stop; do not scan or claim ordinary planning tasks or subtasks."),
@@ -183,7 +183,7 @@ async fn execute(
     task: Option<&str>,
     trigger: &str,
 ) -> Result<()> {
-    let (global, policy) = {
+    let (global, policy, instructions) = {
         let conn = state.db.lock().unwrap();
         let project_record =
             db::get_project(&conn, project)?.context("project no longer exists")?;
@@ -212,7 +212,11 @@ async fn execute(
                 "Run requires an unclaimed, open incoming delegated task",
             );
         }
-        (execution::settings(&conn)?, policy)
+        (
+            execution::settings(&conn)?,
+            policy,
+            execution::templates(&conn)?.render(project, task.unwrap(), trigger),
+        )
     };
     let directory = execution::resolve_repository(project, &global, &policy).await?;
     let candidates = if !policy.candidates.is_empty() {
@@ -262,7 +266,7 @@ async fn execute(
                     candidate,
                     &path,
                     &directory,
-                    &prompt(project, task),
+                    &instructions,
                     Duration::from_secs(1800),
                     Some((url, &state.api_key)),
                 )

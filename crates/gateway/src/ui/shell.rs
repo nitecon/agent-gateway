@@ -72,6 +72,39 @@ pub struct ProjectNav<'a> {
     pub active_tab: &'a str,
 }
 
+pub struct SettingsNav<'a> {
+    pub active_tab: &'a str,
+    pub is_admin: bool,
+    pub has_account: bool,
+}
+
+impl SettingsNav<'_> {
+    pub fn tabs(&self) -> Vec<ProjectTab> {
+        [
+            ("gateway", "Gateway", "/settings/gateway", true),
+            (
+                "account",
+                "Your account",
+                "/settings/account",
+                self.has_account,
+            ),
+            ("users", "Users", "/settings/users", self.is_admin),
+            ("execution", "Agent execution", "/execution", self.is_admin),
+            ("retention", "Retention", "/settings/retention", true),
+            ("appearance", "Appearance", "/settings/appearance", true),
+            ("projects", "Projects", "/settings/projects", true),
+        ]
+        .into_iter()
+        .filter(|(_, _, _, visible)| *visible)
+        .map(|(key, label, href, _)| ProjectTab {
+            key,
+            label,
+            href: href.into(),
+        })
+        .collect()
+    }
+}
+
 impl ProjectNav<'_> {
     pub fn tabs(&self) -> Vec<ProjectTab> {
         let ident = self.ident;
@@ -112,6 +145,7 @@ struct ShellOpen<'a> {
     page_title: &'a str,
     nav: &'a str,
     project: Option<ProjectNav<'a>>,
+    settings: Option<SettingsNav<'a>>,
 }
 
 #[derive(Template)]
@@ -176,6 +210,7 @@ pub fn control_panel_open(page_title: &str, active: &str) -> String {
         page_title,
         nav: nav_key(active),
         project: None,
+        settings: None,
     }
     .render()
     .expect("shell_open template renders")
@@ -188,6 +223,27 @@ pub fn control_panel_open_project(page_title: &str, ident: &str, active_tab: &st
         page_title,
         nav: "projects",
         project: Some(ProjectNav { ident, active_tab }),
+        settings: None,
+    }
+    .render()
+    .expect("shell_open template renders")
+}
+
+pub fn control_panel_open_settings(
+    page_title: &str,
+    active_tab: &str,
+    is_admin: bool,
+    has_account: bool,
+) -> String {
+    ShellOpen {
+        page_title,
+        nav: "settings",
+        project: None,
+        settings: Some(SettingsNav {
+            active_tab,
+            is_admin,
+            has_account,
+        }),
     }
     .render()
     .expect("shell_open template renders")

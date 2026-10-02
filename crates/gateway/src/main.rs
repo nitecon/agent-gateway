@@ -536,7 +536,7 @@ async fn main() -> Result<()> {
     let api = Router::new()
         .route("/v1/projects/{ident}/tasks/{id}/subtasks", get(subtasks::get).post(subtasks::create))
         .route("/v1/execution/clients", get(execution_api::clients))
-        .route("/v1/execution/templates", get(execution_api::templates))
+        .route("/v1/execution/templates", get(execution_api::templates).put(execution_api::put_templates))
         .route("/v1/projects/{ident}/execution/runs", get(execution_api::runs))
         .route("/v1/execution/settings", get(execution_api::get_settings).put(execution_api::put_settings))
         .route("/v1/projects/{ident}/execution", get(execution_api::get_project).put(execution_api::put_project))
@@ -873,6 +873,7 @@ async fn main() -> Result<()> {
         .route("/agents/new", get(routes::new_agent_page))
         .route("/agents/{name}", get(routes::agent_detail_page))
         .route("/settings", get(ui::settings::settings_page))
+        .route("/settings/{section}", get(ui::settings::section_page))
         .route("/execution", get(ui::execution::page))
         .route("/theme", get(routes::get_theme).post(routes::set_theme))
         .layer(middleware::from_fn_with_state(state.clone(), ui_page_auth));

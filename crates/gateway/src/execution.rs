@@ -32,6 +32,52 @@ pub struct Settings {
     pub candidates: Vec<Candidate>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Templates {
+    pub task: String,
+    pub cadence: String,
+}
+
+impl Default for Templates {
+    fn default() -> Self {
+        let task = crate::execution_queue::default_prompt("{{project}}", Some("{{task_id}}"));
+        Self {
+            cadence: format!(
+                "This is a scheduled execution of an incoming delegated task.\n{task}"
+            ),
+            task,
+        }
+    }
+}
+
+impl Templates {
+    pub fn render(&self, project: &str, task: &str, trigger: &str) -> String {
+        let template = if trigger == "cadence" {
+            &self.cadence
+        } else {
+            &self.task
+        };
+        template
+            .replace("{{project}}", project)
+            .replace("{{task_id}}", task)
+    }
+}
+
+pub fn templates(conn: &Connection) -> Result<Templates> {
+    Ok(db::get_setting(conn, "execution.templates")?
+        .map(|json| serde_json::from_str(&json))
+        .transpose()?
+        .unwrap_or_default())
+}
+
+pub fn save_templates(conn: &Connection, value: &Templates) -> Result<()> {
+    if value.task.trim().is_empty() || value.cadence.trim().is_empty() {
+        bail!("base instructions must not be empty");
+    }
+    db::set_setting(conn, "execution.templates", &serde_json::to_string(value)?)
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProjectSettings {

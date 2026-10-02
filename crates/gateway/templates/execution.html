@@ -32,8 +32,15 @@
   </div>
 </section>
 <section class="nd-card nd-mt-md"><div class="nd-card-header"><strong>Base instructions</strong></div><div class="nd-card-body">
-  <details><summary>Task received</summary><pre style="white-space:pre-wrap">{{ task_template }}</pre></details>
-  <details><summary>Scheduled review</summary><pre style="white-space:pre-wrap">{{ cadence_template }}</pre></details>
+  <p class="gw-muted">These instructions apply to all projects and are used by future runs. Use <code>{% raw %}{{project}}{% endraw %}</code> for the project and <code>{% raw %}{{task_id}}{% endraw %}</code> for the assigned delegated task ID.</p>
+  <form id="instructions-form" class="nd-stack nd-gap-sm">
+    <label for="task-instructions">Task received</label>
+    <textarea id="task-instructions" class="nd-input" name="task" rows="12" required>{{ task_template }}</textarea>
+    <label for="cadence-instructions">Scheduled review</label>
+    <textarea id="cadence-instructions" class="nd-input" name="cadence" rows="12" required>{{ cadence_template }}</textarea>
+    <div><button type="submit" class="nd-btn-primary">Save instructions</button></div>
+    <p id="instructions-result" role="status" aria-live="polite"></p>
+  </form>
 </div></section>
 {% if !project.is_empty() %}
 <section class="nd-card nd-mt-md">
@@ -53,6 +60,19 @@
 {% endif %}
 <script>
 (() => {
+  const instructionsForm = document.getElementById('instructions-form');
+  instructionsForm.addEventListener('submit', async event => {
+    event.preventDefault();
+    const button = instructionsForm.querySelector('[type=submit]');
+    const result = document.getElementById('instructions-result');
+    button.disabled = true; result.textContent = 'Saving…';
+    try {
+      const response = await fetch('/v1/execution/templates', {method: 'PUT', headers: {'Content-Type': 'application/json', 'X-Gateway-UI': '1'}, body: JSON.stringify(Object.fromEntries(new FormData(instructionsForm)))});
+      if (!response.ok) throw new Error((await response.json()).error || 'Could not save instructions');
+      result.textContent = 'Instructions saved.';
+    } catch (error) { result.textContent = error.message; }
+    finally { button.disabled = false; }
+  });
   const form = document.getElementById('execution-form');
   const settings = JSON.parse(form.dataset.settings);
   const project = form.dataset.project;

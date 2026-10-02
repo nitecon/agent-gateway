@@ -50,8 +50,22 @@ pub async fn page(
         )
     };
     let theme = db::get_theme(&conn)?;
+    let templates = execution::templates(&conn)?;
     let chrome = if project.is_empty() {
-        PageChrome::global("Agent execution", "Agent execution", "settings", &theme, "")
+        let mut chrome = PageChrome::global(
+            "Agent execution",
+            "Settings — Agent execution",
+            "settings",
+            &theme,
+            "",
+        );
+        chrome.shell_open = super::shell::control_panel_open_settings(
+            "Settings — Agent execution",
+            "execution",
+            true,
+            crate::ui_auth::request_user(&headers).is_some(),
+        );
+        chrome
     } else {
         PageChrome::project(
             "Agent execution",
@@ -68,22 +82,8 @@ pub async fn page(
         project: project.clone(),
         settings_json,
         runs,
-        task_template: execution_queue::prompt(
-            if project.is_empty() {
-                "PROJECT"
-            } else {
-                &project
-            },
-            Some("TASK_ID"),
-        ),
-        cadence_template: execution_queue::prompt(
-            if project.is_empty() {
-                "PROJECT"
-            } else {
-                &project
-            },
-            None,
-        ),
+        task_template: templates.task,
+        cadence_template: templates.cadence,
         clients: execution_client::discover()
             .into_iter()
             .map(|c| {

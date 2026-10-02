@@ -4,7 +4,7 @@ summary: Agent coordination gateway for project-scoped comms, task boards, proje
 kind: agent_context
 source_format: agent_context
 source_ref: .agent/api/agent-gateway.yaml
-version: v1.16.2
+version: v1.17.0
 labels:
   - gateway
   - agents
@@ -58,11 +58,12 @@ content:
   workflows:
     - name: Configure repository execution
       steps:
+        - "The control panel opens Settings at /settings/gateway. Secondary navigation selects individual full-width Gateway, Your account, Users, Agent execution (/execution), Retention, Appearance and Projects pages. Account requires a signed-in user; Users and Agent execution require an administrator."
         - "Administrator: PUT /v1/execution/settings with an absolute data_directory and ordered candidates [{client: claude, model: MODEL}, {client: codex, model: null}]. Model names pass through unchanged. Empty gateway candidates try Claude then Codex."
         - "Discover gateway-host clients with GET /v1/execution/clients; service-account PATH and credentials control availability."
         - "PUT /v1/projects/:ident/execution with local_path for an existing repository root, or allow_checkout=true and an explicit HTTPS/SSH clone_url. Enable execution separately with enabled=true. Checkout is never inferred from execution permission."
         - "Set on_task_received=true and/or cadence_seconds (60–31536000). Both triggers select only open, unclaimed incoming cross-project delegated target tasks using task_delegations. Ordinary planning tasks, subtasks, and source tracking tasks are excluded regardless of age. Cadence binds runs to specific eligible target IDs instead of scanning the general task board. A nonempty project candidates list overrides gateway defaults. PUT replaces the full configuration; omitted fields return to defaults."
-        - "GET /v1/execution/templates returns base instructions for scope evaluation, task claiming, repository-scoped execution, verification and closing completed tickets. Clients inherit local memory/tools context through repository cwd and receive GATEWAY_EXECUTION_URL / GATEWAY_EXECUTION_API_KEY for authoritative API access."
+        - "GET /v1/execution/templates returns gateway-wide base instructions as {task, cadence}. Administrators can edit both on /execution or PUT the full pair of nonempty strings to /v1/execution/templates. Saved text persists across restarts independently of execution settings and applies to future runs in every project. The task template is used for task-received runs and cadence for scheduled runs; {{project}} and {{task_id}} are replaced with the assigned project and delegated task ID. Default instructions cover scope evaluation, task claiming, repository-scoped execution, verification and closing completed tickets. Clients inherit local memory/tools context through repository cwd and receive GATEWAY_EXECUTION_URL / GATEWAY_EXECUTION_API_KEY for authoritative API access."
         - "GET /v1/projects/:ident/execution/runs shows the latest 100 runs and ordered attempts. Missing clients, failures and timeouts trigger fallback; process success alone does not close a task. needs_attention means the client exited successfully but the task remains open. failed and interrupted task runs are not automatically replayed; review their current state before continuing manually. Both triggers share one run per task; old queued ordinary-task and unscoped cadence runs are cancelled before execution."
         - "POST /v1/projects/:ident/tasks/:id/subtasks creates a linked child using title plus optional description, specification, labels and target_project_ident. GET lists child tasks and current statuses. Subtask creation alone does not launch execution. Use explicit cross-project delegation to hand off work for automatic execution; the target project's execution policy applies. Wait for required reviews/testing before closing the parent."
     - name: Register and communicate for a project

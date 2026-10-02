@@ -66,7 +66,7 @@ def main():
 import json, os, re, sys, urllib.request
 from pathlib import Path
 prompt = sys.stdin.read()
-print(json.dumps({"cwd": os.getcwd(), "argv": sys.argv[1:]}))
+print(json.dumps({"cwd": os.getcwd(), "argv": sys.argv[1:], "prompt": prompt}))
 if Path(sys.argv[0]).name == "claude":
     print("simulated provider outage", file=sys.stderr)
     sys.exit(1)
@@ -112,6 +112,11 @@ if match:
         assert all(item["path"].startswith(str(binaries)) for item in clients)
         candidates = [{"client": "claude", "model": "primary"}, {"client": "claude", "model": "secondary"}, {"client": "codex", "model": "fallback"}]
         api("/v1/execution/settings", {"data_directory": str(FIXTURE / "managed"), "candidates": candidates}, "PUT")
+        instructions = api("/v1/execution/templates")
+        instructions["task"] += "\nEdited task instructions for {{project}} / {{task_id}}."
+        instructions["cadence"] += "\nEdited scheduled instructions for {{project}} / {{task_id}}."
+        api("/v1/execution/templates", instructions, "PUT")
+        assert api("/v1/execution/templates") == instructions
         for project in ["mapped", "cloned", "source", "disabled", "cadence", "failure", "unfinished", "legacy"]:
             api("/v1/projects", {"ident": project})
         api("/v1/projects/mapped/execution", {"local_path": str(checkout), "enabled": True, "on_task_received": True}, "PUT")
@@ -125,6 +130,8 @@ if match:
         assert [a["candidate"] for a in run["attempts"]] == candidates
         assert [a["success"] for a in run["attempts"]] == [False, False, True]
         assert str(checkout) in run["attempts"][-1]["output"]
+        assert f'Edited task instructions for mapped / {task["id"]}.' in run["attempts"][-1]["output"]
+        assert "Edited scheduled instructions" not in run["attempts"][-1]["output"]
         api("/v1/projects/cloned/execution", {"allow_checkout": True, "clone_url": "https://fixture.invalid/repository.git", "enabled": True, "on_task_received": True}, "PUT")
         cloned_task = delegated_task("cloned", "Checkout execution")
         assert wait_run("cloned", cloned_task["id"])["status"] == "completed"
@@ -141,7 +148,10 @@ if match:
         api("/v1/projects/cadence/execution", {"local_path": str(checkout), "enabled": True, "cadence_seconds": 60}, "PUT")
         ordinary_cadence = api("/v1/projects/cadence/tasks", {"title": "Cadence must ignore planning"})
         cadence_task = delegated_task("cadence", "Scheduled delegated work")
-        assert wait_run("cadence", cadence_task["id"])["status"] == "completed"
+        cadence_run = wait_run("cadence", cadence_task["id"])
+        assert cadence_run["status"] == "completed"
+        assert f'Edited scheduled instructions for cadence / {cadence_task["id"]}.' in cadence_run["attempts"][-1]["output"]
+        assert "Edited task instructions" not in cadence_run["attempts"][-1]["output"]
         api("/v1/projects/disabled/tasks", {"title": "Do not execute"})
         for project, status in [("failure", "failed"), ("unfinished", "needs_attention")]:
             api(f"/v1/projects/{project}/execution", {"local_path": str(checkout), "enabled": True, "on_task_received": True}, "PUT")

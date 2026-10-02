@@ -48,4 +48,11 @@
       {% endfor %}
     </nav>
     {% endif %}
+    {% if let Some(settings) = settings %}
+    <nav class="gw-tabs" aria-label="Settings sections">
+      {% for tab in settings.tabs() %}
+      <a href="{{ tab.href }}"{% if tab.key == settings.active_tab %} class="gw-tab-active" aria-current="page"{% endif %}>{{ tab.label }}</a>
+      {% endfor %}
+    </nav>
+    {% endif %}
     <main class="app-content">
