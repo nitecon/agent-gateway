@@ -4,12 +4,29 @@ use crate::{
     AppState,
 };
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
 
 type Result<T> = std::result::Result<Json<T>, AppError>;
+
+#[derive(Default, serde::Deserialize)]
+pub struct RunQuery {
+    pub task_id: Option<String>,
+}
+
+pub async fn all_runs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Vec<crate::execution_queue::Run>> {
+    require_admin(&headers)?;
+    Ok(Json(crate::execution_queue::list_runs(
+        &state.db.lock().unwrap(),
+        None,
+        None,
+    )?))
+}
 
 pub async fn templates(
     State(state): State<AppState>,
@@ -34,6 +51,7 @@ pub async fn runs(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(ident): Path<String>,
+    Query(query): Query<RunQuery>,
 ) -> Result<Vec<crate::execution_queue::Run>> {
     require_admin(&headers)?;
     let conn = state.db.lock().unwrap();
@@ -41,7 +59,10 @@ pub async fn runs(
     if crate::db::get_project(&conn, &ident)?.is_none() {
         return Err(AppError(StatusCode::NOT_FOUND, "project not found".into()));
     }
-    Ok(Json(crate::execution_queue::runs(&conn, &ident)?))
+    Ok(Json(match query.task_id.as_deref() {
+        Some(task) => crate::execution_queue::list_runs(&conn, Some(&ident), Some(task))?,
+        None => crate::execution_queue::runs(&conn, &ident)?,
+    }))
 }
 
 pub async fn clients(headers: HeaderMap) -> Result<Vec<crate::execution_client::DiscoveredClient>> {
@@ -130,6 +151,35 @@ mod tests {
         headers.insert(crate::ui_auth::USER_ROLE_HEADER, "member".parse().unwrap());
         assert_eq!(
             clients(headers.clone()).await.err().unwrap().0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            all_runs(State(state.clone()), headers.clone())
+                .await
+                .err()
+                .unwrap()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            crate::execution_socket::sessions(State(state.clone()), headers.clone())
+                .await
+                .err()
+                .unwrap()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            runs(
+                State(state.clone()),
+                headers.clone(),
+                Path("fixture".into()),
+                Query(RunQuery::default())
+            )
+            .await
+            .err()
+            .unwrap()
+            .0,
             StatusCode::FORBIDDEN
         );
         assert_eq!(

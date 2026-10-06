@@ -89,6 +89,16 @@ pub struct ProjectSettings {
     pub cadence_seconds: Option<u64>,
     /// Empty inherits the gateway candidate list.
     pub candidates: Vec<Candidate>,
+    /// Interactive execution waits for a registered cmux session; it never falls back to headless.
+    pub executor: Executor,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Executor {
+    #[default]
+    Headless,
+    Cmux,
 }
 
 fn validate_path(value: Option<&str>, name: &str) -> Result<()> {
@@ -163,10 +173,15 @@ pub fn save_project_settings(
     {
         bail!("cadence_seconds must be between 60 and 31536000 or null");
     }
-    if value.enabled && value.local_path.is_none() && !value.allow_checkout {
+    if value.executor == Executor::Headless
+        && value.enabled
+        && value.local_path.is_none()
+        && !value.allow_checkout
+    {
         bail!("execution requires a local mapping or checkout permission");
     }
-    if value.enabled
+    if value.executor == Executor::Headless
+        && value.enabled
         && value.local_path.is_none()
         && (value.clone_url.is_none() || settings(conn)?.data_directory.is_none())
     {

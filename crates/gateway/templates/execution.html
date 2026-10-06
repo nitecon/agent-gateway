@@ -1,15 +1,29 @@
 {% extends "base.html" %}
 {% block content %}
+<section class="nd-card nd-mb-md">
+  <div class="nd-card-header"><strong>Execution overview</strong><span id="runs-refresh" class="gw-muted" role="status">Updates every 3 seconds</span></div>
+  <div class="nd-card-body">
+    <label>Project <select id="execution-project" class="nd-input"><option value="">All projects</option>{% for ident in projects %}<option value="{{ ident }}" {% if ident.as_str() == project.as_str() %}selected{% endif %}>{{ ident }}</option>{% endfor %}</select></label>
+    <p id="run-counts" class="gw-muted"></p>
+    <div id="execution-runs">
+      {% if runs.is_empty() %}<p>No executions recorded.</p>{% endif %}
+      {% for run in runs %}<details data-run-id="{{ run.id }}"><summary>{{ run.project_ident }} — {{ run.status }} — {% if let Some(title) = run.task_title %}{{ title }}{% else %}{{ run.id }}{% endif %}</summary><p>{{ run.progress }}</p><pre style="white-space:pre-wrap">{{ run.summary }}</pre></details>{% endfor %}
+    </div>
+    <details class="nd-mt-md"><summary>Interactive sessions</summary><div id="execution-sessions"><p>No session information loaded.</p></div></details>
+  </div>
+</section>
 <section class="nd-card">
   <div class="nd-card-header"><strong>Agent execution{% if !project.is_empty() %} — {{ project }}{% endif %}</strong></div>
   <div class="nd-card-body">
-    <p>Agents run on the gateway host, one run at a time. Clients use the gateway service account’s credentials and repository instructions.</p>
+    <p>Gateway-host agents run one at a time using the service account’s credentials. Projects can also route delegated tasks to a registered interactive session.</p>
     <ul>{% for client in clients %}<li>{{ client }}</li>{% endfor %}</ul>
     <form id="execution-form" class="nd-stack nd-gap-sm" data-project="{{ project }}" data-settings="{{ settings_json }}">
       {% if project.is_empty() %}
       <label>Data directory <input class="nd-input" name="data_directory" placeholder="/srv/agent-repositories"></label>
       <p class="gw-muted">Unmapped repositories are cloned here only when their project explicitly permits checkout. Select projects from the registry to configure mappings and triggers.</p>
       {% else %}
+      <label>Execution location <select class="nd-input" name="executor"><option value="headless">Gateway host</option><option value="cmux">Interactive cmux session</option></select></label>
+      <p class="gw-muted">Interactive execution waits for an idle session mapped to this project. Configure its repository in cmux; gateway paths and client fallbacks apply to gateway-host execution.</p>
       <label>Local repository path <input class="nd-input" name="local_path" placeholder="/srv/checkouts/project"></label>
       <p class="gw-muted">Use the absolute repository root. An invalid mapping stops execution; it never triggers a replacement checkout.</p>
       <label><input type="checkbox" name="allow_checkout"> Allow checkout when no local mapping is set</label>
@@ -42,22 +56,6 @@
     <p id="instructions-result" role="status" aria-live="polite"></p>
   </form>
 </div></section>
-{% if !project.is_empty() %}
-<section class="nd-card nd-mt-md">
-  <div class="nd-card-header"><strong>Recent runs</strong> <a href="">Refresh</a></div>
-  <div class="nd-card-body">
-    {% if runs.is_empty() %}<p>No executions recorded.</p>{% endif %}
-    {% for run in runs %}
-    <details class="nd-mb-sm">
-      <summary>{{ run.trigger }} — {{ run.status }} — {{ run.id }}</summary>
-      {% if let Some(task) = run.task_id %}<p><a href="/projects/{{ project }}/tasks/{{ task }}">Open task</a></p>{% endif %}
-      <pre style="white-space:pre-wrap;overflow-wrap:anywhere">{{ run.output }}</pre>
-      {% for attempt in run.attempts %}<pre style="white-space:pre-wrap;overflow-wrap:anywhere">{{ attempt }}</pre>{% endfor %}
-    </details>
-    {% endfor %}
-  </div>
-</section>
-{% endif %}
 <script>
 (() => {
   const instructionsForm = document.getElementById('instructions-form');
@@ -76,6 +74,81 @@
   const form = document.getElementById('execution-form');
   const settings = JSON.parse(form.dataset.settings);
   const project = form.dataset.project;
+  document.getElementById('execution-project').addEventListener('change', event => {
+    window.location.href = event.target.value ? '/execution?project=' + encodeURIComponent(event.target.value) : '/execution';
+  });
+  const runContainer = document.getElementById('execution-runs');
+  const refreshStatus = document.getElementById('runs-refresh');
+  const task = new URLSearchParams(window.location.search).get('task_id');
+  const runsUrl = project ? '/v1/projects/' + encodeURIComponent(project) + '/execution/runs' + (task ? '?task_id=' + encodeURIComponent(task) : '') : '/v1/execution/runs';
+  function element(tag, text, className) {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = text;
+    if (className) node.className = className;
+    return node;
+  }
+  const date = value => value ? new Date(value).toLocaleString() : '—';
+  function textBlock(parent, text) {
+    const node = element('pre', text);
+    node.style.whiteSpace = 'pre-wrap'; node.style.overflowWrap = 'anywhere'; parent.append(node);
+  }
+  function renderRuns(runs) {
+    const open = new Set([...runContainer.querySelectorAll('details[open][data-run-id]')].map(node => node.dataset.runId));
+    const diagnosticsOpen = new Set([...runContainer.querySelectorAll('details[open][data-diagnostics-id]')].map(node => node.dataset.diagnosticsId));
+    const counts = {};
+    const fragment = document.createDocumentFragment();
+    if (!runs.length) fragment.append(element('p','No executions recorded.'));
+    for (const run of runs) {
+      counts[run.status] = (counts[run.status] || 0) + 1;
+      const row = element('details', undefined, 'nd-mb-md'); row.dataset.runId = run.id; row.open = open.has(run.id);
+      row.append(element('summary', run.project_ident + ' — ' + run.status.replaceAll('_',' ') + ' — ' + (run.task_title || run.id)));
+      const facts = element('p', (run.client || 'Awaiting client') + (run.model ? ' / ' + run.model : '') + ' · ' + (run.executor === 'cmux' ? 'Interactive' : 'Gateway host'));
+      row.append(facts,element('p','Queued: ' + date(run.created_at) + ' · Started: ' + date(run.started_at) + ' · Finished: ' + date(run.finished_at), 'gw-muted'));
+      row.append(element('p','Last update: ' + date(run.updated_at), 'gw-muted'));
+      if (run.progress) textBlock(row,run.progress);
+      row.append(element('strong','Outcome summary'));
+      if (run.summary) {
+        row.append(element('p',run.summary_source === 'partial' ? 'Partial response — the complete final result was not captured successfully.' : 'Reported by the agent.', 'gw-muted'));
+        textBlock(row,run.summary);
+      } else row.append(element('p',run.finished_at ? 'No outcome summary was reported. Inspect diagnostics and task comments.' : 'Awaiting the agent’s outcome summary.', 'gw-muted'));
+      row.append(element('p',run.output));
+      if (run.task_id) {
+        const link = element('a','Open task'); link.href = '/projects/' + encodeURIComponent(run.project_ident) + '/tasks/' + encodeURIComponent(run.task_id); row.append(link);
+      }
+      const diagnostics = element('details', undefined, 'nd-mt-sm'); diagnostics.dataset.diagnosticsId = run.id; diagnostics.open = diagnosticsOpen.has(run.id);
+      diagnostics.append(element('summary','Attempt diagnostics'));
+      for (const attempt of run.attempts) textBlock(diagnostics,JSON.stringify(attempt,null,2));
+      if (!run.attempts.length) diagnostics.append(element('p','No finished attempts.'));
+      row.append(diagnostics); fragment.append(row);
+    }
+    runContainer.replaceChildren(fragment);
+    document.getElementById('run-counts').textContent = Object.entries(counts).map(([state,count]) => count + ' ' + state.replaceAll('_',' ')).join(' · ');
+  }
+  function renderSessions(sessions) {
+    const container = document.getElementById('execution-sessions');
+    const fragment = document.createDocumentFragment();
+    const visible = sessions.filter(session => !project || session.project_ident === project);
+    if (!visible.length) fragment.append(element('p','No interactive sessions registered.'));
+    for (const session of visible) {
+      fragment.append(element('p',session.project_ident + ' · ' + session.client + ' · ' + session.state.replaceAll('_',' ') + ' · ' + (session.connected ? 'Connected' : 'Disconnected') + ' · Last seen: ' + date(session.last_seen_at)));
+    }
+    container.replaceChildren(fragment);
+  }
+  async function refreshRuns() {
+    if (document.hidden) return;
+    try {
+      const headers = {'X-Gateway-UI':'1'};
+      const response = await fetch(runsUrl,{headers});
+      if (!response.ok) throw new Error('Execution updates unavailable (' + response.status + ')');
+      renderRuns(await response.json());
+      const sessionsResponse = await fetch('/v1/execution/sessions',{headers});
+      if (sessionsResponse.ok) renderSessions(await sessionsResponse.json());
+      refreshStatus.textContent = 'Updated ' + new Date().toLocaleTimeString() + ' · every 3 seconds';
+    } catch (error) { refreshStatus.textContent = error.message; }
+  }
+  refreshRuns();
+  setInterval(refreshRuns,3000);
+
   const container = document.getElementById('candidates');
   const result = document.getElementById('execution-result');
   for (const [key, value] of Object.entries(settings)) {

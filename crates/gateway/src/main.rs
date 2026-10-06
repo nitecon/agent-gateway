@@ -5,6 +5,7 @@ mod execution;
 mod execution_api;
 mod execution_client;
 mod execution_queue;
+mod execution_socket;
 mod projects;
 mod routes;
 mod subtasks;
@@ -536,6 +537,9 @@ async fn main() -> Result<()> {
     let api = Router::new()
         .route("/v1/projects/{ident}/tasks/{id}/subtasks", get(subtasks::get).post(subtasks::create))
         .route("/v1/execution/clients", get(execution_api::clients))
+        .route("/v1/execution/runs", get(execution_api::all_runs))
+        .route("/v1/execution/connect", get(execution_socket::connect))
+        .route("/v1/execution/sessions", get(execution_socket::sessions))
         .route("/v1/execution/templates", get(execution_api::templates).put(execution_api::put_templates))
         .route("/v1/projects/{ident}/execution/runs", get(execution_api::runs))
         .route("/v1/execution/settings", get(execution_api::get_settings).put(execution_api::put_settings))

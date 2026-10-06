@@ -1,6 +1,6 @@
 use crate::{
     db,
-    execution::{self, Candidate, Client},
+    execution::{self, Candidate, Client, Executor},
     execution_client, AppState,
 };
 use anyhow::{Context, Result};
@@ -37,6 +37,31 @@ pub fn initialize(conn: &Connection) -> Result<()> {
     );
     CREATE INDEX IF NOT EXISTS task_subtasks_parent ON task_subtasks(parent_id);",
     )?;
+    // Additive migration for gateways that already have execution history.
+    let columns = conn
+        .prepare("PRAGMA table_info(execution_runs)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (name, definition) in [
+        ("started_at", "INTEGER"),
+        ("updated_at", "INTEGER"),
+        ("client", "TEXT"),
+        ("model", "TEXT"),
+        ("executor", "TEXT NOT NULL DEFAULT 'headless'"),
+        ("progress", "TEXT NOT NULL DEFAULT ''"),
+        ("summary", "TEXT NOT NULL DEFAULT ''"),
+        ("summary_source", "TEXT NOT NULL DEFAULT 'missing'"),
+        ("session_key", "TEXT"),
+        ("last_sequence", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !columns.iter().any(|column| column == name) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE execution_runs ADD COLUMN {name} {definition}"
+            ))?;
+        }
+    }
+    conn.execute("UPDATE execution_runs SET updated_at=COALESCE(finished_at,created_at) WHERE updated_at IS NULL", [])?;
+    crate::execution_socket::initialize(conn)?;
     Ok(())
 }
 
@@ -51,12 +76,40 @@ pub struct Run {
     pub finished_at: Option<i64>,
     pub output: String,
     pub attempts: Vec<serde_json::Value>,
+    pub task_title: Option<String>,
+    pub started_at: Option<i64>,
+    pub updated_at: i64,
+    pub client: Option<String>,
+    pub model: Option<String>,
+    pub executor: String,
+    pub progress: String,
+    pub summary: String,
+    pub summary_source: String,
+    pub session_key: Option<String>,
+    pub last_sequence: i64,
 }
 
 pub fn runs(conn: &Connection, project: &str) -> Result<Vec<Run>> {
-    let mut statement = conn.prepare("SELECT id, project_ident, task_id, trigger, status, created_at, finished_at, output FROM execution_runs WHERE project_ident=?1 ORDER BY created_at DESC, id DESC LIMIT 100")?;
+    list_runs(conn, Some(project), None)
+}
+
+pub fn list_runs(conn: &Connection, project: Option<&str>, task: Option<&str>) -> Result<Vec<Run>> {
+    select_runs(conn, project, task, None)
+}
+
+pub fn run(conn: &Connection, project: &str, id: &str) -> Result<Option<Run>> {
+    Ok(select_runs(conn, Some(project), None, Some(id))?.pop())
+}
+
+fn select_runs(
+    conn: &Connection,
+    project: Option<&str>,
+    task: Option<&str>,
+    id: Option<&str>,
+) -> Result<Vec<Run>> {
+    let mut statement = conn.prepare("SELECT r.id,r.project_ident,r.task_id,r.trigger,r.status,r.created_at,r.finished_at,r.output,t.title,r.started_at,COALESCE(r.updated_at,r.created_at),r.client,r.model,r.executor,r.progress,r.summary,r.summary_source,r.session_key,r.last_sequence FROM execution_runs r LEFT JOIN tasks t ON t.id=r.task_id WHERE (?1 IS NULL OR r.project_ident=?1) AND (?2 IS NULL OR r.task_id=?2) AND (?3 IS NULL OR r.id=?3) ORDER BY CASE WHEN r.finished_at IS NULL THEN 0 ELSE 1 END,r.created_at DESC,r.id DESC LIMIT 100")?;
     let mut runs = statement
-        .query_map([project], |row| {
+        .query_map(params![project, task, id], |row| {
             Ok(Run {
                 id: row.get(0)?,
                 project_ident: row.get(1)?,
@@ -67,6 +120,17 @@ pub fn runs(conn: &Connection, project: &str) -> Result<Vec<Run>> {
                 finished_at: row.get(6)?,
                 output: row.get(7)?,
                 attempts: vec![],
+                task_title: row.get(8)?,
+                started_at: row.get(9)?,
+                updated_at: row.get(10)?,
+                client: row.get(11)?,
+                model: row.get(12)?,
+                executor: row.get(13)?,
+                progress: row.get(14)?,
+                summary: row.get(15)?,
+                summary_source: row.get(16)?,
+                session_key: row.get(17)?,
+                last_sequence: row.get(18)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -95,7 +159,7 @@ fn enqueue(
 
 /// Incoming delegated targets are stored as normal tasks. The delegation row,
 /// not the task kind or title, establishes that another project allocated work.
-fn eligible_delegated_tasks(
+pub(crate) fn eligible_delegated_tasks(
     conn: &Connection,
     project: &str,
     task: Option<&str>,
@@ -132,7 +196,7 @@ pub fn schedule(conn: &Connection, now: i64) -> Result<()> {
             "task"
         } else if let Some(seconds) = policy.cadence_seconds {
             let last: Option<i64> = conn.query_row("SELECT MAX(created_at) FROM execution_runs WHERE project_ident=?1 AND trigger='cadence'", [&project.ident], |r| r.get(0))?;
-            let pending: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM execution_runs WHERE project_ident=?1 AND status IN ('queued','running'))", [&project.ident], |r| r.get(0))?;
+            let pending: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM execution_runs WHERE project_ident=?1 AND finished_at IS NULL)", [&project.ident], |r| r.get(0))?;
             if pending
                 || last.is_some_and(|last| {
                     now.saturating_sub(last) < (seconds as i64).saturating_mul(1000)
@@ -154,17 +218,60 @@ pub fn schedule(conn: &Connection, now: i64) -> Result<()> {
                 &format!("task:{task}"),
                 now,
             )?;
+            conn.execute("UPDATE execution_runs SET executor=?2,updated_at=COALESCE(updated_at,created_at) WHERE dedup_key=?1 AND status='queued'", params![format!("task:{task}"), if policy.executor == Executor::Cmux { "cmux" } else { "headless" }])?;
         }
     }
     Ok(())
 }
 
-fn finish(conn: &Connection, id: &str, status: &str, message: &str) -> Result<()> {
+pub(crate) fn finish(conn: &Connection, id: &str, status: &str, message: &str) -> Result<()> {
     conn.execute(
-        "UPDATE execution_runs SET status=?2, finished_at=?3, output=?4 WHERE id=?1",
+        "UPDATE execution_runs SET status=?2, finished_at=?3, updated_at=?3, output=?4 WHERE id=?1",
         params![id, status, db::now_ms(), message],
     )?;
     Ok(())
+}
+
+pub fn bounded(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        return value.to_owned();
+    }
+    let mut end = limit.saturating_sub(32);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n[truncated]", &value[..end])
+}
+
+pub fn redacted(value: &str, key: &str, limit: usize) -> String {
+    bounded(
+        &if key.is_empty() {
+            value.to_owned()
+        } else {
+            value.replace(key, "[redacted]")
+        },
+        limit,
+    )
+}
+
+pub fn progress(conn: &Connection, id: &str, message: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE execution_runs SET progress=?2,updated_at=?3 WHERE id=?1 AND finished_at IS NULL",
+        params![id, bounded(message, 4096), db::now_ms()],
+    )?;
+    Ok(())
+}
+
+pub fn summary(conn: &Connection, id: &str, message: &str, source: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE execution_runs SET summary=?2,summary_source=?3,updated_at=?4 WHERE id=?1",
+        params![id, bounded(message, 16384), source, db::now_ms()],
+    )?;
+    Ok(())
+}
+
+pub fn reporting_prompt() -> &'static str {
+    "\nReport concise progress and blockers as you work. End your final response with a concise execution summary: work performed, validation and results, blockers or questions, and relevant commit/artifact references. Describe unfinished work accurately; a response ending does not mean the task is done."
 }
 
 pub fn default_prompt(project: &str, task: Option<&str>) -> String {
@@ -218,7 +325,17 @@ async fn execute(
             execution::templates(&conn)?.render(project, task.unwrap(), trigger),
         )
     };
+    if policy.executor != Executor::Headless {
+        return finish(
+            &state.db.lock().unwrap(),
+            id,
+            "cancelled",
+            "Project now uses interactive execution",
+        );
+    }
+    progress(&state.db.lock().unwrap(), id, "Preparing repository")?;
     let directory = execution::resolve_repository(project, &global, &policy).await?;
+    let instructions = format!("{instructions}{}", reporting_prompt());
     let candidates = if !policy.candidates.is_empty() {
         policy.candidates
     } else if !global.candidates.is_empty() {
@@ -247,6 +364,7 @@ async fn execute(
                 .flatten()
                 .is_some_and(|d| d.source_project_ident != project && d.completed_at.is_none());
             if !current.enabled
+                || current.executor != Executor::Headless
                 || (trigger == "task" && !current.on_task_received)
                 || (trigger == "cadence" && current.cadence_seconds.is_none())
                 || !incoming
@@ -260,6 +378,19 @@ async fn execute(
                 );
             }
         }
+        {
+            let conn = state.db.lock().unwrap();
+            conn.execute("UPDATE execution_runs SET client=?2,model=?3,summary='',summary_source='missing',updated_at=?4 WHERE id=?1", params![id,candidate.client.executable(),candidate.model,db::now_ms()])?;
+            progress(
+                &conn,
+                id,
+                &format!(
+                    "Starting {} attempt {}",
+                    candidate.client.executable(),
+                    position + 1
+                ),
+            )?;
+        }
         let outcome = match execution_client::executable_on_path(candidate.client.executable()) {
             Some(path) => {
                 execution_client::attempt(
@@ -269,6 +400,11 @@ async fn execute(
                     &instructions,
                     Duration::from_secs(1800),
                     Some((url, &state.api_key)),
+                    Some(execution_client::Observer {
+                        db: state.db.clone(),
+                        run_id: id.to_owned(),
+                        api_key: state.api_key.clone(),
+                    }),
                 )
                 .await
             }
@@ -281,15 +417,32 @@ async fn execute(
             candidate: candidate.clone(),
             success: false,
             output: error.to_string(),
+            summary: None,
+            summary_complete: false,
         });
         if !state.api_key.is_empty() {
             attempt.output = attempt.output.replace(&state.api_key, "[redacted]");
         }
+        attempt.summary = attempt
+            .summary
+            .map(|value| redacted(&value, &state.api_key, 16384));
         let conn = state.db.lock().unwrap();
         conn.execute(
             "INSERT INTO execution_attempts(run_id,position,body) VALUES (?1,?2,?3)",
             params![id, position as i64, serde_json::to_string(&attempt)?],
         )?;
+        if let Some(value) = &attempt.summary {
+            summary(
+                &conn,
+                id,
+                value,
+                if attempt.success && attempt.summary_complete {
+                    "client_final"
+                } else {
+                    "partial"
+                },
+            )?;
+        }
         let done = task
             .map(|task| {
                 db::get_task_detail(&conn, project, task)
@@ -328,17 +481,18 @@ async fn execute(
 /// One worker deliberately serializes repository writes, including projects mapped
 /// to the same checkout. Runs survive restart; interrupted runs require review.
 pub fn start(state: AppState, url: String) -> Result<()> {
-    state.db.lock().unwrap().execute("UPDATE execution_runs SET status='interrupted', finished_at=?1, output='Gateway restarted during execution; inspect repository and task before retrying' WHERE status='running'", [db::now_ms()])?;
+    crate::execution_socket::recover(&state.db.lock().unwrap())?;
+    state.db.lock().unwrap().execute("UPDATE execution_runs SET status='interrupted', finished_at=?1, updated_at=?1, output='Gateway restarted during execution; inspect repository and task before retrying' WHERE executor='headless' AND status='running'", [db::now_ms()])?;
     tokio::spawn(async move {
         loop {
             let next = (|| -> Result<Option<PendingRun>> {
                 let conn = state.db.lock().unwrap();
                 schedule(&conn, db::now_ms())?;
-                let next: Option<PendingRun> = conn.query_row("SELECT id,project_ident,task_id,trigger FROM execution_runs WHERE status='queued' ORDER BY created_at,id LIMIT 1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+                let next: Option<PendingRun> = conn.query_row("SELECT id,project_ident,task_id,trigger FROM execution_runs WHERE status='queued' AND executor='headless' ORDER BY created_at,id LIMIT 1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
                 if let Some((id, ..)) = &next {
                     conn.execute(
-                        "UPDATE execution_runs SET status='running' WHERE id=?1",
-                        [id],
+                        "UPDATE execution_runs SET status='running',started_at=?2,updated_at=?2 WHERE id=?1",
+                        params![id,db::now_ms()],
                     )?;
                 }
                 Ok(next)
@@ -367,6 +521,25 @@ pub fn start(state: AppState, url: String) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn additive_migration_preserves_old_history_and_persisted_summaries() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE projects(ident TEXT PRIMARY KEY); CREATE TABLE tasks(id TEXT PRIMARY KEY,title TEXT); INSERT INTO projects VALUES ('old'); CREATE TABLE execution_runs(id TEXT PRIMARY KEY,project_ident TEXT NOT NULL,task_id TEXT,trigger TEXT NOT NULL,dedup_key TEXT UNIQUE NOT NULL,status TEXT NOT NULL,created_at INTEGER NOT NULL,finished_at INTEGER,output TEXT NOT NULL DEFAULT ''); INSERT INTO execution_runs VALUES ('run','old',NULL,'task','old','completed',100,200,'Legacy result');").unwrap();
+        initialize(&conn).unwrap();
+        let old = runs(&conn, "old").unwrap().pop().unwrap();
+        assert_eq!(old.output, "Legacy result");
+        assert_eq!(old.updated_at, 200);
+        assert_eq!(old.summary_source, "missing");
+        summary(&conn, "run", "Implemented and verified", "client_final").unwrap();
+        initialize(&conn).unwrap();
+        assert_eq!(
+            runs(&conn, "old").unwrap()[0].summary,
+            "Implemented and verified"
+        );
+        assert_eq!(list_runs(&conn, None, None).unwrap().len(), 1);
+        assert!(list_runs(&conn, Some("other"), None).unwrap().is_empty());
+    }
 
     fn fixture() -> db::Db {
         let database = db::open(":memory:").unwrap();

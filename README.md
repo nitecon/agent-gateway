@@ -498,6 +498,17 @@ hosts. Pages never embed the API key.
 | `/projects/:ident/settings` | Identity, repository mapping, channel room, external links (CI, runbooks), archive. |
 | `/patterns`, `/skills`, `/commands`, `/agents` | Library pages (unchanged). |
 | `/settings` | Gateway-level: your account and password, user management (admins), version, channel plugins, retention windows, theme. |
+| `/execution` | Administrator execution overview across projects: live status/progress, client/model, timestamps, outcome summaries and interactive session state. Select a project to configure execution or inspect its history; task detail links filter by task. Updates every three seconds. |
+
+Execution history persists across restarts. Headless runs retain the agent's final
+response separately from bounded attempt diagnostics; missing or partial summaries
+are labeled. A client exiting successfully does not itself complete its task.
+Projects can explicitly choose `executor: cmux` to wait for an interactive session
+instead of launching a gateway-host client. The native WebSocket registration,
+assignment and reporting contract is in
+[interactive-execution.yaml](.agent/api/interactive-execution.yaml). Unfinished
+interactive assignments require reconciliation after disconnect; they are never
+automatically replayed or moved to a headless client.
 
 Keyboard: `g h/a/p/t/s` jumps between sections, `j`/`k` move the selection,
 Enter opens it, `r` focuses the reply box, `e` resolves, `?` shows the help

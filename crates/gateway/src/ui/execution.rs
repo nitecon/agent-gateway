@@ -11,6 +11,7 @@ use serde::Deserialize;
 #[derive(Deserialize)]
 pub struct ExecutionQuery {
     pub project: Option<String>,
+    pub task_id: Option<String>,
 }
 
 #[derive(Template)]
@@ -25,6 +26,7 @@ struct ExecutionTemplate {
     runs: Vec<execution_queue::Run>,
     task_template: String,
     cadence_template: String,
+    projects: Vec<String>,
 }
 
 pub async fn page(
@@ -41,12 +43,12 @@ pub async fn page(
     let (settings_json, runs) = if project.is_empty() {
         (
             serde_json::to_string(&execution::settings(&conn)?)?,
-            Vec::new(),
+            execution_queue::list_runs(&conn, None, None)?,
         )
     } else {
         (
             serde_json::to_string(&execution::project_settings(&conn, &project)?)?,
-            execution_queue::runs(&conn, &project)?,
+            execution_queue::list_runs(&conn, Some(&project), query.task_id.as_deref())?,
         )
     };
     let theme = db::get_theme(&conn)?;
@@ -84,6 +86,11 @@ pub async fn page(
         runs,
         task_template: templates.task,
         cadence_template: templates.cadence,
+        projects: db::all_projects(&conn)?
+            .into_iter()
+            .filter(|p| p.archived_at.is_none())
+            .map(|p| p.ident)
+            .collect(),
         clients: execution_client::discover()
             .into_iter()
             .map(|c| {

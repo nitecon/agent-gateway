@@ -1,0 +1,126 @@
+app: agent-gateway-interactive-execution
+title: Interactive execution WebSocket contract
+summary: Version 1 registration, durable assignment acknowledgment and execution reporting for optional cmux sessions.
+kind: agent_context
+source_format: agent_context
+source_ref: crates/gateway/src/execution_socket.rs
+version: v1.18.0
+labels: [gateway, execution, websocket, cmux, integration]
+content:
+  purpose: >-
+    Let cmux connect interactive Claude/Codex sessions to delegated tasks while the
+    gateway retains authoritative task state and persistent execution status/results.
+    Requires agent-gateway v1.18.0 or newer; check the deployed gateway version
+    before enabling this integration.
+  auth:
+    transport: Use wss outside loopback; native clients supply Authorization Bearer on the upgrade request.
+    header: "Authorization: Bearer <GATEWAY_API_KEY>"
+    notes:
+      - The existing shared gateway API key grants executor authority. There is no per-project executor credential system in version 1.
+      - Browser cookies, query-string tokens and browser XHR authentication are not accepted for this WebSocket.
+      - REST execution metadata accepts bearer auth or administrator browser sessions; ordinary members receive 403.
+  endpoints:
+    - method: GET
+      path: /v1/execution/connect
+      intent: Upgrade to the version 1 native executor WebSocket.
+    - method: GET
+      path: /v1/execution/sessions
+      intent: List up to 100 registered sessions, connected state, latest heartbeat and active run IDs.
+    - method: GET
+      path: /v1/execution/runs
+      intent: List up to 100 runs across projects, unfinished first, then newest first.
+    - method: GET
+      path: /v1/projects/:ident/execution/runs
+      query:
+        task_id: Optional exact task UUID filter.
+      intent: Inspect a project's runs, attempts, summary, progress and reconciliation sequence.
+    - method: PUT
+      path: /v1/projects/:ident/execution
+      intent: Replace the full project execution policy; omitted fields use defaults.
+      request:
+        executor: headless (default) or cmux.
+        enabled: Explicit opt-in; defaults false.
+        on_task_received: Enable incoming delegated task trigger.
+        cadence_seconds: Optional delegated task polling cadence.
+      notes:
+        - cmux mode requires no gateway repository mapping or checkout. The registered workspace supplies its cwd.
+        - Local paths, checkout and candidate/model fallback settings apply to headless mode.
+        - cmux mode waits for an idle registered session; it never automatically launches a headless fallback.
+  workflows:
+    - name: Register current sessions and announce lifecycle changes
+      steps:
+        - Send register within 60 seconds of connecting, using protocol_version 1 and a stable instance_id.
+        - The sessions array is a complete snapshot for that instance, including existing sessions. Resend it on start, idle/busy changes, exit and workspace changes.
+        - Use stable workspace_id and surface_id plus the provider's native session_id. Project mapping must be explicit and match an existing gateway project ident. cwd must be absolute; never infer mappings from folder basenames.
+        - Client is claude or codex in version 1. State is idle, busy, waiting_input or exited. Model is optional.
+        - A registered response returns persistent session_key, session metadata and run_id when an unfinished assignment exists. Keys remain stable across reconnect for instance/surface/native-session identity.
+        - A second live connection for the same instance is rejected. Remapping project/cwd while a session owns an unfinished assignment is rejected.
+        - Missing or exited sessions with active assignments leave those runs needing attention. Report the final outcome before removing an ended session where possible.
+    - name: Receive and acknowledge a delegated assignment
+      steps:
+        - The gateway offers only open unclaimed incoming cross-project delegated targets, subject to project opt-in. Ordinary tasks and outgoing tracking tickets never launch work.
+        - An idle session may receive an assignment containing run_id, task_id, project_ident, session_key, workspace_id, surface_id, session_id, action execute and prompt.
+        - The assignment is persisted as assigned before delivery. At most one unfinished assignment is allowed per surface, even if its native session ID changes.
+        - Validate the exact originating surface/session and whether the agent can accept work. Send accepted and wait for its response before submitting the prompt. The gateway rechecks task and policy eligibility at first acceptance.
+        - A first accepted response records running and started_at. An idempotent repeat returns current status. Do not execute when the returned status is cancelled, completed or otherwise terminal.
+        - The agent must fetch current task detail and claim through the existing task API/agent-tools before changing code. Execution assignment is separate from the task's owner/status.
+        - Display a terminal notification and deliver through the provider's supported input mechanism. Queue busy sessions; do not treat arbitrary foreground shell input as agent task delivery.
+    - name: Report progress, questions and outcome
+      steps:
+        - Send report after acknowledgment, bound to run_id and session_key. Provide a positive increasing signed-64-bit sequence per run, starting at 1; persist the counter locally.
+        - Running and waiting_input update execution state and progress. Questions can be answered directly in the originating terminal. Waiting_input does not finish or release the assignment.
+        - Finished and failed end execution and release the session. Supply a concise summary of work, validation, blockers/questions and commit/artifact references when available.
+        - Report fields are bounded to 4096 bytes for progress and 16384 for summary, with UTF-8-safe visible truncation. The gateway's API key is redacted before persistence.
+        - Finished only becomes completed when the canonical gateway task is already done; otherwise it becomes needs_attention. Failed becomes failed unless the task is already done. Reports never themselves mark tasks done.
+        - The recorded response includes status and last accepted sequence. Repeated/older sequences and reports on terminal runs are acknowledged without changing recorded state.
+    - name: Heartbeat and reconnect reconciliation
+      steps:
+        - The server sends JSON heartbeat messages while idle. Send a heartbeat at least every 30 seconds; the server returns heartbeat_ack and the connection closes after 60 seconds without incoming messages. Never echo a heartbeat_ack.
+        - Lost connections and gateway restarts mark unfinished assigned runs needs_attention with no finished_at. Session rows are retained as disconnected.
+        - Reconnect with the same identities and inspect registered run_id plus REST run state/last_sequence. There is no automatic assignment or prompt replay and no headless fallback.
+        - Reconcile persisted acceptance/submission state with the local native session. Resume reporting for an acknowledged running task using a greater sequence. If delivery is uncertain, ask the user before submitting anything again.
+        - An assigned but unacknowledged run can only start after accepted succeeds and the client has reconciled delivery. Never interpret the registered snapshot as a new instruction to execute.
+        - If a session really exited, retain its identity long enough to report an acknowledged run failed/finished, then announce exited or remove it from the snapshot. Unacknowledged stale assignments remain needing human reconciliation.
+  schemas:
+    register:
+      type: register
+      protocol_version: 1
+      instance_id: cmux-machine-instance
+      sessions:
+        - workspace_id: workspace-uuid
+          surface_id: surface-uuid
+          session_id: provider-native-session-id
+          project_ident: example-project
+          client: codex
+          model: null
+          cwd: /home/user/projects/example-project
+          state: idle
+    accepted:
+      type: accepted
+      run_id: gateway-run-uuid
+      session_key: gateway-session-uuid
+    report:
+      type: report
+      run_id: gateway-run-uuid
+      session_key: gateway-session-uuid
+      sequence: 1
+      state: waiting_input
+      message: Which environment should I use for validation?
+      summary: null
+    heartbeat:
+      type: heartbeat
+    error:
+      type: error
+      message: Human-readable rejection; do not execute an assignment after an error.
+  limits:
+    incoming_frame_and_message_bytes: 65536
+    sessions_per_snapshot: 64
+    identity_bytes: 512
+    report_progress_bytes: 4096
+    report_summary_bytes: 16384
+    send_timeout_seconds: 5
+    inactivity_timeout_seconds: 60
+  operations:
+    control_panel: /execution shows cross-project runs, per-project filtering, automatic refresh, summaries and interactive session state. Task detail links to its filtered execution history.
+    existing_history: Schema migration is additive; old runs remain visible with summary_source missing when no summary was recorded.
+    validation: Unit tests cover registration rollback, ownership, opt-in, duplicate assignment prevention, completion semantics, reconnect fencing and recovery. execution_smoke.py verifies real process progress, WebSocket exchange and restart persistence using isolated fake clients.
