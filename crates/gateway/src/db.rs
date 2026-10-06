@@ -1175,7 +1175,7 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         [],
     );
     let _ = conn.execute("ALTER TABLE tasks ADD COLUMN delegated_to_task_id TEXT", []);
-    crate::execution_queue::initialize(conn)?;
+    crate::execution_history::initialize(conn)?;
 
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS task_delegations (
@@ -1333,6 +1333,7 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             ON gateway_memory_client_links(project_ident, gateway_memory_id);",
     )?;
 
+    crate::task_events::initialize(conn)?;
     apply_artifact_substrate_schema(conn)?;
     validate_project_casing(conn)?;
     ensure_project_uniqueness_indexes(conn)?;
@@ -10132,7 +10133,37 @@ pub fn insert_task(
     hostname: Option<&str>,
     reporter: &str,
 ) -> Result<Task> {
+    insert_task_record(
+        conn,
+        project_ident,
+        title,
+        description,
+        details,
+        labels,
+        hostname,
+        reporter,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_task_record(
+    conn: &Connection,
+    project_ident: &str,
+    title: &str,
+    description: Option<&str>,
+    details: Option<&str>,
+    labels: &[String],
+    hostname: Option<&str>,
+    reporter: &str,
+    delegation: Option<(&str, &str)>,
+) -> Result<Task> {
     let project_ident = normalize_project_ident(project_ident);
+    let kind = if delegation.is_some() {
+        "delegated"
+    } else {
+        "normal"
+    };
     let id = new_uuid();
     let now = now_ms();
     let labels_json = serialize_string_array(labels);
@@ -10162,9 +10193,9 @@ pub fn insert_task(
             crud_col("updated_at", now),
             crud_col("started_at", DbValue::null()),
             crud_col("done_at", DbValue::null()),
-            crud_col("kind", "normal"),
-            crud_col("delegated_to_project_ident", DbValue::null()),
-            crud_col("delegated_to_task_id", DbValue::null()),
+            crud_col("kind", kind),
+            crud_col("delegated_to_project_ident", delegation.map(|d| d.0)),
+            crud_col("delegated_to_task_id", delegation.map(|d| d.1)),
         ],
     )?;
 
@@ -10184,41 +10215,25 @@ pub fn insert_task(
         updated_at: now,
         started_at: None,
         done_at: None,
-        kind: "normal".to_string(),
-        delegated_to_project_ident: None,
-        delegated_to_task_id: None,
+        kind: kind.to_string(),
+        delegated_to_project_ident: delegation.map(|d| d.0.to_string()),
+        delegated_to_task_id: delegation.map(|d| d.1.to_string()),
     })
 }
 
 pub fn insert_delegated_task(conn: &Connection, task: &DelegatedTaskInsert<'_>) -> Result<Task> {
-    let project_ident = normalize_project_ident(task.project_ident);
-    let target_project_ident = normalize_project_ident(task.target_project_ident);
-    let mut inserted = insert_task(
+    let target = normalize_project_ident(task.target_project_ident);
+    insert_task_record(
         conn,
-        &project_ident,
+        task.project_ident,
         task.title,
         task.description,
         task.details,
         task.labels,
         task.hostname,
         task.reporter,
-    )?;
-    crud(conn).update(
-        "tasks",
-        &[
-            crud_col("kind", "delegated"),
-            crud_col("delegated_to_project_ident", target_project_ident.as_str()),
-            crud_col("delegated_to_task_id", task.target_task_id),
-        ],
-        &[
-            crud_eq("id", inserted.id.as_str()),
-            crud_eq("project_ident", project_ident.as_str()),
-        ],
-    )?;
-    inserted.kind = "delegated".to_string();
-    inserted.delegated_to_project_ident = Some(target_project_ident);
-    inserted.delegated_to_task_id = Some(task.target_task_id.to_string());
-    Ok(inserted)
+        Some((&target, task.target_task_id)),
+    )
 }
 
 /// List task summaries for a project filtered by status. When `statuses`

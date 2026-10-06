@@ -1,195 +1,98 @@
 {% extends "base.html" %}
 {% block content %}
-<section class="nd-card nd-mb-md">
-  <div class="nd-card-header"><strong>Execution overview</strong><span id="runs-refresh" class="gw-muted" role="status">Updates every 3 seconds</span></div>
-  <div class="nd-card-body">
-    <label>Project <select id="execution-project" class="nd-input"><option value="">All projects</option>{% for ident in projects %}<option value="{{ ident }}" {% if ident.as_str() == project.as_str() %}selected{% endif %}>{{ ident }}</option>{% endfor %}</select></label>
-    <p id="run-counts" class="gw-muted"></p>
-    <div id="execution-runs">
-      {% if runs.is_empty() %}<p>No executions recorded.</p>{% endif %}
-      {% for run in runs %}<details data-run-id="{{ run.id }}"><summary>{{ run.project_ident }} — {{ run.status }} — {% if let Some(title) = run.task_title %}{{ title }}{% else %}{{ run.id }}{% endif %}</summary><p>{{ run.progress }}</p><pre style="white-space:pre-wrap">{{ run.summary }}</pre></details>{% endfor %}
-    </div>
-    <details class="nd-mt-md"><summary>Interactive sessions</summary><div id="execution-sessions"><p>No session information loaded.</p></div></details>
-  </div>
-</section>
 <section class="nd-card">
-  <div class="nd-card-header"><strong>Agent execution{% if !project.is_empty() %} — {{ project }}{% endif %}</strong></div>
-  <div class="nd-card-body">
-    <p>Gateway-host agents run one at a time using the service account’s credentials. Projects can also route delegated tasks to a registered interactive session.</p>
-    <ul>{% for client in clients %}<li>{{ client }}</li>{% endfor %}</ul>
-    <form id="execution-form" class="nd-stack nd-gap-sm" data-project="{{ project }}" data-settings="{{ settings_json }}">
-      {% if project.is_empty() %}
-      <label>Data directory <input class="nd-input" name="data_directory" placeholder="/srv/agent-repositories"></label>
-      <p class="gw-muted">Unmapped repositories are cloned here only when their project explicitly permits checkout. Select projects from the registry to configure mappings and triggers.</p>
-      {% else %}
-      <label>Execution location <select class="nd-input" name="executor"><option value="headless">Gateway host</option><option value="cmux">Interactive cmux session</option></select></label>
-      <p class="gw-muted">Interactive execution waits for an idle session mapped to this project. Configure its repository in cmux; gateway paths and client fallbacks apply to gateway-host execution.</p>
-      <label>Local repository path <input class="nd-input" name="local_path" placeholder="/srv/checkouts/project"></label>
-      <p class="gw-muted">Use the absolute repository root. An invalid mapping stops execution; it never triggers a replacement checkout.</p>
-      <label><input type="checkbox" name="allow_checkout"> Allow checkout when no local mapping is set</label>
-      <label>Clone URL <input class="nd-input" name="clone_url" placeholder="git@github.com:organization/repository.git"></label>
-      <label><input type="checkbox" name="enabled"> Enable agent execution for this project</label>
-      <label><input type="checkbox" name="on_task_received"> Run when delegated tasks are received</label>
-      <p class="gw-muted">Only open, unclaimed tasks delegated in from another project can start execution. Ordinary planning tasks and subtasks do not, regardless of age. Failed runs are not retried automatically.</p>
-      <label>Delegation check cadence in seconds <input class="nd-input" name="cadence_seconds" type="number" min="60" max="31536000" placeholder="Leave blank to disable"></label>
-      <p class="gw-muted">Cadence checks the same incoming delegated tasks; it never launches a general task-board review.</p>
-      <p><a href="/execution">Gateway data directory and default clients</a></p>
-      {% endif %}
-      <fieldset><legend>Client and model fallback order</legend>
-        <p class="gw-muted">Attempts run from top to bottom. Leave a model blank for the client’s default. Empty project lists inherit gateway defaults; empty gateway defaults try Claude then Codex.</p>
-        <div id="candidates" class="nd-stack nd-gap-sm"></div>
-        <button type="button" id="add-candidate" class="nd-btn-secondary nd-btn-sm">Add fallback</button>
-      </fieldset>
-      <div><button type="submit" class="nd-btn-primary">Save settings</button></div>
-      <p id="execution-result" role="status" aria-live="polite"></p>
-    </form>
+  <div class="nd-card-header"><strong>Task lifecycle stream</strong><span id="stream-refresh" class="gw-muted" role="status" style="margin-left:1rem">Updates every 3 seconds</span></div>
+  <div class="nd-card-body" id="stream-view" data-project="{{ project }}" data-task="{{ task_id }}">
+    <p>Task creation, comments and completion are streamed to connected clients. Enable the gateway and experimental injection in cmux; it matches repositories and delivers only to an active agent. No project execution settings or gateway-host agents are required.</p>
+    <label>Project <select id="stream-project" class="nd-input"><option value="">All projects</option>{% for ident in projects %}<option value="{{ ident }}" {% if ident.as_str() == project.as_str() %}selected{% endif %}>{{ ident }}</option>{% endfor %}</select></label>
+    <div id="task-events"><p>Loading task events…</p></div>
+    <details class="nd-mt-md"><summary>Connected clients</summary><div id="stream-consumers"></div></details>
+    <details class="nd-mt-md"><summary>Previous execution history (read only)</summary><div id="legacy-history"></div></details>
   </div>
 </section>
-<section class="nd-card nd-mt-md"><div class="nd-card-header"><strong>Base instructions</strong></div><div class="nd-card-body">
-  <p class="gw-muted">These instructions apply to all projects and are used by future runs. Use <code>{% raw %}{{project}}{% endraw %}</code> for the project and <code>{% raw %}{{task_id}}{% endraw %}</code> for the assigned delegated task ID.</p>
-  <form id="instructions-form" class="nd-stack nd-gap-sm">
-    <label for="task-instructions">Task received</label>
-    <textarea id="task-instructions" class="nd-input" name="task" rows="12" required>{{ task_template }}</textarea>
-    <label for="cadence-instructions">Scheduled review</label>
-    <textarea id="cadence-instructions" class="nd-input" name="cadence" rows="12" required>{{ cadence_template }}</textarea>
-    <div><button type="submit" class="nd-btn-primary">Save instructions</button></div>
-    <p id="instructions-result" role="status" aria-live="polite"></p>
-  </form>
-</div></section>
 <script>
 (() => {
-  const instructionsForm = document.getElementById('instructions-form');
-  instructionsForm.addEventListener('submit', async event => {
-    event.preventDefault();
-    const button = instructionsForm.querySelector('[type=submit]');
-    const result = document.getElementById('instructions-result');
-    button.disabled = true; result.textContent = 'Saving…';
-    try {
-      const response = await fetch('/v1/execution/templates', {method: 'PUT', headers: {'Content-Type': 'application/json', 'X-Gateway-UI': '1'}, body: JSON.stringify(Object.fromEntries(new FormData(instructionsForm)))});
-      if (!response.ok) throw new Error((await response.json()).error || 'Could not save instructions');
-      result.textContent = 'Instructions saved.';
-    } catch (error) { result.textContent = error.message; }
-    finally { button.disabled = false; }
-  });
-  const form = document.getElementById('execution-form');
-  const settings = JSON.parse(form.dataset.settings);
-  const project = form.dataset.project;
-  document.getElementById('execution-project').addEventListener('change', event => {
-    window.location.href = event.target.value ? '/execution?project=' + encodeURIComponent(event.target.value) : '/execution';
-  });
-  const runContainer = document.getElementById('execution-runs');
-  const refreshStatus = document.getElementById('runs-refresh');
-  const task = new URLSearchParams(window.location.search).get('task_id');
-  const runsUrl = project ? '/v1/projects/' + encodeURIComponent(project) + '/execution/runs' + (task ? '?task_id=' + encodeURIComponent(task) : '') : '/v1/execution/runs';
-  function element(tag, text, className) {
-    const node = document.createElement(tag);
-    if (text !== undefined) node.textContent = text;
-    if (className) node.className = className;
-    return node;
-  }
+  const view = document.getElementById('stream-view');
+  const params = new URLSearchParams();
+  if (view.dataset.project) params.set('project', view.dataset.project);
+  if (view.dataset.task) params.set('task_id', view.dataset.task);
+  const suffix = params.size ? '?' + params : '';
   const date = value => value ? new Date(value).toLocaleString() : '—';
-  function textBlock(parent, text) {
-    const node = element('pre', text);
-    node.style.whiteSpace = 'pre-wrap'; node.style.overflowWrap = 'anywhere'; parent.append(node);
+  function node(tag, text) {
+    const item = document.createElement(tag);
+    if (text !== undefined) item.textContent = text;
+    return item;
   }
-  function renderRuns(runs) {
-    const open = new Set([...runContainer.querySelectorAll('details[open][data-run-id]')].map(node => node.dataset.runId));
-    const diagnosticsOpen = new Set([...runContainer.querySelectorAll('details[open][data-diagnostics-id]')].map(node => node.dataset.diagnosticsId));
-    const counts = {};
+  function block(parent, text) {
+    if (!text) return;
+    const item = node('pre',text); item.style.whiteSpace = 'pre-wrap'; item.style.overflowWrap = 'anywhere'; parent.append(item);
+  }
+  document.getElementById('stream-project').addEventListener('change', event => {
+    const target = new URLSearchParams();
+    if (event.target.value) target.set('project',event.target.value);
+    window.location.href = '/task-stream' + (target.size ? '?' + target : '');
+  });
+  function renderEvents(events) {
+    const container = document.getElementById('task-events');
+    const opened = new Set([...container.querySelectorAll('details[open]')].map(item => item.dataset.eventId));
     const fragment = document.createDocumentFragment();
-    if (!runs.length) fragment.append(element('p','No executions recorded.'));
-    for (const run of runs) {
-      counts[run.status] = (counts[run.status] || 0) + 1;
-      const row = element('details', undefined, 'nd-mb-md'); row.dataset.runId = run.id; row.open = open.has(run.id);
-      row.append(element('summary', run.project_ident + ' — ' + run.status.replaceAll('_',' ') + ' — ' + (run.task_title || run.id)));
-      const facts = element('p', (run.client || 'Awaiting client') + (run.model ? ' / ' + run.model : '') + ' · ' + (run.executor === 'cmux' ? 'Interactive' : 'Gateway host'));
-      row.append(facts,element('p','Queued: ' + date(run.created_at) + ' · Started: ' + date(run.started_at) + ' · Finished: ' + date(run.finished_at), 'gw-muted'));
-      row.append(element('p','Last update: ' + date(run.updated_at), 'gw-muted'));
-      if (run.progress) textBlock(row,run.progress);
-      row.append(element('strong','Outcome summary'));
-      if (run.summary) {
-        row.append(element('p',run.summary_source === 'partial' ? 'Partial response — the complete final result was not captured successfully.' : 'Reported by the agent.', 'gw-muted'));
-        textBlock(row,run.summary);
-      } else row.append(element('p',run.finished_at ? 'No outcome summary was reported. Inspect diagnostics and task comments.' : 'Awaiting the agent’s outcome summary.', 'gw-muted'));
-      row.append(element('p',run.output));
-      if (run.task_id) {
-        const link = element('a','Open task'); link.href = '/projects/' + encodeURIComponent(run.project_ident) + '/tasks/' + encodeURIComponent(run.task_id); row.append(link);
+    if (!events.length) fragment.append(node('p','No task lifecycle events recorded yet.'));
+    for (const event of events) {
+      const row = node('details'); row.dataset.eventId = String(event.id); row.open = opened.has(String(event.id)); row.className = 'nd-mt-md';
+      row.append(node('summary',event.project_ident + ' — ' + event.kind.replaceAll('_',' ') + ' — ' + event.task.title));
+      row.append(node('p','Event ' + event.id + ' · ' + date(event.created_at) + ' · Task state at event: ' + event.task.status));
+      if (event.canonical_remote) row.append(node('p',event.canonical_remote));
+      if (event.truncated) row.append(node('p','Preview truncated. Open the task for full context.'));
+      if (event.comment) {
+        row.append(node('strong',event.kind === 'task_completed' ? 'Latest task comment' : 'Comment by ' + event.comment.author));
+        block(row,event.comment.content);
+      } else block(row,event.task.description);
+      if (!event.deliveries.length) row.append(node('p','No client delivery recorded.'));
+      for (const delivery of event.deliveries) {
+        row.append(node('p',delivery.consumer_id + ' · ' + delivery.status + ' · ' + date(delivery.updated_at)));
+        block(row,delivery.message); block(row,delivery.summary);
       }
-      const diagnostics = element('details', undefined, 'nd-mt-sm'); diagnostics.dataset.diagnosticsId = run.id; diagnostics.open = diagnosticsOpen.has(run.id);
-      diagnostics.append(element('summary','Attempt diagnostics'));
-      for (const attempt of run.attempts) textBlock(diagnostics,JSON.stringify(attempt,null,2));
-      if (!run.attempts.length) diagnostics.append(element('p','No finished attempts.'));
-      row.append(diagnostics); fragment.append(row);
-    }
-    runContainer.replaceChildren(fragment);
-    document.getElementById('run-counts').textContent = Object.entries(counts).map(([state,count]) => count + ' ' + state.replaceAll('_',' ')).join(' · ');
-  }
-  function renderSessions(sessions) {
-    const container = document.getElementById('execution-sessions');
-    const fragment = document.createDocumentFragment();
-    const visible = sessions.filter(session => !project || session.project_ident === project);
-    if (!visible.length) fragment.append(element('p','No interactive sessions registered.'));
-    for (const session of visible) {
-      fragment.append(element('p',session.project_ident + ' · ' + session.client + ' · ' + session.state.replaceAll('_',' ') + ' · ' + (session.connected ? 'Connected' : 'Disconnected') + ' · Last seen: ' + date(session.last_seen_at)));
+      const link = node('a','Open task'); link.href = '/projects/' + encodeURIComponent(event.project_ident) + '/tasks/' + encodeURIComponent(event.task.id); row.append(link);
+      fragment.append(row);
     }
     container.replaceChildren(fragment);
   }
-  async function refreshRuns() {
+  function renderConsumers(consumers) {
+    const container = document.getElementById('stream-consumers');
+    const fragment = document.createDocumentFragment();
+    if (!consumers.length) fragment.append(node('p','No clients have subscribed.'));
+    for (const client of consumers) fragment.append(node('p',client.consumer_id + ' · ' + (client.connected ? 'Connected' : 'Disconnected') + ' · Last acknowledged event: ' + client.cursor + ' · Last seen: ' + date(client.last_seen_at)));
+    container.replaceChildren(fragment);
+  }
+  function renderHistory(runs) {
+    const container = document.getElementById('legacy-history');
+    const fragment = document.createDocumentFragment();
+    if (!runs.length) fragment.append(node('p','No previous executions recorded.'));
+    for (const run of runs) {
+      const row = node('details');
+      row.append(node('summary',run.project_ident + ' — ' + run.status + ' — ' + (run.task_title || run.id)));
+      row.append(node('p','Started: ' + date(run.started_at) + ' · Finished: ' + date(run.finished_at)));
+      block(row,run.progress); block(row,run.summary || 'No outcome summary recorded.'); block(row,run.output);
+      for (const attempt of run.attempts) block(row,JSON.stringify(attempt,null,2));
+      fragment.append(row);
+    }
+    container.replaceChildren(fragment);
+  }
+  async function read(url) {
+    const response = await fetch(url,{headers:{'X-Gateway-UI':'1'}});
+    if (!response.ok) throw new Error('Could not refresh task stream');
+    return response.json();
+  }
+  async function refresh() {
     if (document.hidden) return;
+    const status = document.getElementById('stream-refresh');
     try {
-      const headers = {'X-Gateway-UI':'1'};
-      const response = await fetch(runsUrl,{headers});
-      if (!response.ok) throw new Error('Execution updates unavailable (' + response.status + ')');
-      renderRuns(await response.json());
-      const sessionsResponse = await fetch('/v1/execution/sessions',{headers});
-      if (sessionsResponse.ok) renderSessions(await sessionsResponse.json());
-      refreshStatus.textContent = 'Updated ' + new Date().toLocaleTimeString() + ' · every 3 seconds';
-    } catch (error) { refreshStatus.textContent = error.message; }
+      const [events,clients] = await Promise.all([read('/v1/task-events'+suffix),read('/v1/task-events/consumers')]);
+      renderEvents(events); renderConsumers(clients); status.textContent = 'Updated ' + new Date().toLocaleTimeString();
+    } catch (error) { status.textContent = error.message; }
   }
-  refreshRuns();
-  setInterval(refreshRuns,3000);
-
-  const container = document.getElementById('candidates');
-  const result = document.getElementById('execution-result');
-  for (const [key, value] of Object.entries(settings)) {
-    const field = form.elements.namedItem(key);
-    if (!field) continue;
-    if (field.type === 'checkbox') field.checked = value;
-    else field.value = value ?? '';
-  }
-  function addCandidate(candidate = {client: 'claude', model: ''}) {
-    const row = document.createElement('div');
-    row.className = 'gw-inline-form';
-    const select = document.createElement('select');
-    select.setAttribute('aria-label', 'Client');
-    for (const client of ['claude', 'codex']) {
-      const option = document.createElement('option'); option.value = client; option.textContent = client; select.append(option);
-    }
-    select.value = candidate.client;
-    const input = document.createElement('input'); input.placeholder = 'Default model'; input.setAttribute('aria-label', 'Model'); input.value = candidate.model ?? '';
-    const up = document.createElement('button'); up.type = 'button'; up.textContent = 'Move up'; up.onclick = () => { if (row.previousElementSibling) container.insertBefore(row, row.previousElementSibling); };
-    const remove = document.createElement('button'); remove.type = 'button'; remove.textContent = 'Remove'; remove.onclick = () => row.remove();
-    row.append(select, input, up, remove); container.append(row);
-  }
-  settings.candidates.forEach(addCandidate);
-  document.getElementById('add-candidate').onclick = () => addCandidate();
-  form.addEventListener('submit', async event => {
-    event.preventDefault();
-    const value = {};
-    for (const key of Object.keys(settings)) {
-      const field = form.elements.namedItem(key); if (!field) continue;
-      value[key] = field.type === 'checkbox' ? field.checked : (field.value.trim() || null);
-    }
-    if (project && value.cadence_seconds !== null) value.cadence_seconds = Number(value.cadence_seconds);
-    value.candidates = [...container.children].map(row => ({client: row.querySelector('select').value, model: row.querySelector('input').value.trim() || null}));
-    const button = form.querySelector('[type=submit]'); button.disabled = true; result.textContent = 'Saving…';
-    try {
-      const response = await fetch(project ? `/v1/projects/${encodeURIComponent(project)}/execution` : '/v1/execution/settings', {method: 'PUT', headers: {'Content-Type': 'application/json', 'X-Gateway-UI': '1'}, body: JSON.stringify(value)});
-      if (!response.ok) throw new Error((await response.json()).error || 'Could not save settings');
-      result.textContent = 'Settings saved.';
-    } catch (error) { result.textContent = error.message; }
-    finally { button.disabled = false; }
-  });
+  read('/v1/execution/runs'+suffix).then(renderHistory).catch(() => { document.getElementById('legacy-history').textContent = 'Could not load previous history.'; });
+  refresh(); setInterval(refresh,3000);
 })();
 </script>
 {% endblock %}

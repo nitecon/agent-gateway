@@ -30,3 +30,8 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace
+
+      - name: Task lifecycle WebSocket smoke
+        run: |
+          cargo build -p gateway
+          python3 crates/gateway/tests/task_stream_smoke.py

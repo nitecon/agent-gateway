@@ -9586,7 +9586,7 @@ pub(crate) fn render_task_link_page(detail: &db::TaskDetail, theme: &str) -> Str
         r##"<div class="nd-flex nd-gap-sm nd-mb-md">
   <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident_path}/tasks">← Project tasks</a>
   <a class="nd-btn-ghost nd-btn-sm" href="/tasks">All projects</a>
-  <a class="nd-btn-secondary nd-btn-sm" href="/execution?project={ident_path}&amp;task_id={task_path}">Execution history</a>
+  <a class="nd-btn-secondary nd-btn-sm" href="/task-stream?project={ident_path}&amp;task_id={task_path}">Task activity</a>
 </div>
 
 <section class="nd-card nd-mb-lg">

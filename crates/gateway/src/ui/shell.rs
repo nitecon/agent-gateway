@@ -89,7 +89,7 @@ impl SettingsNav<'_> {
                 self.has_account,
             ),
             ("users", "Users", "/settings/users", self.is_admin),
-            ("execution", "Agent execution", "/execution", self.is_admin),
+            ("task-stream", "Task stream", "/task-stream", self.is_admin),
             ("retention", "Retention", "/settings/retention", true),
             ("appearance", "Appearance", "/settings/appearance", true),
             ("projects", "Projects", "/settings/projects", true),

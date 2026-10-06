@@ -1,0 +1,142 @@
+app: agent-gateway-task-stream
+title: Task lifecycle stream contract
+summary: One authenticated connection across projects for durable task creation, comments, completion and client delivery visibility.
+kind: agent_context
+source_format: agent_context
+source_ref: crates/gateway/src/task_events.rs
+version: v1.19.0
+labels: [gateway, tasks, websocket, cmux, lifecycle, integration]
+content:
+  purpose: >-
+    The gateway publishes standard task lifecycle events; cmux owns repository
+    matching and interactive terminal injection behind one global experimental
+    approval. There is no per-project execution configuration or agent launching.
+    Requires gateway v1.19.0+ and an updated client implementing this contract.
+  auth:
+    header: "Authorization: Bearer <GATEWAY_API_KEY>"
+    transport: Use wss outside loopback. Supply the header on the native upgrade request.
+    notes:
+      - The existing shared API key authorizes the stream across projects.
+      - Cookies and query-string keys do not authorize the WebSocket.
+      - REST metadata accepts bearer authentication or administrator browser sessions; members receive 403.
+      - Keep the key out of terminal input, URLs, logs and session snapshots.
+  endpoints:
+    - method: GET
+      path: /v1/tasks/stream
+      intent: Upgrade the single task lifecycle WebSocket.
+    - method: GET
+      path: /v1/task-events
+      intent: Inspect up to 100 lifecycle snapshots and client delivery receipts.
+      query:
+        after_event_id: Optional nonnegative exclusive cursor; ascending IDs when present, newest first when absent.
+        project: Optional exact project ident filter for REST viewing only.
+        task_id: Optional exact task UUID filter for REST viewing only.
+    - method: GET
+      path: /v1/task-events/consumers
+      intent: Inspect up to 100 client identities, acknowledged cursor, connection and heartbeat state.
+    - method: GET
+      path: /v1/projects
+      intent: Discover registered projects and canonical_remote repository identities for automatic matching.
+    - method: GET
+      path: /v1/projects/:ident/tasks/:id
+      intent: Fetch current authoritative task state, full specification and comments before delivery when necessary.
+    - method: GET
+      path: /v1/execution/runs
+      intent: Read preserved legacy execution records; optional project and task_id filters. No execution or configuration operation remains.
+  workflows:
+    - name: Enable a client and subscribe
+      steps:
+        - Enabling the gateway in cmux creates one outbound connection for all local workspaces. A separate global experimental approval enables direct input injection.
+        - Send subscribe as the first JSON message, with protocol_version 1 and a stable consumer_id for the cmux instance. No project list, policy or session snapshot is required.
+        - A new consumer without after_event_id starts at the current log tail; existing tasks are not automatically replayed on first opt-in. subscribed returns cursor and latest_event_id.
+        - A known consumer without after_event_id resumes its persisted acknowledged cursor. An explicit cursor may request earlier replay, including 0; it cannot skip ahead of the saved cursor. First-use explicit cursors must be between 0 and the current tail.
+        - A second live connection for the same consumer is rejected; stale connections are fenced when replaced. Gateway startup clears live connection flags while preserving cursors, events and receipts.
+    - name: Receive standard lifecycle events
+      steps:
+        - The event envelope contains id, kind, project_ident, canonical_remote, task snapshot, optional comment, optional current delegation metadata, created_at, truncated and deliveries.
+        - Kinds are task_created, task_commented and task_completed. Both ordinary and delegated tasks, user/agent/system comments, subtasks and mirrored source completion are included; no per-project opt-in gates the stream.
+        - Events are inserted transactionally with their mutations. Task and comment snapshots survive task deletion and preserve state at the event; delegation metadata reflects the surviving relationship at read time and may be null after deletion.
+        - task_created is emitted for both incoming normal target tasks and outgoing source tracking tickets. task.kind delegated and delegated_to_task_id identify an outgoing tracking ticket; do not treat it as a second assignment to execute.
+        - task_completed is emitted only on a transition into done. Its optional comment is the latest non-system task comment at completion, not a generated or guaranteed outcome summary.
+        - Payloads are bounded and API-key text is redacted. truncated means a preview was shortened; fetch current task detail/comments when full context is needed. The task detail API is a flattened task object with comments and specification aliases.
+    - name: Deconflict and visibly inject in cmux
+      steps:
+        - Normalize the workspace Git upstream/origin remote and match the gateway canonical_remote. Never infer identity from the workspace title or folder basename; do not create per-project configuration requirements.
+        - cmux verifies an actual active local Claude/Codex process in the exact workspace/surface before any terminal input. No agent means no injection, no fallback and no process launch. Ambiguous repository/surface matches remain visible as skipped or queued with a reason.
+        - Queue messages while a matching agent is busy or a user draft is pending. Recheck native foreground identity immediately before submitting; do not input into a shell, unrelated process or changed surface.
+        - Persist the event and local delivery state before acknowledgment and submission. Mark uncertain submission after a crash or restart for reconciliation; never blindly replay terminal input.
+        - Wrap injected plain text with <Start Agent Gateway Message Injection> and </Stop AgentGateway Message injection>. Render a colored local annotation identifying the gateway event and source; do not insert ANSI control sequences into the agent prompt.
+        - Keep task comments as incoming context and completion events as completion notifications. Avoid recursive acknowledgment-comment loops without blindly discarding all agent-authored comments. Comment progress/final summaries and mark canonical task status through existing agent-tools task APIs.
+    - name: Acknowledge receipt and report delivery
+      steps:
+        - One event is in flight until acknowledged. Persist it locally, then send ack promptly with status received or queued; holding the acknowledgment blocks subsequent events across projects.
+        - ack includes event_id, status and optional workspace_id, surface_id, message and summary. States are received, queued, injected, skipped, failed and uncertain; offered is the server's pre-send reservation state.
+        - Receipt advances the consumer's durable cursor. Later ack messages can update the same event from received/queued to an actual delivery outcome after processing the local queue, including following reconnect.
+        - injected, skipped, failed and uncertain are terminal delivery outcomes; repeated/older status updates return the recorded terminal state without changing it. queued cannot regress to received. Only events actually offered to this consumer may be acknowledged.
+        - recorded confirms event_id and actual saved status. Neither receipt nor injection changes task ownership, task status or lifecycle comments. Report summaries describe the client's delivery; execution outcomes belong in canonical task comments.
+        - If disconnected before receipt, the event is offered again on reconnect with the same ID. A local journal must recognize it and reconcile existing submission before reporting the outcome. Delivery to a PTY cannot promise exactly-once submission after an uncertain crash.
+    - name: Heartbeat and errors
+      steps:
+        - Send heartbeat at least every 30 seconds after subscription. The server replies heartbeat_ack and sends heartbeat messages approximately every 20 seconds. Never echo heartbeat_ack.
+        - The connection closes after 60 seconds without incoming text messages; writes time out after 5 seconds.
+        - error contains a human-readable rejection. An unsuccessful subscribe does not authorize event delivery; preserve the existing local journal and reconnect when appropriate.
+  schemas:
+    subscribe:
+      type: subscribe
+      protocol_version: 1
+      consumer_id: cmux-machine-instance
+      after_event_id: null
+    subscribed:
+      type: subscribed
+      protocol_version: 1
+      consumer_id: cmux-machine-instance
+      cursor: 42
+      latest_event_id: 42
+    event:
+      type: event
+      event:
+        id: 43
+        kind: task_commented
+        project_ident: example-project
+        canonical_remote: github.com/owner/example-project
+        task: "Standard task snapshot: id, title, description, details, status, owner, timestamps, kind and delegation target fields."
+        comment: "Standard comment snapshot: id, task_id, author, author_type, content and created_at; null on task_created."
+        delegation: "Standard delegation relationship or null."
+        created_at: 1791320000000
+        truncated: false
+        deliveries: []
+    ack:
+      type: ack
+      event_id: 43
+      status: injected
+      workspace_id: workspace-uuid
+      surface_id: surface-uuid
+      message: Submitted to the active Codex terminal.
+      summary: null
+    recorded:
+      type: recorded
+      event_id: 43
+      status: injected
+    heartbeat:
+      type: heartbeat
+    error:
+      type: error
+      message: Human-readable rejection.
+  limits:
+    incoming_frame_and_message_bytes: 65536
+    outgoing_event_frame_bytes: 65536
+    identity_bytes: 128
+    receipt_message_bytes: 4096
+    receipt_summary_bytes: 16384
+    rest_page_records: 100
+    simultaneous_inflight_events_per_connection: 1
+    send_timeout_seconds: 5
+    inactivity_timeout_seconds: 60
+  migration:
+    - /v1/execution/connect, /v1/execution/sessions, /v1/execution/settings, /v1/execution/templates, /v1/execution/clients and per-project execution settings/history routes are removed.
+    - Legacy settings keys are deleted. Existing execution records/attempts remain read-only; unfinished records become retired and are never resumed. Canonical tasks and subtasks are preserved.
+    - /task-stream replaces the execution configuration page; /execution is a viewing alias. Task detail links to filtered lifecycle history.
+    - cmux clients using the old assignment protocol need the delegated subscription update; installing hooks or enabling old project policies will not restore it.
+  validation:
+    - Unit tests cover atomic rollback, snapshots after deletion, delegation source identity, replay/fencing, idempotent receipts, redaction/UTF-8 bounds and legacy cleanup/history.
+    - tests/task_stream_smoke.py runs a real isolated gateway and native RFC6455 peer; checks lifecycle across projects, ordinary comments, delegation, subtasks, restart/replay, cookie/bearer authorization, removed routes and read-only legacy migration. No real agent or production task is used.

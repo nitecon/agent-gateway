@@ -498,17 +498,26 @@ hosts. Pages never embed the API key.
 | `/projects/:ident/settings` | Identity, repository mapping, channel room, external links (CI, runbooks), archive. |
 | `/patterns`, `/skills`, `/commands`, `/agents` | Library pages (unchanged). |
 | `/settings` | Gateway-level: your account and password, user management (admins), version, channel plugins, retention windows, theme. |
-| `/execution` | Administrator execution overview across projects: live status/progress, client/model, timestamps, outcome summaries and interactive session state. Select a project to configure execution or inspect its history; task detail links filter by task. Updates every three seconds. |
+| `/task-stream` (also `/execution`) | Administrator task lifecycle timeline across projects, comments and outcome notes, delivery receipts, and connected clients. Filter by project/task; updates every three seconds. Previous executions remain visible as read-only history. |
 
-Execution history persists across restarts. Headless runs retain the agent's final
-response separately from bounded attempt diagnostics; missing or partial summaries
-are labeled. A client exiting successfully does not itself complete its task.
-Projects can explicitly choose `executor: cmux` to wait for an interactive session
-instead of launching a gateway-host client. The native WebSocket registration,
-assignment and reporting contract is in
-[interactive-execution.yaml](.agent/api/interactive-execution.yaml). Unfinished
-interactive assignments require reconciliation after disconnect; they are never
-automatically replayed or moved to a headless client.
+Task creation, comments and completion are published across projects through one
+native bearer-authenticated WebSocket at `/v1/tasks/stream`. Events have durable
+ordered IDs and resumable consumer cursors. Clients acknowledge receipt separately
+from terminal delivery; neither acknowledgment claims nor completes a task.
+Add progress/outcome comments and mark the canonical task done through agent-tools.
+
+cmux owns repository matching and optional direct injection into active attached
+Claude/Codex terminals, behind a global experimental approval. Per-project
+execution settings, gateway-host launching, cadence, fallback clients, and native
+session hook requirements are removed. Existing execution records and summaries
+are preserved; unfinished legacy executions become `retired` without resuming
+work. cmux clients must implement the new stream subscription protocol; the old
+`/v1/execution/connect` assignment protocol is removed.
+
+See [task-stream.yaml](.agent/api/task-stream.yaml) for the wire contract and
+`cargo build -p gateway && python3 crates/gateway/tests/task_stream_smoke.py` for an
+isolated real-WebSocket lifecycle, replay, authentication and migration smoke.
+The smoke runs in CI and launches no real agents.
 
 Keyboard: `g h/a/p/t/s` jumps between sections, `j`/`k` move the selection,
 Enter opens it, `r` focuses the reply box, `e` resolves, `?` shows the help
