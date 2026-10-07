@@ -8308,11 +8308,19 @@ pub struct DelegateTaskRequest {
     pub reporter: Option<String>,
 }
 
+// Preserve explicit JSON null so owner clearing still passes ownership checks.
+fn present_nullable_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
+}
+
 #[derive(Deserialize)]
 pub struct UpdateTaskRequest {
     pub status: Option<String>,
     /// `Some(null)` in JSON clears the owner; `Some("xyz")` assigns it;
     /// absent leaves the current owner alone.
+    #[serde(default, deserialize_with = "present_nullable_value")]
     pub owner_agent_id: Option<serde_json::Value>,
     pub rank: Option<i64>,
     pub title: Option<String>,
