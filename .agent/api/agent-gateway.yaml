@@ -30,7 +30,9 @@ content:
     notes:
       - All /v1 API routes require the bearer token.
       - Public HTML control-panel routes do not require bearer auth.
-      - X-Agent-Id controls per-agent unread queues and actor identity on task workflows.
+      - X-Agent-Id controls per-agent unread queues and legacy display identity on task workflows.
+      - Session-origin builds accept task mutation headers X-Agent-Session-Id (UUID), X-Agent-Instance-Id (UUID), X-Agent-Provider (codex|claude), X-Agent-OS (linux|windows|macos), all together or absent. Malformed or partial provenance returns 400. Unattributed legacy requests have null origin.
+      - Session-attributed claims store task.owner_origin. Status/owner PATCH requires the exact claiming session_id AND instance_id (409 on mismatch, including legacy callers). Release/reopen to todo and stale reclaim clear origin ownership; comments do not change it. Event/comment origin identifies that mutation actor, and delegated result mirrors retain target worker origin. See the authoritative task lifecycle stream contract for availability and full semantics.
   safety:
     - name: Do not use theme endpoint for agents
       guidance: /theme is a frontend display preference endpoint for the control panel, not an agent integration surface.

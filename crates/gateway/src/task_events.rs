@@ -19,11 +19,126 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
 
+/// Exact process/session provenance supplied by a task mutation client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentOrigin {
+    pub session_id: String,
+    pub instance_id: String,
+    pub provider: String,
+    pub os: String,
+}
+
+pub fn origin(headers: &HeaderMap) -> Result<Option<AgentOrigin>, AppError> {
+    let names = [
+        "x-agent-session-id",
+        "x-agent-instance-id",
+        "x-agent-provider",
+        "x-agent-os",
+    ];
+    if names.iter().all(|name| !headers.contains_key(*name)) {
+        return Ok(None);
+    }
+    let values = names
+        .iter()
+        .map(|name| {
+            if headers.get_all(*name).iter().count() != 1 {
+                return Err(AppError(
+                    StatusCode::BAD_REQUEST,
+                    format!("exactly one {name} required"),
+                ));
+            }
+            headers
+                .get(*name)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| AppError(StatusCode::BAD_REQUEST, format!("invalid {name}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let uuid = |value: &str| {
+        uuid::Uuid::parse_str(value)
+            .map(|id| id.to_string())
+            .map_err(|_| {
+                AppError(
+                    StatusCode::BAD_REQUEST,
+                    "agent session and instance IDs must be UUIDs".into(),
+                )
+            })
+    };
+    if !matches!(values[2], "codex" | "claude")
+        || !matches!(values[3], "linux" | "windows" | "macos")
+    {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "invalid agent provider or OS".into(),
+        ));
+    }
+    Ok(Some(AgentOrigin {
+        session_id: uuid(values[0])?,
+        instance_id: uuid(values[1])?,
+        provider: values[2].into(),
+        os: values[3].into(),
+    }))
+}
+
+/// Connection is held under the DB mutex. Context and all causative mirrors are
+/// transactional; rollback and unattributed callers cannot inherit an actor.
+pub fn mutation<T>(
+    conn: &Connection,
+    origin: Option<&AgentOrigin>,
+    f: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE task_mutation_context SET origin_json=?1 WHERE id=1",
+        [origin.map(serde_json::to_string).transpose()?],
+    )?;
+    let result = f(&tx)?;
+    tx.execute(
+        "UPDATE task_mutation_context SET origin_json=NULL WHERE id=1",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(result)
+}
+
+pub fn current_origin(conn: &Connection) -> Result<Option<AgentOrigin>> {
+    let raw: Option<String> = conn.query_row(
+        "SELECT origin_json FROM task_mutation_context WHERE id=1",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(raw.map(|s| serde_json::from_str(&s)).transpose()?)
+}
+
+pub fn read_origin(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<AgentOrigin>> {
+    let raw: Option<String> = row.get(index)?;
+    raw.map(|s| {
+        serde_json::from_str(&s).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                index,
+                rusqlite::types::Type::Text,
+                Box::new(e),
+            )
+        })
+    })
+    .transpose()
+}
+
+#[derive(Debug)]
+pub struct OwnershipConflict;
+impl std::fmt::Display for OwnershipConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("task ownership requires the exact claiming agent session and instance")
+    }
+}
+impl std::error::Error for OwnershipConflict {}
+
 const FRAME_BYTES: usize = 65536;
 
 /// Triggers keep lifecycle events in the same transaction as every task mutation,
 /// including browser/API changes, delegation mirrors and generated subtasks.
 pub fn initialize(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    let conn = &*tx;
     conn.execute_batch("CREATE TABLE IF NOT EXISTS task_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
         project_ident TEXT NOT NULL, canonical_remote TEXT, task_json TEXT NOT NULL,
@@ -42,25 +157,46 @@ pub fn initialize(conn: &Connection) -> Result<()> {
         PRIMARY KEY(consumer_id,event_id)
     );
     DELETE FROM settings WHERE key='execution' OR key='execution.templates' OR key GLOB 'execution.project.*';")?;
+    for (table, column) in [
+        ("tasks", "owner_origin_json"),
+        ("task_comments", "origin_json"),
+        ("task_events", "origin_json"),
+    ] {
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+            params![table, column],
+            |r| r.get(0),
+        )?;
+        if !present {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"))?;
+        }
+    }
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS task_mutation_context (id INTEGER PRIMARY KEY CHECK(id=1), origin_json TEXT);
+        INSERT OR IGNORE INTO task_mutation_context(id) VALUES (1);
+        DROP TRIGGER IF EXISTS task_event_created;
+        DROP TRIGGER IF EXISTS task_event_commented;
+        DROP TRIGGER IF EXISTS task_event_completed;")?;
+    let actor = "(SELECT origin_json FROM task_mutation_context WHERE id=1)";
     let task = task_json("NEW");
     let commented_task = task_json("t");
     let comment = comment_json("NEW");
     let latest_comment = comment_json("c");
     conn.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS task_event_created AFTER INSERT ON tasks BEGIN
-        INSERT INTO task_events(kind,project_ident,canonical_remote,task_json,created_at)
-        VALUES ('task_created',NEW.project_ident,(SELECT canonical_remote FROM projects WHERE ident=NEW.project_ident),{task},NEW.created_at);
+        INSERT INTO task_events(kind,project_ident,canonical_remote,task_json,created_at,origin_json)
+        VALUES ('task_created',NEW.project_ident,(SELECT canonical_remote FROM projects WHERE ident=NEW.project_ident),{task},NEW.created_at,{actor});
     END;
     CREATE TRIGGER IF NOT EXISTS task_event_commented AFTER INSERT ON task_comments BEGIN
-        INSERT INTO task_events(kind,project_ident,canonical_remote,task_json,comment_json,created_at)
-        SELECT 'task_commented',t.project_ident,p.canonical_remote,{commented_task},{comment},NEW.created_at
+        INSERT INTO task_events(kind,project_ident,canonical_remote,task_json,comment_json,created_at,origin_json)
+        SELECT 'task_commented',t.project_ident,p.canonical_remote,{commented_task},{comment},NEW.created_at,{actor}
         FROM tasks t JOIN projects p ON p.ident=t.project_ident WHERE t.id=NEW.task_id;
     END;
     CREATE TRIGGER IF NOT EXISTS task_event_completed AFTER UPDATE OF status ON tasks
     WHEN NEW.status='done' AND OLD.status!='done' BEGIN
-        INSERT INTO task_events(kind,project_ident,canonical_remote,task_json,comment_json,created_at)
+        INSERT INTO task_events(kind,project_ident,canonical_remote,task_json,comment_json,created_at,origin_json)
         VALUES ('task_completed',NEW.project_ident,(SELECT canonical_remote FROM projects WHERE ident=NEW.project_ident),{task},
-        (SELECT {latest_comment} FROM task_comments c WHERE c.task_id=NEW.id AND c.author_type!='system' ORDER BY c.created_at DESC,c.id DESC LIMIT 1),NEW.updated_at);
+        (SELECT {latest_comment} FROM task_comments c WHERE c.task_id=NEW.id AND c.author_type!='system' ORDER BY c.created_at DESC,c.id DESC LIMIT 1),NEW.updated_at,{actor});
     END;"))?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -91,11 +227,12 @@ fn task_json(alias: &str) -> String {
     entries.push(format!(
         "'labels',json(CASE WHEN json_valid({alias}.labels) THEN {alias}.labels ELSE '[]' END)"
     ));
+    entries.push(format!("'owner_origin',json({alias}.owner_origin_json)"));
     format!("json_object({})", entries.join(","))
 }
 
 fn comment_json(alias: &str) -> String {
-    let entries: Vec<String> = [
+    let mut entries: Vec<String> = [
         "id",
         "task_id",
         "author",
@@ -106,6 +243,7 @@ fn comment_json(alias: &str) -> String {
     .iter()
     .map(|field| format!("'{field}',{alias}.{field}"))
     .collect();
+    entries.push(format!("'origin',json({alias}.origin_json)"));
     format!("json_object({})", entries.join(","))
 }
 
@@ -115,6 +253,7 @@ pub struct Event {
     pub kind: String,
     pub project_ident: String,
     pub canonical_remote: Option<String>,
+    pub origin: Option<AgentOrigin>,
     pub task: Value,
     pub comment: Option<Value>,
     pub delegation: Option<Value>,
@@ -145,7 +284,7 @@ pub struct EventQuery {
 /// Bounded, ordered replay; absence of a cursor selects the newest events for UI.
 pub fn list(conn: &Connection, query: &EventQuery) -> Result<Vec<Event>> {
     let project = query.project.as_deref().filter(|s| !s.is_empty());
-    let mut stmt = conn.prepare("SELECT id,kind,project_ident,canonical_remote,task_json,comment_json,created_at FROM task_events
+    let mut stmt = conn.prepare("SELECT id,kind,project_ident,canonical_remote,task_json,comment_json,created_at,origin_json FROM task_events
         WHERE (?1 IS NULL OR id>?1) AND (?2 IS NULL OR project_ident=?2)
         AND (?3 IS NULL OR json_extract(task_json,'$.id')=?3)
         ORDER BY CASE WHEN ?1 IS NOT NULL THEN id END ASC,id DESC LIMIT 100")?;
@@ -159,11 +298,12 @@ pub fn list(conn: &Connection, query: &EventQuery) -> Result<Vec<Event>> {
                 r.get::<_, String>(4)?,
                 r.get::<_, Option<String>>(5)?,
                 r.get::<_, i64>(6)?,
+                read_origin(r, 7)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut events = Vec::new();
-    for (id, kind, project_ident, canonical_remote, task, comment, created_at) in records {
+    for (id, kind, project_ident, canonical_remote, task, comment, created_at, origin) in records {
         let task: Value = serde_json::from_str(&task)?;
         let task_id = task["id"].as_str().unwrap_or_default();
         let delegation = db::get_delegation_by_target(conn, &project_ident, task_id)?
@@ -174,6 +314,7 @@ pub fn list(conn: &Connection, query: &EventQuery) -> Result<Vec<Event>> {
             project_ident,
             canonical_remote,
             task,
+            origin,
             comment: comment.map(|s| serde_json::from_str(&s)).transpose()?,
             delegation: delegation.map(serde_json::to_value).transpose()?,
             created_at,
@@ -625,6 +766,229 @@ mod tests {
             "fixture-agent",
         )
         .unwrap()
+    }
+
+    fn actor() -> AgentOrigin {
+        AgentOrigin {
+            session_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+            instance_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into(),
+            provider: "codex".into(),
+            os: "linux".into(),
+        }
+    }
+
+    fn status_update(status: &str) -> db::TaskUpdate<'_> {
+        db::TaskUpdate {
+            status: Some(status),
+            owner_agent_id: None,
+            rank: None,
+            title: None,
+            description: None,
+            details: None,
+            labels: None,
+            hostname: None,
+        }
+    }
+
+    #[test]
+    fn origin_headers_are_all_or_none_and_validated() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(origin(&headers).unwrap(), None);
+        headers.insert("x-agent-session-id", actor().session_id.parse().unwrap());
+        assert_eq!(origin(&headers).unwrap_err().0, StatusCode::BAD_REQUEST);
+        headers.insert("x-agent-instance-id", actor().instance_id.parse().unwrap());
+        headers.insert("x-agent-provider", "codex".parse().unwrap());
+        headers.insert("x-agent-os", "linux".parse().unwrap());
+        assert_eq!(origin(&headers).unwrap(), Some(actor()));
+        for (name, bad) in [
+            ("x-agent-session-id", "not-uuid"),
+            ("x-agent-instance-id", ""),
+            ("x-agent-provider", "other"),
+            ("x-agent-os", "other"),
+        ] {
+            let mut bad_headers = headers.clone();
+            bad_headers.insert(name, bad.parse().unwrap());
+            assert_eq!(origin(&bad_headers).unwrap_err().0, StatusCode::BAD_REQUEST);
+        }
+        headers.append("x-agent-session-id", actor().session_id.parse().unwrap());
+        assert_eq!(origin(&headers).unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn origin_snapshots_rollback_and_completion_uses_actor_not_commenter() {
+        let database = database();
+        let conn = database.lock().unwrap();
+        let worker = actor();
+        let failed: Result<()> = mutation(&conn, Some(&worker), |conn| {
+            let task = task(conn);
+            db::insert_comment(conn, &task.id, "shared-machine", "agent", "Rolled back")?;
+            bail!("fixture failure")
+        });
+        assert!(failed.is_err());
+        assert_eq!(tail(&conn).unwrap(), 0);
+        assert_eq!(current_origin(&conn).unwrap(), None);
+        let task = mutation(&conn, Some(&worker), |conn| Ok(task(conn))).unwrap();
+        let mut commenter = actor();
+        commenter.session_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc".into();
+        mutation(&conn, Some(&commenter), |conn| {
+            db::insert_comment(conn, &task.id, "shared-machine", "agent", "Latest comment")
+        })
+        .unwrap();
+        mutation(&conn, Some(&worker), |conn| {
+            db::update_task(
+                conn,
+                "example",
+                &task.id,
+                &status_update("done"),
+                Some("shared-machine"),
+            )
+        })
+        .unwrap();
+        db::delete_task(&conn, "example", &task.id).unwrap();
+        initialize(&conn).unwrap(); // Migration/reopen preserves the snapshots.
+        let events = list(
+            &conn,
+            &EventQuery {
+                after_event_id: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].origin, Some(worker.clone()));
+        assert_eq!(events[1].origin, Some(commenter.clone()));
+        assert_eq!(events[2].origin, Some(worker));
+        assert_eq!(
+            events[2].comment.as_ref().unwrap()["origin"],
+            serde_json::to_value(commenter).unwrap()
+        );
+        let legacy =
+            db::insert_task(&conn, "example", "Legacy", None, None, &[], None, "legacy").unwrap();
+        assert_eq!(list(&conn, &EventQuery::default()).unwrap()[0].origin, None);
+        assert_eq!(
+            db::get_task_detail(&conn, "example", &legacy.id)
+                .unwrap()
+                .unwrap()
+                .task
+                .owner_origin,
+            None
+        );
+    }
+
+    #[test]
+    fn exact_owner_session_and_instance_fence_shared_machine_and_legacy() {
+        let database = database();
+        let conn = database.lock().unwrap();
+        let task = task(&conn);
+        let worker = actor();
+        mutation(&conn, Some(&worker), |conn| {
+            db::update_task(
+                conn,
+                "example",
+                &task.id,
+                &status_update("in_progress"),
+                Some("shared-machine"),
+            )
+        })
+        .unwrap();
+        let mut other_session = worker.clone();
+        other_session.session_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc".into();
+        let mut other_instance = worker.clone();
+        other_instance.instance_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc".into();
+        for actor in [Some(&other_session), Some(&other_instance), None] {
+            for status in ["in_progress", "todo", "done"] {
+                let err = mutation(&conn, actor, |conn| {
+                    db::update_task(
+                        conn,
+                        "example",
+                        &task.id,
+                        &status_update(status),
+                        Some("shared-machine"),
+                    )
+                })
+                .unwrap_err();
+                assert!(err.downcast_ref::<OwnershipConflict>().is_some());
+            }
+            let mut update = status_update("in_progress");
+            update.status = None;
+            update.owner_agent_id = Some(None);
+            assert!(mutation(&conn, actor, |conn| db::update_task(
+                conn,
+                "example",
+                &task.id,
+                &update,
+                Some("shared-machine")
+            ))
+            .is_err());
+        }
+        for actor in [Some(&other_session), None] {
+            assert!(mutation(&conn, actor, |conn| db::reorder_tasks_in_column(
+                conn,
+                "example",
+                "done",
+                std::slice::from_ref(&task.id),
+                Some("shared-machine")
+            ))
+            .is_err());
+        }
+        let detail = db::get_task_detail(&conn, "example", &task.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.task.status, "in_progress");
+        assert_eq!(detail.task.owner_origin, Some(worker.clone()));
+        let released = mutation(&conn, Some(&worker), |conn| {
+            db::update_task(
+                conn,
+                "example",
+                &task.id,
+                &status_update("todo"),
+                Some("shared-machine"),
+            )
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(released.owner_origin, None);
+        mutation(&conn, Some(&other_session), |conn| {
+            db::update_task(
+                conn,
+                "example",
+                &task.id,
+                &status_update("in_progress"),
+                Some("shared-machine"),
+            )
+        })
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET started_at=0,updated_at=0 WHERE id=?1",
+            [&task.id],
+        )
+        .unwrap();
+        assert_eq!(db::reclaim_stale_tasks(&conn, "example").unwrap(), 1);
+        assert_eq!(
+            db::get_task_detail(&conn, "example", &task.id)
+                .unwrap()
+                .unwrap()
+                .task
+                .owner_origin,
+            None
+        );
+        assert_eq!(current_origin(&conn).unwrap(), None);
+        db::update_task(
+            &conn,
+            "example",
+            &task.id,
+            &status_update("in_progress"),
+            Some("legacy"),
+        )
+        .unwrap();
+        assert_eq!(
+            db::get_task_detail(&conn, "example", &task.id)
+                .unwrap()
+                .unwrap()
+                .task
+                .owner_origin,
+            None
+        );
     }
 
     #[test]

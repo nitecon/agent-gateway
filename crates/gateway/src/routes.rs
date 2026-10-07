@@ -36,7 +36,15 @@ impl IntoResponse for AppError {
 impl<E: Into<anyhow::Error>> From<E> for AppError {
     fn from(e: E) -> Self {
         let err = e.into();
-        AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}"))
+        let status = if err
+            .downcast_ref::<crate::task_events::OwnershipConflict>()
+            .is_some()
+        {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        AppError(status, format!("{err:#}"))
     }
 }
 
@@ -3450,6 +3458,7 @@ pub async fn generate_spec_tasks_handler(
     headers: HeaderMap,
     Json(body): Json<GenerateSpecTasksRequest>,
 ) -> Result<Response> {
+    let origin = crate::task_events::origin(&headers)?;
     let (context, authorization) = begin_artifact_mutation(
         &state,
         &headers,
@@ -3575,8 +3584,8 @@ pub async fn generate_spec_tasks_handler(
                     if let Some(team) = &item.team {
                         labels.push(team.clone());
                     }
-                    db::insert_task(
-                        &conn,
+                    crate::task_events::mutation(&conn, origin.as_ref(), |conn| db::insert_task(
+                        conn,
                         &ident,
                         &generated_spec_task_title(&item),
                         Some(&format!(
@@ -3591,7 +3600,7 @@ pub async fn generate_spec_tasks_handler(
                         &labels,
                         body.hostname.as_deref(),
                         &reporter,
-                    )?
+                    ))?
                 }
             };
             let link = link_task_to_spec_item(
@@ -3603,8 +3612,8 @@ pub async fn generate_spec_tasks_handler(
                 &item.manifest_item_id,
                 &task.id,
             )?;
-            db::insert_comment(
-                &conn,
+            crate::task_events::mutation(&conn, origin.as_ref(), |conn| db::insert_comment(
+                conn,
                 &task.id,
                 "system",
                 "system",
@@ -3615,7 +3624,7 @@ pub async fn generate_spec_tasks_handler(
                     item.manifest_item_id,
                     link.record.link_id
                 ),
-            )?;
+            ))?;
             if !task_ids.contains(&task.id) {
                 task_ids.push(task.id.clone());
             }
@@ -8579,6 +8588,7 @@ pub async fn create_task_handler(
     Path(ident): Path<String>,
     Json(req): Json<CreateTaskRequest>,
 ) -> Result<Json<TaskCreateResponse>> {
+    let origin = crate::task_events::origin(&headers)?;
     // Verify project exists.
     {
         let conn = state.db.lock().unwrap();
@@ -8608,8 +8618,9 @@ pub async fn create_task_handler(
     let ident_clone = ident;
     let task = spawn_blocking(move || -> anyhow::Result<db::Task> {
         let conn = db.lock().unwrap();
+        crate::task_events::mutation(&conn, origin.as_ref(), |conn| {
         let task = db::insert_task(
-            &conn,
+            conn,
             &ident_clone,
             &title,
             description.as_deref(),
@@ -8620,7 +8631,7 @@ pub async fn create_task_handler(
         )?;
         if task.owner_agent_id.is_none() && task.status == "todo" {
             system_nudge(
-                &conn,
+                conn,
                 &ident_clone,
                 "Task created",
                 format!(
@@ -8630,6 +8641,7 @@ pub async fn create_task_handler(
             )?;
         }
         Ok(task)
+        })
     })
     .await??;
 
@@ -8642,6 +8654,7 @@ pub async fn delegate_task_handler(
     Path(source_ident): Path<String>,
     Json(req): Json<DelegateTaskRequest>,
 ) -> Result<Json<DelegationResponse>> {
+    let origin = crate::task_events::origin(&headers)?;
     let source_ident = normalize_project_ident(&source_ident);
     let target_ident = normalize_project_ident(&req.target_project_ident);
     let title = req.title.trim().to_string();
@@ -8668,15 +8681,16 @@ pub async fn delegate_task_handler(
     let db = state.db.clone();
     let response = spawn_blocking(move || -> anyhow::Result<DelegationResponse> {
         let conn = db.lock().unwrap();
-        if db::get_project(&conn, &source_ident)?.is_none() {
+        crate::task_events::mutation(&conn, origin.as_ref(), |conn| {
+        if db::get_project(conn, &source_ident)?.is_none() {
             anyhow::bail!("project '{source_ident}' not found");
         }
-        if db::get_project(&conn, &target_ident)?.is_none() {
+        if db::get_project(conn, &target_ident)?.is_none() {
             anyhow::bail!("project '{target_ident}' not found");
         }
 
         let target_task = db::insert_task(
-            &conn,
+            conn,
             &target_ident,
             &title,
             description.as_deref(),
@@ -8687,7 +8701,7 @@ pub async fn delegate_task_handler(
         )?;
         let source_title = format!("{title} (DELEGATED)");
         let source_task = db::insert_delegated_task(
-            &conn,
+            conn,
             &db::DelegatedTaskInsert {
                 project_ident: &source_ident,
                 title: &source_title,
@@ -8701,7 +8715,7 @@ pub async fn delegate_task_handler(
             },
         )?;
         let delegation = db::insert_task_delegation(
-            &conn,
+            conn,
             &source_ident,
             &source_task.id,
             &target_ident,
@@ -8710,7 +8724,7 @@ pub async fn delegate_task_handler(
             hostname.as_deref(),
         )?;
         db::insert_comment(
-            &conn,
+            conn,
             &source_task.id,
             "agent-gateway",
             "system",
@@ -8720,7 +8734,7 @@ pub async fn delegate_task_handler(
             ),
         )?;
         db::insert_comment(
-            &conn,
+            conn,
             &target_task.id,
             "agent-gateway",
             "system",
@@ -8730,7 +8744,7 @@ pub async fn delegate_task_handler(
             ),
         )?;
         let message_id = system_nudge(
-            &conn,
+            conn,
             &target_ident,
             "Delegated task created",
             format!(
@@ -8744,6 +8758,7 @@ pub async fn delegate_task_handler(
             source_task,
             target_task,
             message_id,
+        })
         })
     })
     .await??;
@@ -8781,6 +8796,7 @@ pub async fn update_task_handler(
     Path((ident, task_id)): Path<(String, String)>,
     Json(req): Json<UpdateTaskRequest>,
 ) -> Result<Json<db::Task>> {
+    let origin = crate::task_events::origin(&headers)?;
     // Validate & decode the nullable-string fields up-front so we can return
     // 400 on a client-side shape mistake rather than bubbling a 500.
     let owner_opt = decode_nullable_string("owner_agent_id", req.owner_agent_id)?;
@@ -8810,7 +8826,8 @@ pub async fn update_task_handler(
     let task = spawn_blocking(move || -> anyhow::Result<Option<db::Task>> {
         let conn = db.lock().unwrap();
         db::reclaim_stale_tasks(&conn, &ident_for_reclaim)?;
-        let before = db::get_task_detail(&conn, &ident_for_update, &task_id_clone)?.map(|d| d.task);
+        crate::task_events::mutation(&conn, origin.as_ref(), |conn| {
+        let before = db::get_task_detail(conn, &ident_for_update, &task_id_clone)?.map(|d| d.task);
 
         let upd = db::TaskUpdate {
             status: status.as_deref(),
@@ -8823,7 +8840,7 @@ pub async fn update_task_handler(
             hostname: hostname_opt.as_ref().map(|inner| inner.as_deref()),
         };
         let updated = db::update_task(
-            &conn,
+            conn,
             &ident_for_update,
             &task_id_clone,
             &upd,
@@ -8833,10 +8850,10 @@ pub async fn update_task_handler(
         if let (Some(before), Some(after)) = (&before, &updated) {
             if before.status != "done" && after.status == "done" {
                 if let Some(delegation) =
-                    db::get_delegation_by_target(&conn, &ident_for_update, &task_id_clone)?
+                    db::get_delegation_by_target(conn, &ident_for_update, &task_id_clone)?
                 {
                     let target_detail =
-                        db::get_task_detail(&conn, &delegation.target_project_ident, &delegation.target_task_id)?
+                        db::get_task_detail(conn, &delegation.target_project_ident, &delegation.target_task_id)?
                             .ok_or_else(|| anyhow::anyhow!("target delegated task missing"))?;
                     let comments = target_detail
                         .comments
@@ -8854,7 +8871,7 @@ pub async fn update_task_handler(
                         if comments.is_empty() { "(none)" } else { &comments }
                     );
                     db::insert_comment(
-                        &conn,
+                        conn,
                         &delegation.source_task_id,
                         "agent-gateway",
                         "system",
@@ -8870,25 +8887,25 @@ pub async fn update_task_handler(
                         labels: None,
                         hostname: None,
                     };
-                    let _ = db::update_task(
-                        &conn,
+                    let _ = db::update_task_mirrored(
+                        conn,
                         &delegation.source_project_ident,
                         &delegation.source_task_id,
                         &done_upd,
-                        None,
-                    )?;
+                    )?.ok_or_else(|| anyhow::anyhow!("source delegated task missing"))?;
                     let message_id = system_nudge(
-                        &conn,
+                        conn,
                         &delegation.source_project_ident,
                         "Delegated task completed",
                         summary,
                     )?;
-                    db::mark_delegation_complete(&conn, &delegation.id, message_id)?;
+                    db::mark_delegation_complete(conn, &delegation.id, message_id)?;
                 }
             }
         }
 
         Ok(updated)
+        })
     })
     .await??;
 
@@ -8903,9 +8920,11 @@ pub async fn update_task_handler(
 
 pub async fn update_delegation_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((ident, task_id)): Path<(String, String)>,
     Json(req): Json<UpdateDelegationRequest>,
 ) -> Result<Json<DelegationResponse>> {
+    let origin = crate::task_events::origin(&headers)?;
     let details_opt = if req.specification.is_some() {
         req.specification
     } else {
@@ -8914,7 +8933,8 @@ pub async fn update_delegation_handler(
     let db = state.db.clone();
     let response = spawn_blocking(move || -> anyhow::Result<DelegationResponse> {
         let conn = db.lock().unwrap();
-        let delegation = db::get_delegation_by_source(&conn, &ident, &task_id)?
+        crate::task_events::mutation(&conn, origin.as_ref(), |conn| {
+        let delegation = db::get_delegation_by_source(conn, &ident, &task_id)?
             .ok_or_else(|| anyhow::anyhow!("task '{task_id}' is not a delegated source task"))?;
         let source_title = req.title.as_ref().map(|title| {
             if title.ends_with(" (DELEGATED)") {
@@ -8935,7 +8955,7 @@ pub async fn update_delegation_handler(
             hostname: None,
         };
         let source_task = db::update_task(
-            &conn,
+            conn,
             &delegation.source_project_ident,
             &delegation.source_task_id,
             &source_upd,
@@ -8955,7 +8975,7 @@ pub async fn update_delegation_handler(
             hostname: None,
         };
         let target_task = db::update_task(
-            &conn,
+            conn,
             &delegation.target_project_ident,
             &delegation.target_task_id,
             &target_upd,
@@ -8965,21 +8985,21 @@ pub async fn update_delegation_handler(
 
         let note = "Delegated task contract was updated by the source project.";
         db::insert_comment(
-            &conn,
+            conn,
             &delegation.source_task_id,
             "agent-gateway",
             "system",
             note,
         )?;
         db::insert_comment(
-            &conn,
+            conn,
             &delegation.target_task_id,
             "agent-gateway",
             "system",
             note,
         )?;
         let message_id = system_nudge(
-            &conn,
+            conn,
             &delegation.target_project_ident,
             "Delegated task updated",
             format!(
@@ -8994,6 +9014,7 @@ pub async fn update_delegation_handler(
             target_task,
             message_id,
         })
+        })
     })
     .await??;
 
@@ -9006,6 +9027,7 @@ pub async fn add_comment_handler(
     Path((ident, task_id)): Path<(String, String)>,
     Json(req): Json<AddCommentRequest>,
 ) -> Result<Json<db::TaskComment>> {
+    let origin = crate::task_events::origin(&headers)?;
     let content = req.content;
     if content.trim().is_empty() {
         return Err(AppError(
@@ -9056,24 +9078,27 @@ pub async fn add_comment_handler(
     let task_id_clone = task_id;
     let comment = spawn_blocking(move || -> anyhow::Result<db::TaskComment> {
         let conn = db.lock().unwrap();
-        let comment = db::insert_comment(&conn, &task_id_clone, &author, &author_type, &content)?;
-        if author_type != "system" {
-            if let Some(delegation) =
-                db::get_delegation_by_target(&conn, &ident_clone, &task_id_clone)?
-            {
-                let body = format!(
-                    "New comment on delegated task `{}` from project `{}`:\n\n{}: {}",
-                    delegation.source_task_id, delegation.target_project_ident, author, content
-                );
-                system_nudge(
-                    &conn,
-                    &delegation.source_project_ident,
-                    "Delegated task comment added",
-                    body,
-                )?;
+        crate::task_events::mutation(&conn, origin.as_ref(), |conn| {
+            let comment =
+                db::insert_comment(conn, &task_id_clone, &author, &author_type, &content)?;
+            if author_type != "system" {
+                if let Some(delegation) =
+                    db::get_delegation_by_target(conn, &ident_clone, &task_id_clone)?
+                {
+                    let body = format!(
+                        "New comment on delegated task `{}` from project `{}`:\n\n{}: {}",
+                        delegation.source_task_id, delegation.target_project_ident, author, content
+                    );
+                    system_nudge(
+                        conn,
+                        &delegation.source_project_ident,
+                        "Delegated task comment added",
+                        body,
+                    )?;
+                }
             }
-        }
-        Ok(comment)
+            Ok(comment)
+        })
     })
     .await??;
 
@@ -9108,6 +9133,7 @@ pub async fn reorder_tasks_handler(
     axum::extract::Query(q): axum::extract::Query<ReorderTasksQuery>,
     Json(req): Json<ReorderTasksRequest>,
 ) -> Result<Json<Vec<db::TaskSummary>>> {
+    let origin = crate::task_events::origin(&headers)?;
     // Verify project exists (consistent with other project-scoped handlers).
     {
         let conn = state.db.lock().unwrap();
@@ -9135,7 +9161,9 @@ pub async fn reorder_tasks_handler(
 
     let tasks = spawn_blocking(move || -> anyhow::Result<Vec<db::TaskSummary>> {
         let conn = db.lock().unwrap();
-        db::reorder_tasks_in_column(&conn, &ident_clone, &status_clone, &order, actor.as_deref())?;
+        crate::task_events::mutation(&conn, origin.as_ref(), |conn| {
+            db::reorder_tasks_in_column(conn, &ident_clone, &status_clone, &order, actor.as_deref())
+        })?;
         db::list_tasks(
             &conn,
             &ident_clone,
@@ -10955,6 +10983,7 @@ mod tests {
             labels: vec!["demo".to_string()],
             hostname: Some("host".to_string()),
             owner_agent_id: None,
+            owner_origin: None,
             reporter: "agent".to_string(),
             created_at: 1,
             updated_at: 1,
@@ -10998,6 +11027,7 @@ mod tests {
                 author: "user".into(),
                 author_type: "user".into(),
                 content: "Please check <this>".into(),
+                origin: None,
                 created_at: 1,
             }],
         };

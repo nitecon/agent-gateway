@@ -248,6 +248,23 @@ Per-project kanban task board. Tasks move through three statuses — `todo`,
 `X-Agent-Id` header (falling back to `"user"` when absent or `_default`) and
 can be overridden per request with an explicit `reporter`/`author` field.
 
+Session-origin builds also accept `X-Agent-Session-Id` (UUID),
+`X-Agent-Instance-Id` (UUID), `X-Agent-Provider` (`codex`/`claude`) and
+`X-Agent-OS` (`linux`/`windows`/`macos`) together. Partial or malformed headers
+return 400. Legacy requests without these headers remain unattributed.
+Attributed claims persist `owner_origin`; status or owner changes then require
+the exact claiming session and instance (409 otherwise), including requests
+sharing the same `X-Agent-Id` and unattributed callers. Release/reopen to `todo`
+and stale reclaim clear session ownership.
+
+Lifecycle events and comments expose optional `origin` with `session_id`,
+`instance_id`, `provider` and `os`. Completion events identify the completing
+actor independently of the latest comment author. Automatic delegated source
+result comments and completion retain the target worker's origin and commit
+atomically with target completion. The protocol-v1 broadcast and receipt
+contract is unchanged; see `.agent/api/task-stream.yaml` for the authoritative
+extension and availability notes.
+
 Two background reconciliations run on every list and detail read:
 
 - **Stale reclaim (1h).** An `in_progress` task with no `updated_at` activity

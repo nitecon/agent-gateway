@@ -4,14 +4,16 @@ summary: One authenticated connection across projects for durable task creation,
 kind: agent_context
 source_format: agent_context
 source_ref: crates/gateway/src/task_events.rs
-version: v1.19.0
+version: protocol-v1-session-origin
 labels: [gateway, tasks, websocket, cmux, lifecycle, integration]
 content:
   purpose: >-
     The gateway publishes standard task lifecycle events; cmux owns repository
     matching and interactive terminal injection behind one global experimental
     approval. There is no per-project execution configuration or agent launching.
-    Requires gateway v1.19.0+ and an updated client implementing this contract.
+    Base streaming requires gateway v1.19.0+. Session origins require a gateway
+    build containing the session-origin change; older released builds omit origins.
+    This additive extension keeps stream protocol_version 1.
   auth:
     header: "Authorization: Bearer <GATEWAY_API_KEY>"
     transport: Use wss outside loopback. Supply the header on the native upgrade request.
@@ -20,6 +22,30 @@ content:
       - Cookies and query-string keys do not authorize the WebSocket.
       - REST metadata accepts bearer authentication or administrator browser sessions; members receive 403.
       - Keep the key out of terminal input, URLs, logs and session snapshots.
+  task_mutation_identity:
+    headers:
+      X-Agent-Id: Legacy machine/display identity; retained independently of session provenance.
+      X-Agent-Session-Id: UUID identifying the exact agent session.
+      X-Agent-Instance-Id: UUID identifying the client/process instance.
+      X-Agent-Provider: codex or claude.
+      X-Agent-OS: linux, windows or macos.
+    validation:
+      - Supply all four provenance headers together on task mutations, including creation, comments, delegation updates, generated spec tasks, subtasks and reorder. Missing, duplicate or malformed provenance headers return 400; UUIDs are normalized.
+      - Supplying none preserves legacy behavior with null origin; the gateway never derives origin from X-Agent-Id, author, reporter, requester, provider detection or previous comments.
+    ownership:
+      - A transition into in_progress stores the request origin as task.owner_origin, independently of owner_agent_id. Unattributed claims store null.
+      - When owner_origin exists, PATCH status (including repeated claims) or owner_agent_id requires exactly matching session_id AND instance_id; other sessions and unattributed callers receive 409. Reorder transitions enforce the same fence; same-column ranking does not transfer ownership. Provider and OS are descriptive, never routing or ownership selectors.
+      - Successful release or reopen to todo clears owner_origin. Completion retains the claim origin; event.origin separately identifies the completing actor. The existing 1h stale reclaim clears ownership and generates unattributed system comments.
+      - Legacy tasks with null owner_origin retain their previous behavior. Ordinary title/specification edits and comments do not transfer session ownership.
+      - Automatic delegated source completion bypasses source ownership as a causative result mirror, preserving the completing target worker origin, never substituting requester or gateway identity.
+    persistence:
+      - Event origin is persisted in the same transaction as its task mutation. Delegation creation, updates and target completion with source result comment/completion are atomic, including rollback on any mirror failure.
+      - REST /v1/task-events and WebSocket events expose origin; task detail exposes owner_origin and comments[].origin. Comment create responses and snapshots expose origin even for system mirrors with author agent-gateway.
+      - Completion event.origin is the actor of the status mutation. The optional latest non-system comment retains its own comment.origin and may be authored by a different session.
+      - Origins and ownership survive restart. Event and comment snapshots survive task deletion; old persisted events remain null/unattributed without backfill.
+    broadcast:
+      - All projects remain on the same stream. There is no OS/provider filtering, agent registry, launching, scheduling or participant selector.
+      - Existing event-level ack/status/cursor remains unchanged. A client may aggregate local recipients and encode bounded structured per-recipient data in the existing summary string; no per-recipient protocol schema is introduced.
   endpoints:
     - method: GET
       path: /v1/tasks/stream
@@ -53,7 +79,7 @@ content:
         - A second live connection for the same consumer is rejected; stale connections are fenced when replaced. Gateway startup clears live connection flags while preserving cursors, events and receipts.
     - name: Receive standard lifecycle events
       steps:
-        - The event envelope contains id, kind, project_ident, canonical_remote, task snapshot, optional comment, optional current delegation metadata, created_at, truncated and deliveries.
+        - The event envelope contains id, kind, project_ident, canonical_remote, task snapshot, optional origin, optional comment, optional current delegation metadata, created_at, truncated and deliveries.
         - Kinds are task_created, task_commented and task_completed. Both ordinary and delegated tasks, user/agent/system comments, subtasks and mirrored source completion are included; no per-project opt-in gates the stream.
         - Events are inserted transactionally with their mutations. Task and comment snapshots survive task deletion and preserve state at the event; delegation metadata reflects the surviving relationship at read time and may be null after deletion.
         - task_created is emitted for both incoming normal target tasks and outgoing source tracking tickets. task.kind delegated and delegated_to_task_id identify an outgoing tracking ticket; do not treat it as a second assignment to execute.
@@ -99,8 +125,13 @@ content:
         kind: task_commented
         project_ident: example-project
         canonical_remote: github.com/owner/example-project
-        task: "Standard task snapshot: id, title, description, details, status, owner, timestamps, kind and delegation target fields."
-        comment: "Standard comment snapshot: id, task_id, author, author_type, content and created_at; null on task_created."
+        origin:
+          session_id: aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
+          instance_id: bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb
+          provider: codex
+          os: linux
+        task: "Standard task snapshot: id, title, description, details, status, owner_agent_id, optional owner_origin, timestamps, kind and delegation target fields."
+        comment: "Standard comment snapshot: id, task_id, author, author_type, content, created_at and optional origin; null on task_created."
         delegation: "Standard delegation relationship or null."
         created_at: 1791320000000
         truncated: false
@@ -138,5 +169,5 @@ content:
     - /task-stream replaces the execution configuration page; /execution is a viewing alias. Task detail links to filtered lifecycle history.
     - cmux clients using the old assignment protocol need the delegated subscription update; installing hooks or enabling old project policies will not restore it.
   validation:
-    - Unit tests cover atomic rollback, snapshots after deletion, delegation source identity, replay/fencing, idempotent receipts, redaction/UTF-8 bounds and legacy cleanup/history.
-    - tests/task_stream_smoke.py runs a real isolated gateway and native RFC6455 peer; checks lifecycle across projects, ordinary comments, delegation, subtasks, restart/replay, cookie/bearer authorization, removed routes and read-only legacy migration. No real agent or production task is used.
+    - Unit tests cover header validation, exact session/instance ownership, legacy compatibility, stale reclaim, mutation-actor completion provenance, origin rollback and persisted snapshots, plus atomic rollback, snapshots after deletion, delegation source identity, replay/fencing, idempotent receipts, redaction/UTF-8 bounds and legacy cleanup/history.
+    - tests/task_stream_smoke.py runs a real isolated gateway and native RFC6455 peer; checks lifecycle across projects, ordinary comments, delegation creation and worker-origin source mirrors, forced mirror rollback, ownership conflicts across shared machine IDs, subtasks, restart/replay with origin persistence, cookie/bearer authorization, removed routes and read-only legacy migration. No real agent or production task is used.

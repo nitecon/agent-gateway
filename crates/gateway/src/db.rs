@@ -7639,6 +7639,7 @@ pub struct Task {
     pub labels: Vec<String>,
     pub hostname: Option<String>,
     pub owner_agent_id: Option<String>,
+    pub owner_origin: Option<crate::task_events::AgentOrigin>,
     pub reporter: String,
     pub created_at: i64,
     pub updated_at: i64,
@@ -7659,6 +7660,7 @@ pub struct TaskComment {
     pub author_type: String,
     pub content: String,
     pub created_at: i64,
+    pub origin: Option<crate::task_events::AgentOrigin>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -10047,13 +10049,14 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         kind: row.get(15)?,
         delegated_to_project_ident: row.get(16)?,
         delegated_to_task_id: row.get(17)?,
+        owner_origin: crate::task_events::read_origin(row, 18)?,
     })
 }
 
 const TASK_SELECT_COLS: &str =
     "id, project_ident, title, description, details, status, rank, labels, \
      hostname, owner_agent_id, reporter, created_at, updated_at, started_at, done_at, \
-     kind, delegated_to_project_ident, delegated_to_task_id";
+     kind, delegated_to_project_ident, delegated_to_task_id, owner_origin_json";
 
 /// Reclaim any task in this project that has been `in_progress` for longer than
 /// [`TASK_RECLAIM_MS`] without any `updated_at` activity. Reclaimed tasks are
@@ -10109,6 +10112,7 @@ pub fn reclaim_stale_tasks(conn: &Connection, project_ident: &str) -> Result<usi
             &[
                 crud_col("status", "todo"),
                 crud_col("owner_agent_id", DbValue::null()),
+                crud_col("owner_origin_json", DbValue::null()),
                 crud_col("started_at", DbValue::null()),
                 crud_col("updated_at", now),
             ],
@@ -10210,6 +10214,7 @@ fn insert_task_record(
         labels: labels.to_vec(),
         hostname: hostname.map(str::to_string),
         owner_agent_id: None,
+        owner_origin: None,
         reporter: reporter.to_string(),
         created_at: now,
         updated_at: now,
@@ -10347,7 +10352,7 @@ pub fn get_task_detail(
     };
 
     let mut stmt = conn.prepare_cached(
-        "SELECT id, task_id, author, author_type, content, created_at
+        "SELECT id, task_id, author, author_type, content, created_at, origin_json
          FROM task_comments
          WHERE task_id = ?1
          ORDER BY created_at ASC",
@@ -10361,6 +10366,7 @@ pub fn get_task_detail(
                 author_type: r.get(3)?,
                 content: r.get(4)?,
                 created_at: r.get(5)?,
+                origin: crate::task_events::read_origin(r, 6)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -10450,6 +10456,27 @@ pub fn update_task(
     upd: &TaskUpdate<'_>,
     actor_agent_id: Option<&str>,
 ) -> Result<Option<Task>> {
+    update_task_inner(conn, project_ident, task_id, upd, actor_agent_id, true)
+}
+
+/// Only automatic delegated result propagation bypasses source ownership.
+pub fn update_task_mirrored(
+    conn: &Connection,
+    project_ident: &str,
+    task_id: &str,
+    upd: &TaskUpdate<'_>,
+) -> Result<Option<Task>> {
+    update_task_inner(conn, project_ident, task_id, upd, None, false)
+}
+
+fn update_task_inner(
+    conn: &Connection,
+    project_ident: &str,
+    task_id: &str,
+    upd: &TaskUpdate<'_>,
+    actor_agent_id: Option<&str>,
+    enforce_owner: bool,
+) -> Result<Option<Task>> {
     let project_ident = normalize_project_ident(project_ident);
     // Validate requested status early.
     if let Some(s) = upd.status {
@@ -10470,6 +10497,16 @@ pub fn update_task(
         }
     };
 
+    let origin = crate::task_events::current_origin(conn)?;
+    if enforce_owner && (upd.status.is_some() || upd.owner_agent_id.is_some()) {
+        if let Some(owner) = &current.owner_origin {
+            if !origin.as_ref().is_some_and(|actor| {
+                actor.session_id == owner.session_id && actor.instance_id == owner.instance_id
+            }) {
+                return Err(crate::task_events::OwnershipConflict.into());
+            }
+        }
+    }
     let now = now_ms();
     let new_status = upd.status.unwrap_or(&current.status).to_string();
     let owner_explicit = upd.owner_agent_id.is_some();
@@ -10553,6 +10590,15 @@ pub fn update_task(
         assignments.push(crud_col("done_at", done));
     }
 
+    if transitioning && new_status == "in_progress" {
+        assignments.push(crud_col(
+            "owner_origin_json",
+            origin.as_ref().map(serde_json::to_string).transpose()?,
+        ));
+    } else if transitioning && new_status == "todo" {
+        assignments.push(crud_col("owner_origin_json", DbValue::null()));
+    }
+
     // Always bump updated_at.
     assignments.push(crud_col("updated_at", now));
 
@@ -10597,8 +10643,13 @@ pub fn insert_comment(
     let id = new_uuid();
     let now = now_ms();
 
-    let tx = conn.unchecked_transaction()?;
-    crud(&tx).insert(
+    let origin = crate::task_events::current_origin(conn)?;
+    let tx = if conn.is_autocommit() {
+        Some(conn.unchecked_transaction()?)
+    } else {
+        None
+    };
+    crud(conn).insert(
         "task_comments",
         &[
             crud_col("id", id.as_str()),
@@ -10607,14 +10658,20 @@ pub fn insert_comment(
             crud_col("author_type", author_type),
             crud_col("content", content),
             crud_col("created_at", now),
+            crud_col(
+                "origin_json",
+                origin.as_ref().map(serde_json::to_string).transpose()?,
+            ),
         ],
     )?;
-    crud(&tx).update(
+    crud(conn).update(
         "tasks",
         &[crud_col("updated_at", now)],
         &[crud_eq("id", task_id)],
     )?;
-    tx.commit()?;
+    if let Some(tx) = tx {
+        tx.commit()?;
+    }
 
     Ok(TaskComment {
         id,
@@ -10623,6 +10680,7 @@ pub fn insert_comment(
         author_type: author_type.to_string(),
         content: content.to_string(),
         created_at: now,
+        origin,
     })
 }
 
@@ -10768,7 +10826,13 @@ pub fn delete_task(conn: &Connection, project_ident: &str, task_id: &str) -> Res
 
 /// Current row snapshot read at the top of `reorder_tasks_in_column`:
 /// `(status, owner_agent_id, started_at, done_at)`.
-type TaskStateSnapshot = (String, Option<String>, Option<i64>, Option<i64>);
+type TaskStateSnapshot = (
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<crate::task_events::AgentOrigin>,
+);
 
 /// Apply a client-driven order to one status column. For each id in `order`,
 /// set `status = target_status` and `rank = index` (0-based). Any status
@@ -10802,13 +10866,18 @@ pub fn reorder_tasks_in_column(
     }
 
     let now = now_ms();
-    let tx = conn.unchecked_transaction()?;
+    let tx = if conn.is_autocommit() {
+        Some(conn.unchecked_transaction()?)
+    } else {
+        None
+    };
+    let origin = crate::task_events::current_origin(conn)?;
 
     for (idx, task_id) in order.iter().enumerate() {
         // Fetch current status + owner for this row, scoped to the project.
         let current: Option<TaskStateSnapshot> = {
-            let mut stmt = tx.prepare(
-                "SELECT status, owner_agent_id, started_at, done_at
+            let mut stmt = conn.prepare(
+                "SELECT status, owner_agent_id, started_at, done_at, owner_origin_json
                  FROM tasks WHERE id = ?1 AND project_ident = ?2",
             )?;
             let mut rows = stmt.query_map(params![task_id, project_ident.as_str()], |r| {
@@ -10817,12 +10886,13 @@ pub fn reorder_tasks_in_column(
                     r.get::<_, Option<String>>(1)?,
                     r.get::<_, Option<i64>>(2)?,
                     r.get::<_, Option<i64>>(3)?,
+                    crate::task_events::read_origin(r, 4)?,
                 ))
             })?;
             rows.next().transpose()?
         };
 
-        let (old_status, old_owner, old_started_at, old_done_at) = match current {
+        let (old_status, old_owner, old_started_at, old_done_at, old_origin) = match current {
             Some(v) => v,
             None => anyhow::bail!("task '{task_id}' not found in project '{project_ident}'"),
         };
@@ -10833,8 +10903,22 @@ pub fn reorder_tasks_in_column(
         let mut new_started_at = old_started_at;
         let mut new_done_at = old_done_at;
         let mut new_owner = old_owner.clone();
+        let mut new_origin = old_origin.clone();
 
         if old_status != target_status {
+            if let Some(owner) = old_origin {
+                if !origin.as_ref().is_some_and(|actor| {
+                    actor.session_id == owner.session_id && actor.instance_id == owner.instance_id
+                }) {
+                    return Err(crate::task_events::OwnershipConflict.into());
+                }
+            }
+            if target_status == "in_progress" {
+                new_origin = origin.clone();
+            }
+            if target_status == "todo" {
+                new_origin = None;
+            }
             match (old_status.as_str(), target_status) {
                 ("todo", "in_progress") => {
                     new_started_at = Some(now);
@@ -10874,7 +10958,7 @@ pub fn reorder_tasks_in_column(
             }
         }
 
-        crud(&tx).update(
+        crud(conn).update(
             "tasks",
             &[
                 crud_col("status", target_status),
@@ -10882,6 +10966,10 @@ pub fn reorder_tasks_in_column(
                 crud_col("started_at", new_started_at),
                 crud_col("done_at", new_done_at),
                 crud_col("owner_agent_id", new_owner),
+                crud_col(
+                    "owner_origin_json",
+                    new_origin.as_ref().map(serde_json::to_string).transpose()?,
+                ),
                 crud_col("updated_at", now),
             ],
             &[
@@ -10891,7 +10979,9 @@ pub fn reorder_tasks_in_column(
         )?;
     }
 
-    tx.commit()?;
+    if let Some(tx) = tx {
+        tx.commit()?;
+    }
     Ok(())
 }
 

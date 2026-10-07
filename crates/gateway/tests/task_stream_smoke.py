@@ -30,12 +30,25 @@ with socket.socket() as sock:
 URL = f"http://127.0.0.1:{PORT}"
 
 
-def api(path, body=None, method=None):
+def api(path, body=None, method=None, origin=None, headers=None):
+    request_headers={"Authorization": "Bearer "+TOKEN, "Content-Type":"application/json", "X-Agent-Id":"fixture-agent"}
+    if origin:
+        request_headers.update({"X-Agent-Session-Id":origin["session_id"], "X-Agent-Instance-Id":origin["instance_id"], "X-Agent-Provider":origin["provider"], "X-Agent-OS":origin["os"]})
+    request_headers.update(headers or {})
     request = urllib.request.Request(URL+path, data=json.dumps(body).encode() if body is not None else None,
         method=method or ("POST" if body is not None else "GET"),
-        headers={"Authorization": "Bearer "+TOKEN, "Content-Type":"application/json", "X-Agent-Id":"fixture-agent"})
+        headers=request_headers)
     with urllib.request.urlopen(request,timeout=10) as response:
         return json.load(response)
+
+
+def rejected(status, path, body, method="PATCH", **kwargs):
+    try: api(path, body, method, **kwargs)
+    except urllib.error.HTTPError as error: assert error.code==status,(error.code,error.read())
+    else: raise AssertionError("mutation unexpectedly accepted")
+
+REQUESTER={"session_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "instance_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "provider":"codex", "os":"linux"}
+WORKER={**REQUESTER,"session_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc", "provider":"claude", "os":"windows"}
 
 
 def cookie(role):
@@ -166,7 +179,7 @@ def main():
         assert 'already connected' in duplicate.receive("error")["message"];duplicate.close()
         task=api("/v1/projects/alpha/tasks",{"title":"Ordinary task streams without policy","specification":"Fixture context"})
         event=receive_event(client,"task_created")
-        assert event["task"]["id"]==task["id"] and event["canonical_remote"]=="github.com/fixture/alpha"
+        assert event["task"]["id"]==task["id"] and event["canonical_remote"]=="github.com/fixture/alpha" and event["origin"] is None
         assert ack(client,event,"queued")["status"]=="queued"
         assert ack(client,event,"injected",workspace_id="workspace",surface_id="surface",message="Delivered "+TOKEN,summary="Recorded "+TOKEN)["status"]=="injected"
         assert ack(client,event,"received")["status"]=="injected"
@@ -185,7 +198,7 @@ def main():
         process.terminate();process.wait(timeout=10)
         process=start()
         client,hello=subscribe("fixture-cmux");assert hello["cursor"]==replay["id"]
-        delegation=api("/v1/projects/alpha/tasks/delegate",{"target_project_ident":"beta","title":"Incoming delegated task"})
+        delegation=api("/v1/projects/alpha/tasks/delegate",{"target_project_ident":"beta","title":"Incoming delegated task"},origin=REQUESTER)
         received=[receive_event(client)];ack(client,received[-1])
         for _ in range(3):
             received.append(receive_event(client));ack(client,received[-1])
@@ -193,13 +206,56 @@ def main():
         assert received[0]["task"]["id"]==delegation["target_task"]["id"]
         assert received[0]["delegation"]["source_project_ident"]=="alpha"
         assert received[1]["task"]["kind"]=="delegated"
-        child=api(f"/v1/projects/alpha/tasks/{pending['id']}/subtasks",{"title":"Generated child"})
-        event=receive_event(client,"task_created");assert event["task"]["id"]==child["id"];ack(client,event)
-        api(f"/v1/projects/beta/tasks/{delegation['target_task']['id']}",{"status":"done"},"PATCH")
+        assert all(e["origin"]==REQUESTER for e in received)
+        target_path=f"/v1/projects/beta/tasks/{delegation['target_task']['id']}"
+        source_path=f"/v1/projects/alpha/tasks/{delegation['source_task']['id']}"
+        api(source_path,{"status":"in_progress"},"PATCH",origin=REQUESTER)
+        claimed=api(target_path,{"status":"in_progress"},"PATCH",origin=WORKER)
+        assert claimed["owner_origin"]==WORKER
+        for actor in [REQUESTER, {**WORKER,"instance_id":REQUESTER["session_id"]}, None]:
+            for status in ["in_progress","todo","done"]:
+                rejected(409,target_path,{"status":status},origin=actor)
+            rejected(409,target_path,{"owner_agent_id":None},origin=actor)
+        rejected(409,"/v1/projects/beta/tasks/reorder?status=done",{"order":[claimed["id"]]},method="POST",origin=REQUESTER)
+        rejected(409,"/v1/projects/beta/tasks/reorder?status=todo",{"order":[claimed["id"]]},method="POST")
+        rejected(400,target_path,{"status":"done"},headers={"X-Agent-Session-Id":WORKER["session_id"]})
+        rejected(400,target_path,{"status":"done"},origin={**WORKER,"provider":"invalid"})
+        rejected(400,target_path,{"status":"done"},origin={**WORKER,"session_id":"invalid"})
+        released=api(target_path,{"status":"todo"},"PATCH",origin=WORKER)
+        assert released["owner_origin"] is None and released["owner_agent_id"] is None
+        api(target_path,{"status":"in_progress"},"PATCH",origin=WORKER)
+        comment=api(target_path+"/comments",{"content":"A different session commented last"},origin=REQUESTER)
+        event=receive_event(client,"task_commented")
+        assert event["origin"]==REQUESTER and event["comment"]["origin"]==REQUESTER and comment["origin"]==REQUESTER
+        ack(client,event)
+        assert api(target_path)["comments"][-1]["origin"]==REQUESTER
+        # Restart must preserve both ownership and event/comment provenance.
+        client.close();wait_disconnected("fixture-cmux")
+        process.terminate();process.wait(timeout=10);process=start()
+        client,hello=subscribe("fixture-cmux")
+        assert api(target_path)["owner_origin"]==WORKER
+        rejected(409,target_path,{"status":"done"},origin=REQUESTER)
+        child=api(f"/v1/projects/alpha/tasks/{pending['id']}/subtasks",{"title":"Generated child"},origin=WORKER)
+        event=receive_event(client,"task_created");assert event["task"]["id"]==child["id"] and event["origin"]==WORKER;ack(client,event)
+        # A failed source mirror must roll back target completion and all events.
+        before_tail=api("/v1/task-events")[0]["id"]
+        with sqlite3.connect(FIXTURE/"gateway.db") as conn:
+            conn.execute(f"CREATE TRIGGER fixture_fail_mirror BEFORE UPDATE OF status ON tasks WHEN NEW.id='{delegation['source_task']['id']}' AND NEW.status='done' BEGIN SELECT RAISE(ABORT,'fixture mirror failure'); END")
+        rejected(500,target_path,{"status":"done"},origin=WORKER)
+        assert api(target_path)["status"]=="in_progress" and api(source_path)["status"]=="in_progress"
+        assert api("/v1/task-events")[0]["id"]==before_tail
+        with sqlite3.connect(FIXTURE/"gateway.db") as conn:
+            assert conn.execute("SELECT origin_json FROM task_mutation_context").fetchone()[0] is None
+            conn.execute("DROP TRIGGER fixture_fail_mirror")
+        api(target_path,{"status":"done"},"PATCH",origin=WORKER)
         completed=[]
         for _ in range(3):
             event=receive_event(client);completed.append(event);ack(client,event)
         assert [e["kind"] for e in completed]==['task_completed','task_commented','task_completed']
+        assert all(e["origin"]==WORKER for e in completed)
+        assert completed[0]["comment"]["origin"]==REQUESTER
+        assert completed[1]["comment"]["author"]=="agent-gateway" and completed[1]["comment"]["origin"]==WORKER
+        assert api(source_path)["status"]=="done" and api(source_path)["comments"][-1]["origin"]==WORKER
         large=api("/v1/projects/alpha/tasks",{"title":"<script>fixture</script>","specification":("🦀\n"+TOKEN)*10000})
         event=receive_event(client,"task_created");assert event["truncated"] and TOKEN not in json.dumps(event);ack(client,event)
         rows=api("/v1/task-events")
