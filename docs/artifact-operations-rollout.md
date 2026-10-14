@@ -1,5 +1,9 @@
 # Artifact Operations Envelope and Rollout Plan (v1)
 
+> Gateway-backed API and agent documentation are retired. Historical references
+> to documentation artifacts, publication, retrieval, export, or migration are
+> obsolete. The supported artifact workflows are specs and design reviews.
+
 **Status:** Draft (Phase 1, gateway-features_spec T004)
 **Audience:** SRE, gateway backend implementers (T005 schema, T006 repository, T007 generic HTTP API, T008 regression tests, T011 documentation workflow), CLI/skill authors, T014 final-rollout validators
 **Depends on:** T002 — `docs/artifact-substrate-v1.md`, T003 — `docs/workflow-mutation-contract.md`

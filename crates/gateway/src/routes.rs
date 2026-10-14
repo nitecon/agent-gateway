@@ -487,8 +487,6 @@ pub struct ArtifactWorkspaceQuery {
     label: Option<String>,
     actor: Option<String>,
     q: Option<String>,
-    chunk_q: Option<String>,
-    include_history: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -752,7 +750,7 @@ fn trim_required(value: &str, field: &'static str) -> Result<String> {
 }
 
 fn validate_artifact_kind(kind: &str) -> Result<()> {
-    if matches!(kind, "design_review" | "spec" | "documentation") {
+    if matches!(kind, "design_review" | "spec") {
         Ok(())
     } else {
         Err(AppError(
@@ -763,10 +761,7 @@ fn validate_artifact_kind(kind: &str) -> Result<()> {
 }
 
 fn validate_body_format(format: &str) -> Result<()> {
-    if matches!(
-        format,
-        "markdown" | "application/agent-context+json" | "openapi" | "swagger"
-    ) {
+    if matches!(format, "markdown") {
         Ok(())
     } else {
         Err(AppError(
@@ -2399,6 +2394,15 @@ pub async fn start_artifact_workflow_run_handler(
     let (context, authorization) =
         begin_artifact_mutation(&state, &headers, &ident, vec!["workflow_run.start"])?;
     let workflow_kind = trim_required(&body.workflow_kind, "workflow_kind")?;
+    if !matches!(
+        workflow_kind.as_str(),
+        "design_review_round" | "spec_iteration" | "spec_acceptance" | "spec_task_generation"
+    ) {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "invalid_workflow_kind".into(),
+        ));
+    }
     let envelope = state.artifact_operations;
     let db = state.db.clone();
     let ident_for_metric = ident.clone();
@@ -2430,7 +2434,7 @@ pub async fn start_artifact_workflow_run_handler(
                 idempotency_key: Some(&context_for_db.idempotency_key),
                 is_resumable: body.is_resumable.unwrap_or(matches!(
                     workflow_kind_for_db.as_str(),
-                    "spec_task_generation" | "doc_publish"
+                    "spec_task_generation"
                 )),
             },
         )?;
@@ -4542,583 +4546,6 @@ pub async fn discover_memory_projects_handler(
     Ok(Json(response))
 }
 
-// ── Agent API docs ───────────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-pub struct ListApiDocsQuery {
-    pub q: Option<String>,
-    pub app: Option<String>,
-    pub label: Option<String>,
-    pub kind: Option<String>,
-    pub scope: Option<String>,
-    #[serde(default)]
-    pub include_history: bool,
-    #[serde(default)]
-    pub envelope: bool,
-}
-
-#[derive(Deserialize, Default)]
-pub struct ApiDocDetailQuery {
-    pub version_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct CreateApiDocRequest {
-    pub app: String,
-    pub title: String,
-    pub summary: Option<String>,
-    #[serde(default = "default_api_doc_kind")]
-    pub kind: String,
-    #[serde(default = "default_api_doc_source_format")]
-    pub source_format: String,
-    pub source_ref: Option<String>,
-    pub version: Option<String>,
-    #[serde(default)]
-    pub labels: Value,
-    pub parent_id: Option<Value>,
-    pub slug: Option<Value>,
-    pub sort_order: Option<i64>,
-    pub global_rank: Option<Value>,
-    pub global_descendants: Option<bool>,
-    pub content: Value,
-    pub author: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct UpdateApiDocRequest {
-    pub app: Option<String>,
-    pub title: Option<String>,
-    pub summary: Option<Value>,
-    pub kind: Option<String>,
-    pub source_format: Option<String>,
-    pub source_ref: Option<Value>,
-    pub version: Option<Value>,
-    pub labels: Option<Value>,
-    pub parent_id: Option<Value>,
-    pub slug: Option<Value>,
-    pub sort_order: Option<i64>,
-    pub global_rank: Option<Value>,
-    pub global_descendants: Option<Value>,
-    pub content: Option<Value>,
-}
-
-#[derive(Serialize)]
-pub struct ApiDocChunk {
-    pub doc_id: String,
-    pub project_ident: String,
-    pub app: String,
-    pub title: String,
-    pub chunk_type: String,
-    pub labels: Vec<String>,
-    pub text: String,
-    pub updated_at: i64,
-}
-
-fn default_api_doc_kind() -> String {
-    "agent_context".to_string()
-}
-
-fn default_api_doc_source_format() -> String {
-    "agent_context".to_string()
-}
-
-fn optional_string_field(field: &str, value: Value) -> Result<Option<String>> {
-    match value {
-        Value::Null => Ok(None),
-        Value::String(s) => Ok(Some(s)),
-        _ => Err(AppError(
-            StatusCode::BAD_REQUEST,
-            format!("{field} must be a string or null"),
-        )),
-    }
-}
-
-fn optional_positive_i64_field(field: &str, value: Value) -> Result<Option<i64>> {
-    match value {
-        Value::Null => Ok(None),
-        Value::Number(n) => match n.as_i64().filter(|value| *value > 0) {
-            Some(value) => Ok(Some(value)),
-            None => Err(AppError(
-                StatusCode::BAD_REQUEST,
-                format!("{field} must be a positive integer or null"),
-            )),
-        },
-        Value::String(s) => {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                return Ok(None);
-            }
-            trimmed
-                .parse::<i64>()
-                .ok()
-                .filter(|value| *value > 0)
-                .map(Some)
-                .ok_or_else(|| {
-                    AppError(
-                        StatusCode::BAD_REQUEST,
-                        format!("{field} must be a positive integer or null"),
-                    )
-                })
-        }
-        _ => Err(AppError(
-            StatusCode::BAD_REQUEST,
-            format!("{field} must be a positive integer or null"),
-        )),
-    }
-}
-
-fn optional_bool_field(field: &str, value: Value) -> Result<Option<bool>> {
-    match value {
-        Value::Null => Ok(None),
-        Value::Bool(value) => Ok(Some(value)),
-        Value::String(s) => {
-            let trimmed = s.trim().to_ascii_lowercase();
-            if trimmed.is_empty() {
-                return Ok(None);
-            }
-            match trimmed.as_str() {
-                "true" => Ok(Some(true)),
-                "false" => Ok(Some(false)),
-                _ => Err(AppError(
-                    StatusCode::BAD_REQUEST,
-                    format!("{field} must be true, false, or null"),
-                )),
-            }
-        }
-        _ => Err(AppError(
-            StatusCode::BAD_REQUEST,
-            format!("{field} must be true, false, or null"),
-        )),
-    }
-}
-
-fn validate_api_doc_input(
-    app: Option<&str>,
-    title: Option<&str>,
-    kind: Option<&str>,
-    source_format: Option<&str>,
-) -> Result<()> {
-    if app.is_some_and(|v| v.trim().is_empty()) {
-        return Err(AppError(StatusCode::BAD_REQUEST, "app is required".into()));
-    }
-    if title.is_some_and(|v| v.trim().is_empty()) {
-        return Err(AppError(
-            StatusCode::BAD_REQUEST,
-            "title is required".into(),
-        ));
-    }
-    if kind.is_some_and(|v| v.trim().is_empty()) {
-        return Err(AppError(StatusCode::BAD_REQUEST, "kind is required".into()));
-    }
-    if source_format.is_some_and(|v| v.trim().is_empty()) {
-        return Err(AppError(
-            StatusCode::BAD_REQUEST,
-            "source_format is required".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn api_doc_chunks(doc: &db::ApiDoc) -> Vec<ApiDocChunk> {
-    let mut chunks = Vec::new();
-    let mut overview = format!("{} ({})", doc.title, doc.app);
-    if let Some(summary) = doc.summary.as_deref().filter(|s| !s.trim().is_empty()) {
-        overview.push_str("\n\n");
-        overview.push_str(summary.trim());
-    }
-    overview.push_str("\n\nkind: ");
-    overview.push_str(&doc.kind);
-    overview.push_str("\nsource_format: ");
-    overview.push_str(&doc.source_format);
-    if let Some(version) = doc.version.as_deref().filter(|s| !s.trim().is_empty()) {
-        overview.push_str("\nversion: ");
-        overview.push_str(version.trim());
-    }
-    chunks.push(ApiDocChunk {
-        doc_id: doc.id.clone(),
-        project_ident: doc.project_ident.clone(),
-        app: doc.app.clone(),
-        title: doc.title.clone(),
-        chunk_type: "overview".to_string(),
-        labels: doc.labels.clone(),
-        text: overview,
-        updated_at: doc.updated_at,
-    });
-
-    if let Value::Object(map) = &doc.content {
-        for key in [
-            "purpose",
-            "workflows",
-            "endpoints",
-            "auth",
-            "safety",
-            "relationships",
-            "examples",
-            "operations",
-            "schemas",
-        ] {
-            if let Some(value) = map.get(key) {
-                let rendered = match value {
-                    Value::String(s) => s.clone(),
-                    _ => serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
-                };
-                if rendered.trim().is_empty() {
-                    continue;
-                }
-                chunks.push(ApiDocChunk {
-                    doc_id: doc.id.clone(),
-                    project_ident: doc.project_ident.clone(),
-                    app: doc.app.clone(),
-                    title: doc.title.clone(),
-                    chunk_type: key.to_string(),
-                    labels: doc.labels.clone(),
-                    text: rendered,
-                    updated_at: doc.updated_at,
-                });
-            }
-        }
-    } else {
-        chunks.push(ApiDocChunk {
-            doc_id: doc.id.clone(),
-            project_ident: doc.project_ident.clone(),
-            app: doc.app.clone(),
-            title: doc.title.clone(),
-            chunk_type: "content".to_string(),
-            labels: doc.labels.clone(),
-            text: doc.content.to_string(),
-            updated_at: doc.updated_at,
-        });
-    }
-
-    chunks
-}
-
-pub async fn list_api_docs_handler(
-    State(state): State<AppState>,
-    Path(ident): Path<String>,
-    Query(q): Query<ListApiDocsQuery>,
-) -> Result<Json<Vec<db::ApiDocSummary>>> {
-    let db = state.db.clone();
-    let (project_exists, docs) = spawn_blocking(move || {
-        let conn = db.lock().unwrap();
-        if db::get_project(&conn, &ident)?.is_none() {
-            return Ok::<_, anyhow::Error>((false, Vec::new()));
-        }
-        let filters = db::ApiDocFilters {
-            query: q.q.as_deref(),
-            app: q.app.as_deref(),
-            label: q.label.as_deref(),
-            kind: q.kind.as_deref(),
-            scope: q.scope.as_deref(),
-        };
-        let docs = db::list_api_docs(&conn, &ident, &filters)?;
-        Ok((true, docs))
-    })
-    .await??;
-    if !project_exists {
-        return Err(AppError(
-            StatusCode::NOT_FOUND,
-            "project not found".to_string(),
-        ));
-    }
-    Ok(Json(docs))
-}
-
-pub async fn api_doc_hierarchy_handler(
-    State(state): State<AppState>,
-    Path(ident): Path<String>,
-    Query(q): Query<ListApiDocsQuery>,
-) -> Result<Json<Vec<db::ApiDocHierarchyNode>>> {
-    let db = state.db.clone();
-    let (project_exists, nodes) = spawn_blocking(move || {
-        let conn = db.lock().unwrap();
-        if db::get_project(&conn, &ident)?.is_none() {
-            return Ok::<_, anyhow::Error>((false, Vec::new()));
-        }
-        let filters = db::ApiDocFilters {
-            query: q.q.as_deref(),
-            app: q.app.as_deref(),
-            label: q.label.as_deref(),
-            kind: q.kind.as_deref(),
-            scope: q.scope.as_deref(),
-        };
-        let nodes = db::api_doc_hierarchy(&conn, &ident, &filters)?;
-        Ok((true, nodes))
-    })
-    .await??;
-    if !project_exists {
-        return Err(AppError(
-            StatusCode::NOT_FOUND,
-            "project not found".to_string(),
-        ));
-    }
-    Ok(Json(nodes))
-}
-
-pub async fn create_api_doc_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(ident): Path<String>,
-    Json(req): Json<CreateApiDocRequest>,
-) -> Result<Json<db::ApiDoc>> {
-    validate_api_doc_input(
-        Some(req.app.as_str()),
-        Some(req.title.as_str()),
-        Some(req.kind.as_str()),
-        Some(req.source_format.as_str()),
-    )?;
-    if req.content.is_null() {
-        return Err(AppError(
-            StatusCode::BAD_REQUEST,
-            "content is required".into(),
-        ));
-    }
-    let labels = decode_labels_field("labels", Some(req.labels))?;
-    let parent_id = match req.parent_id {
-        Some(value) => Some(optional_string_field("parent_id", value)?),
-        None => None,
-    };
-    let slug = match req.slug {
-        Some(value) => Some(optional_string_field("slug", value)?),
-        None => None,
-    };
-    let global_rank = match req.global_rank {
-        Some(value) => Some(optional_positive_i64_field("global_rank", value)?),
-        None => None,
-    };
-    let author = resolve_identity(req.author, &headers);
-    let db = state.db.clone();
-    let doc = spawn_blocking(move || {
-        let conn = db.lock().unwrap();
-        if db::get_project(&conn, &ident)?.is_none() {
-            return Ok::<_, anyhow::Error>(None);
-        }
-        let doc = db::insert_api_doc(
-            &conn,
-            &ident,
-            &db::ApiDocInsert {
-                app: req.app.trim(),
-                title: req.title.trim(),
-                summary: req
-                    .summary
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty()),
-                kind: req.kind.trim(),
-                source_format: req.source_format.trim(),
-                source_ref: req
-                    .source_ref
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty()),
-                version: req
-                    .version
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty()),
-                labels: &labels,
-                parent_id: parent_id
-                    .as_ref()
-                    .map(|value| value.as_deref().map(str::trim).filter(|s| !s.is_empty())),
-                slug: slug
-                    .as_ref()
-                    .map(|value| value.as_deref().map(str::trim).filter(|s| !s.is_empty())),
-                sort_order: req.sort_order,
-                global_rank,
-                global_descendants: req.global_descendants,
-                content: &req.content,
-                author: &author,
-            },
-        )?;
-        Ok(Some(doc))
-    })
-    .await??;
-    match doc {
-        Some(doc) => Ok(Json(doc)),
-        None => Err(AppError(
-            StatusCode::NOT_FOUND,
-            "project not found".to_string(),
-        )),
-    }
-}
-
-pub async fn get_api_doc_handler(
-    State(state): State<AppState>,
-    Path((ident, id)): Path<(String, String)>,
-) -> Result<Json<db::ApiDoc>> {
-    let db = state.db.clone();
-    let doc = spawn_blocking(move || {
-        let conn = db.lock().unwrap();
-        db::get_api_doc(&conn, &ident, &id)
-    })
-    .await??;
-    match doc {
-        Some(doc) => Ok(Json(doc)),
-        None => Err(AppError(
-            StatusCode::NOT_FOUND,
-            "api doc not found".to_string(),
-        )),
-    }
-}
-
-pub async fn update_api_doc_handler(
-    State(state): State<AppState>,
-    Path((ident, id)): Path<(String, String)>,
-    Json(req): Json<UpdateApiDocRequest>,
-) -> Result<Json<db::ApiDoc>> {
-    validate_api_doc_input(
-        req.app.as_deref(),
-        req.title.as_deref(),
-        req.kind.as_deref(),
-        req.source_format.as_deref(),
-    )?;
-    let labels = match req.labels {
-        Some(labels) => Some(decode_labels_field("labels", Some(labels))?),
-        None => None,
-    };
-    let summary = match req.summary {
-        Some(value) => Some(optional_string_field("summary", value)?),
-        None => None,
-    };
-    let source_ref = match req.source_ref {
-        Some(value) => Some(optional_string_field("source_ref", value)?),
-        None => None,
-    };
-    let version = match req.version {
-        Some(value) => Some(optional_string_field("version", value)?),
-        None => None,
-    };
-    let parent_id = match req.parent_id {
-        Some(value) => Some(optional_string_field("parent_id", value)?),
-        None => None,
-    };
-    let slug = match req.slug {
-        Some(value) => Some(optional_string_field("slug", value)?),
-        None => None,
-    };
-    let global_rank = match req.global_rank {
-        Some(value) => Some(optional_positive_i64_field("global_rank", value)?),
-        None => None,
-    };
-    let global_descendants = match req.global_descendants {
-        Some(value) => optional_bool_field("global_descendants", value)?,
-        None => None,
-    };
-    let db = state.db.clone();
-    let doc = spawn_blocking(move || {
-        let conn = db.lock().unwrap();
-        db::update_api_doc(
-            &conn,
-            &ident,
-            &id,
-            &db::ApiDocUpdate {
-                app: req.app.as_deref().map(str::trim),
-                title: req.title.as_deref().map(str::trim),
-                summary: summary
-                    .as_ref()
-                    .map(|value| value.as_deref().map(str::trim).filter(|s| !s.is_empty())),
-                kind: req.kind.as_deref().map(str::trim),
-                source_format: req.source_format.as_deref().map(str::trim),
-                source_ref: source_ref
-                    .as_ref()
-                    .map(|value| value.as_deref().map(str::trim).filter(|s| !s.is_empty())),
-                version: version
-                    .as_ref()
-                    .map(|value| value.as_deref().map(str::trim).filter(|s| !s.is_empty())),
-                labels: labels.as_deref(),
-                parent_id: parent_id
-                    .as_ref()
-                    .map(|value| value.as_deref().map(str::trim).filter(|s| !s.is_empty())),
-                slug: slug
-                    .as_ref()
-                    .map(|value| value.as_deref().map(str::trim).filter(|s| !s.is_empty())),
-                sort_order: req.sort_order,
-                global_rank,
-                global_descendants,
-                content: req.content.as_ref(),
-            },
-        )
-    })
-    .await??;
-    match doc {
-        Some(doc) => Ok(Json(doc)),
-        None => Err(AppError(
-            StatusCode::NOT_FOUND,
-            "api doc not found".to_string(),
-        )),
-    }
-}
-
-pub async fn delete_api_doc_handler(
-    State(state): State<AppState>,
-    Path((ident, id)): Path<(String, String)>,
-) -> Result<Json<DeleteResponse>> {
-    let db = state.db.clone();
-    let deleted = spawn_blocking(move || {
-        let conn = db.lock().unwrap();
-        db::delete_api_doc(&conn, &ident, &id)
-    })
-    .await??;
-    if deleted {
-        Ok(Json(DeleteResponse { deleted: true }))
-    } else {
-        Err(AppError(
-            StatusCode::NOT_FOUND,
-            "api doc not found".to_string(),
-        ))
-    }
-}
-
-pub async fn list_api_doc_chunks_handler(
-    State(state): State<AppState>,
-    Path(ident): Path<String>,
-    Query(q): Query<ListApiDocsQuery>,
-) -> Result<Response> {
-    let db = state.db.clone();
-    let envelope = q.envelope;
-    let (project_exists, chunk_list) = spawn_blocking(move || {
-        let conn = db.lock().unwrap();
-        if db::get_project(&conn, &ident)?.is_none() {
-            return Ok::<_, anyhow::Error>((
-                false,
-                db::ApiDocChunkList {
-                    chunks: Vec::new(),
-                    chunking_status: db::ApiDocChunkingStatus {
-                        status: "none".to_string(),
-                        current_chunk_count: 0,
-                        stale_chunk_count: 0,
-                        superseded_chunk_count: 0,
-                        failed_addresses: Vec::new(),
-                    },
-                    retrieval_scope: "current".to_string(),
-                    include_history: false,
-                },
-            ));
-        }
-        let filters = db::ApiDocFilters {
-            query: q.q.as_deref(),
-            app: q.app.as_deref(),
-            label: q.label.as_deref(),
-            kind: q.kind.as_deref(),
-            scope: q.scope.as_deref(),
-        };
-        let chunks = db::list_api_doc_chunks(&conn, &ident, &filters, q.include_history)?;
-        Ok::<_, anyhow::Error>((true, chunks))
-    })
-    .await??;
-    if !project_exists {
-        return Err(AppError(
-            StatusCode::NOT_FOUND,
-            "project not found".to_string(),
-        ));
-    }
-    if envelope {
-        Ok(Json(chunk_list).into_response())
-    } else {
-        Ok(Json(chunk_list.chunks).into_response())
-    }
-}
-
 // ── POST /v1/projects ─────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -6181,413 +5608,10 @@ fn empty_table_rows(rows: String, colspan: usize) -> String {
     }
 }
 
-fn documentation_page_href(project_ident: &str, doc_id: &str) -> String {
-    format!(
-        "/projects/{}/documentation/{}",
-        path_segment(project_ident),
-        path_segment(doc_id)
-    )
-}
-
 fn format_epoch_ms(epoch_ms: i64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp_millis(epoch_ms)
         .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
         .unwrap_or_else(|| epoch_ms.to_string())
-}
-
-fn documentation_version_selector(
-    project_ident: &str,
-    versions: &[db::ApiDocVersionSummary],
-    selected_version_id: Option<&str>,
-) -> String {
-    if versions.len() <= 1 {
-        return String::new();
-    }
-
-    let options = versions
-        .iter()
-        .map(|version| {
-            let href = if version.is_latest {
-                documentation_page_href(project_ident, &version.doc_id)
-            } else {
-                format!(
-                    "{}?version_id={}",
-                    documentation_page_href(project_ident, &version.doc_id),
-                    path_segment(&version.artifact_version_id)
-                )
-            };
-            let selected = match selected_version_id {
-                Some(id) => id == version.artifact_version_id,
-                None => version.is_latest,
-            };
-            let selected_attr = if selected { " selected" } else { "" };
-            let timestamp = format_epoch_ms(version.created_at);
-            let label = match (version.is_latest, version.version_label.as_deref()) {
-                (true, Some(label)) if !label.trim().is_empty() => {
-                    format!("latest ({})", label.trim())
-                }
-                (true, _) => "latest".to_string(),
-                (false, Some(label)) if !label.trim().is_empty() => {
-                    format!("{} ({})", timestamp, label.trim())
-                }
-                (false, _) => timestamp,
-            };
-            format!(
-                r#"<option value="{href}"{selected}>{label}</option>"#,
-                href = he(&href),
-                selected = selected_attr,
-                label = he(&label),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    format!(
-        r#"<label class="nd-grid nd-gap-xs nd-mb-md">
-  <span class="nd-text-xs nd-text-muted">Version</span>
-  <select class="nd-input" onchange="if (this.value) window.location.href = this.value">{options}</select>
-</label>"#
-    )
-}
-
-fn documentation_scope_filter_options(selected: &str) -> String {
-    [
-        ("all", "Project + Global"),
-        ("local", "Project docs"),
-        ("global", "Global docs"),
-    ]
-    .iter()
-    .map(|(value, label)| {
-        let selected_attr = if selected == *value { " selected" } else { "" };
-        format!(
-            r#"<option value="{value}"{selected_attr}>{label}</option>"#,
-            value = value,
-            label = label,
-            selected_attr = selected_attr
-        )
-    })
-    .collect::<Vec<_>>()
-    .join("\n")
-}
-
-fn documentation_rank_options(selected: Option<i64>) -> String {
-    let mut options = vec![format!(
-        r#"<option value=""{}>Local only</option>"#,
-        if selected.is_none() { " selected" } else { "" }
-    )];
-    let max_rank = selected.unwrap_or(0).max(9);
-    for rank in 1..=max_rank {
-        let selected_attr = if selected == Some(rank) {
-            " selected"
-        } else {
-            ""
-        };
-        options.push(format!(
-            r#"<option value="{rank}"{selected_attr}>Global {rank}</option>"#,
-            rank = rank,
-            selected_attr = selected_attr
-        ));
-    }
-    options.join("\n")
-}
-
-fn documentation_descendants_options(selected: bool) -> String {
-    let page_selected = if selected { "" } else { " selected" };
-    let descendants_selected = if selected { " selected" } else { "" };
-    format!(
-        r#"<option value="false"{page_selected}>Page only</option>
-<option value="true"{descendants_selected}>Page and descendants</option>"#,
-        page_selected = page_selected,
-        descendants_selected = descendants_selected,
-    )
-}
-
-fn documentation_scope_badges(
-    scope: &str,
-    global_rank: Option<i64>,
-    direct_global_rank: Option<i64>,
-    owner_project: &str,
-) -> String {
-    let mut badges = Vec::new();
-    if let Some(rank) = global_rank {
-        badges.push(format!(
-            r#"<span class="nd-badge nd-badge-sm">Global {}</span>"#,
-            rank
-        ));
-        if direct_global_rank.is_none() {
-            badges.push(r#"<span class="nd-badge nd-badge-sm">inherited</span>"#.to_string());
-        }
-    }
-    if scope == "global" || global_rank.is_some() {
-        badges.push(format!(
-            r#"<span class="nd-badge nd-badge-sm">owner {}</span>"#,
-            he(owner_project)
-        ));
-    }
-    badges.join(" ")
-}
-
-fn documentation_visibility_controls(
-    project_ident: &str,
-    doc_id: &str,
-    owner_project: &str,
-    scope: &str,
-    direct_global_rank: Option<i64>,
-    global_descendants: bool,
-) -> String {
-    if owner_project != project_ident || scope == "global" {
-        return format!(
-            r#"<div class="documentation-readonly nd-text-xs nd-text-muted nd-mt-sm">Read-only global page from <strong>{owner}</strong></div>"#,
-            owner = he(owner_project)
-        );
-    }
-
-    format!(
-        r#"<form class="documentation-visibility-form nd-mt-md"
-      data-nd-action="PATCH /v1/projects/{ident}/api-docs/{doc_id}"
-      data-nd-success="reload">
-  <label>
-    <span class="nd-text-xs nd-text-muted">Global rank</span>
-    <select name="global_rank" aria-label="Global rank">
-      {rank_options}
-    </select>
-  </label>
-  <label>
-    <span class="nd-text-xs nd-text-muted">Apply to</span>
-    <select name="global_descendants" aria-label="Apply visibility to">
-      {descendants_options}
-    </select>
-  </label>
-  <button type="submit" class="nd-btn-primary nd-btn-sm">Save visibility</button>
-</form>"#,
-        ident = he(project_ident),
-        doc_id = he(doc_id),
-        rank_options = documentation_rank_options(direct_global_rank),
-        descendants_options = documentation_descendants_options(global_descendants),
-    )
-}
-
-fn documentation_page_card(project_ident: &str, doc: &db::ApiDocSummary) -> String {
-    let labels = if doc.labels.is_empty() {
-        String::new()
-    } else {
-        doc.labels
-            .iter()
-            .map(|label| format!(r#"<span class="nd-badge nd-badge-sm">{}</span>"#, he(label)))
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    let summary = doc.summary.as_deref().unwrap_or("");
-    let scope = documentation_scope_badges(
-        &doc.scope,
-        doc.global_rank,
-        doc.direct_global_rank,
-        &doc.owner_project,
-    );
-    let visibility = documentation_visibility_controls(
-        project_ident,
-        &doc.id,
-        &doc.owner_project,
-        &doc.scope,
-        doc.direct_global_rank,
-        doc.global_descendants,
-    );
-    format!(
-        r#"<article class="nd-card nd-mb-md">
-  <div class="nd-card-body">
-    <a class="nd-btn-ghost nd-text-left nd-w-full documentation-card-link" href="{href}">
-      <strong>{title}</strong>
-      <div class="nd-text-xs nd-text-muted">{app} / {kind} / {source} {version}</div>
-      <div class="nd-text-xs nd-text-muted">{path} {scope}</div>
-    </a>
-    <p class="nd-text-sm nd-text-muted documentation-summary">{summary}</p>
-    <div>{labels}</div>
-    {visibility}
-  </div>
-</article>"#,
-        href = he(&documentation_page_href(project_ident, &doc.id)),
-        title = he(&doc.title),
-        app = he(&doc.app),
-        kind = he(&doc.kind),
-        source = he(&doc.source_format),
-        version = he(doc.version.as_deref().unwrap_or("")),
-        path = he(&doc.wiki_path),
-        scope = scope,
-        labels = labels,
-        summary = he(summary),
-        visibility = visibility,
-    )
-}
-
-fn documentation_doc_group(
-    project_ident: &str,
-    title: &str,
-    docs: &[&db::ApiDocSummary],
-) -> String {
-    if docs.is_empty() {
-        return String::new();
-    }
-
-    let pages = docs
-        .iter()
-        .map(|doc| documentation_page_card(project_ident, doc))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        r#"<section class="documentation-doc-group nd-mb-lg">
-  <div class="documentation-group-heading nd-mb-sm">
-    <h3>{title}</h3>
-    <span class="nd-badge nd-badge-sm">{count} pages</span>
-  </div>
-  {pages}
-</section>"#,
-        title = he(title),
-        count = docs.len(),
-        pages = pages,
-    )
-}
-
-fn documentation_tree_nav(
-    project_ident: &str,
-    nodes: &[db::ApiDocHierarchyNode],
-    current_doc_id: Option<&str>,
-) -> String {
-    if nodes.is_empty() {
-        return r#"<p class="nd-text-muted nd-text-sm">No documentation pages yet.</p>"#
-            .to_string();
-    }
-
-    format!(
-        r#"<ul class="documentation-tree">{items}</ul>"#,
-        items = documentation_tree_items(project_ident, nodes, current_doc_id)
-    )
-}
-
-fn documentation_tree_items(
-    project_ident: &str,
-    nodes: &[db::ApiDocHierarchyNode],
-    current_doc_id: Option<&str>,
-) -> String {
-    nodes
-        .iter()
-        .map(|node| {
-            let active = if current_doc_id == Some(node.id.as_str()) {
-                " nd-active"
-            } else {
-                ""
-            };
-            let children = if node.children.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    r#"<ul>{}</ul>"#,
-                    documentation_tree_items(project_ident, &node.children, current_doc_id)
-                )
-            };
-            let badges = documentation_scope_badges(
-                &node.scope,
-                node.global_rank,
-                node.direct_global_rank,
-                &node.owner_project,
-            );
-            format!(
-                r#"<li>
-  <a class="nd-btn-ghost nd-text-left nd-w-full documentation-tree-link{active}" href="{href}">
-    <strong>{title}</strong>
-    <div class="nd-text-xs nd-text-muted">{path} {badges}</div>
-  </a>
-  {children}
-</li>"#,
-                active = active,
-                href = he(&documentation_page_href(project_ident, &node.id)),
-                title = he(&node.title),
-                path = he(&node.wiki_path),
-                badges = badges,
-                children = children,
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn documentation_visibility_panel(project_ident: &str, doc: &db::ApiDoc) -> String {
-    let controls = documentation_visibility_controls(
-        project_ident,
-        &doc.id,
-        &doc.owner_project,
-        &doc.scope,
-        doc.direct_global_rank,
-        doc.global_descendants,
-    );
-    format!(
-        r#"<section class="nd-card nd-mt-lg">
-  <div class="nd-card-header"><strong>Visibility</strong></div>
-  <div class="nd-card-body">{controls}</div>
-</section>"#,
-        controls = controls,
-    )
-}
-
-fn documentation_head_extra() -> &'static str {
-    r#"<style>
-.documentation-summary {
-  overflow-wrap: anywhere;
-}
-.documentation-content pre {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-.documentation-card-link,
-.documentation-tree-link {
-  display: block;
-  min-width: 0;
-  white-space: normal;
-  overflow-wrap: anywhere;
-}
-.documentation-tree,
-.documentation-tree ul {
-  list-style: none;
-  margin: 0;
-  padding-left: 0;
-}
-.documentation-tree ul {
-  margin-left: 0.85rem;
-  padding-left: 0.85rem;
-  border-left: 1px solid rgba(120, 120, 120, 0.28);
-}
-.documentation-tree li {
-  margin-bottom: 0.35rem;
-}
-.documentation-group-heading {
-  align-items: center;
-  display: flex;
-  gap: 0.5rem;
-  justify-content: space-between;
-}
-.documentation-group-heading h3 {
-  font-size: 1rem;
-  line-height: 1.25;
-  margin: 0;
-}
-.documentation-visibility-form {
-  align-items: end;
-  display: grid;
-  gap: 0.5rem;
-  grid-template-columns: minmax(8rem, 1fr) minmax(9rem, 1fr) auto;
-}
-.documentation-visibility-form label {
-  display: grid;
-  gap: 0.25rem;
-}
-.documentation-readonly {
-  overflow-wrap: anywhere;
-}
-@media (max-width: 760px) {
-  .documentation-visibility-form {
-    grid-template-columns: 1fr;
-  }
-}
-</style>"#
 }
 
 fn artifact_auth_signal(state: &AppState) -> &'static str {
@@ -6608,71 +5632,6 @@ fn path_segment(s: &str) -> String {
         }
     }
     out
-}
-
-pub async fn api_docs_index_page(State(state): State<AppState>) -> Result<Html<String>> {
-    let db = state.db.clone();
-    let (projects, theme) = spawn_blocking(move || -> anyhow::Result<_> {
-        let conn = db.lock().unwrap();
-        Ok((db::list_project_stats(&conn)?, db::get_theme(&conn)?))
-    })
-    .await??;
-
-    let rows = if projects.is_empty() {
-        r#"<tr><td colspan="3" class="nd-text-muted nd-text-center">No projects registered yet.</td></tr>"#.to_string()
-    } else {
-        projects
-            .iter()
-            .map(|project| {
-                let docs_cell = if project.api_doc_count > 0 {
-                    format!(
-                        r#"<a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/documentation">{count} pages</a>"#,
-                        ident = he(&project.ident),
-                        count = project.api_doc_count,
-                    )
-                } else {
-                    format!(
-                        r#"<a class="nd-btn-ghost nd-btn-sm" href="/projects/{ident}/documentation">Start wiki</a>"#,
-                        ident = he(&project.ident),
-                    )
-                };
-                let repo = project.repo_full_name.as_deref().unwrap_or("");
-                format!(
-                    r#"<tr>
-  <td><strong>{ident}</strong><div class="nd-text-xs nd-text-muted">{repo}</div></td>
-  <td>{docs}</td>
-  <td><a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/documentation">Open wiki</a></td>
-</tr>"#,
-                    ident = he(&project.ident),
-                    repo = he(repo),
-                    docs = docs_cell,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-
-    let content = format!(
-        r#"  <section class="nd-card">
-    <div class="nd-card-header"><strong>Documentation Spaces</strong></div>
-    <div class="nd-card-body nd-p-0">
-      <table class="nd-table nd-table-hover">
-        <thead><tr><th>Project</th><th>Pages</th><th></th></tr></thead>
-        <tbody>{rows}</tbody>
-      </table>
-    </div>
-  </section>"#,
-        rows = rows,
-    );
-
-    let html = format!(
-        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
-        head = control_panel_head("agent-gateway - Documentation", &theme, ""),
-        open = control_panel_open("Documentation", "documentation"),
-        content = content,
-        close = control_panel_close(),
-    );
-    Ok(Html(html))
 }
 
 pub async fn memories_index_page(State(state): State<AppState>) -> Result<Html<String>> {
@@ -6878,7 +5837,6 @@ pub async fn memories_page(
     <a class="nd-btn-secondary nd-btn-sm" href="/memories">All projects</a>
     <a class="nd-btn-secondary nd-btn-sm" href="/">Dashboard</a>
     <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/tasks">Tasks</a>
-    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/documentation">Documentation</a>
   </div>
 
   <section class="nd-card">
@@ -6934,330 +5892,6 @@ pub async fn memories_page(
     Ok(Html(html))
 }
 
-pub async fn api_docs_page(
-    State(state): State<AppState>,
-    Path(ident): Path<String>,
-    Query(query): Query<ListApiDocsQuery>,
-) -> Result<Html<String>> {
-    let db = state.db.clone();
-    let ident_for_lookup = ident.clone();
-    let q = query.q.clone();
-    let app = query.app.clone();
-    let label = query.label.clone();
-    let kind = query.kind.clone();
-    let scope = query.scope.clone();
-    let (project, docs, hierarchy, theme) = spawn_blocking(move || -> anyhow::Result<_> {
-        let conn = db.lock().unwrap();
-        let project = db::get_project(&conn, &ident_for_lookup)?;
-        let filters = db::ApiDocFilters {
-            query: q.as_deref(),
-            app: app.as_deref(),
-            label: label.as_deref(),
-            kind: kind.as_deref(),
-            scope: scope.as_deref(),
-        };
-        let docs = db::list_api_docs(&conn, &ident_for_lookup, &filters)?;
-        let hierarchy = db::api_doc_hierarchy(&conn, &ident_for_lookup, &filters)?;
-        let theme = db::get_theme(&conn)?;
-        Ok((project, docs, hierarchy, theme))
-    })
-    .await??;
-
-    let project = project.ok_or_else(|| {
-        AppError(
-            StatusCode::NOT_FOUND,
-            format!("project '{}' not found", ident),
-        )
-    })?;
-
-    let pages = if docs.is_empty() {
-        r#"<p class="nd-text-muted nd-text-sm">No documentation pages match the current filters.</p>"#.to_string()
-    } else {
-        let mut project_docs = Vec::new();
-        let mut global_docs = Vec::new();
-        for doc in &docs {
-            if doc.scope == "global" {
-                global_docs.push(doc);
-            } else {
-                project_docs.push(doc);
-            }
-        }
-        [
-            documentation_doc_group(&project.ident, "Project docs", &project_docs),
-            documentation_doc_group(&project.ident, "Global docs", &global_docs),
-        ]
-        .join("\n")
-    };
-
-    let ident_attr = he(&project.ident);
-    let nav = documentation_tree_nav(&project.ident, &hierarchy, None);
-    let q_value = he(query.q.as_deref().unwrap_or(""));
-    let app_value = he(query.app.as_deref().unwrap_or(""));
-    let label_value = he(query.label.as_deref().unwrap_or(""));
-    let kind_value = he(query.kind.as_deref().unwrap_or(""));
-    let selected_scope = query.scope.as_deref().unwrap_or("all");
-    let scope_options = documentation_scope_filter_options(selected_scope);
-    let content = format!(
-        r#"  <div class="nd-flex nd-gap-md nd-mb-md">
-    <a class="nd-btn-secondary nd-btn-sm" href="/documentation">All documentation</a>
-    <a class="nd-btn-secondary nd-btn-sm" href="/">Dashboard</a>
-    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/tasks">Tasks</a>
-  </div>
-
-  <section class="nd-card nd-mb-lg">
-    <div class="nd-card-header"><strong>Search Documentation</strong></div>
-    <div class="nd-card-body">
-      <form class="nd-grid nd-gap-sm" method="get" action="/projects/{ident}/documentation">
-        <input class="nd-input" name="q" placeholder="Search pages, chunks, source refs, linked records" value="{q}">
-        <input class="nd-input" name="app" placeholder="App" value="{app}">
-        <input class="nd-input" name="label" placeholder="Label" value="{label}">
-        <input class="nd-input" name="kind" placeholder="Kind" value="{kind}">
-        <select class="nd-input" name="scope" aria-label="Documentation scope">
-          {scope_options}
-        </select>
-        <button class="nd-btn-primary" type="submit">Search</button>
-      </form>
-    </div>
-  </section>
-
-  <div class="nd-row">
-    <aside class="nd-col-3">
-      <section class="nd-card">
-        <div class="nd-card-header"><strong>Wiki Navigation</strong></div>
-        <div class="nd-card-body">{nav}</div>
-      </section>
-    </aside>
-    <section class="nd-col-9">
-      {pages}
-    </section>
-  </div>
-
-  "#,
-        ident = ident_attr,
-        nav = nav,
-        pages = pages,
-        q = q_value,
-        app = app_value,
-        label = label_value,
-        kind = kind_value,
-        scope_options = scope_options,
-    );
-
-    let page_title = format!("Documentation - {}", project.ident);
-    let html = format!(
-        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
-        head = control_panel_head(
-            "agent-gateway - Documentation",
-            &theme,
-            documentation_head_extra()
-        ),
-        open = control_panel_open_project(&page_title, &ident, "documentation"),
-        content = content,
-        close = control_panel_close(),
-    );
-    Ok(Html(html))
-}
-
-pub async fn api_doc_detail_page(
-    State(state): State<AppState>,
-    Path((ident, id)): Path<(String, String)>,
-    Query(query): Query<ApiDocDetailQuery>,
-) -> Result<Html<String>> {
-    let db = state.db.clone();
-    let ident_for_lookup = ident.clone();
-    let id_for_lookup = id.clone();
-    let requested_version_id = query
-        .version_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let (project, doc, hierarchy, versions, selected_version, theme) =
-        spawn_blocking(move || -> anyhow::Result<_> {
-            let conn = db.lock().unwrap();
-            let project = db::get_project(&conn, &ident_for_lookup)?;
-            let doc = db::get_api_doc(&conn, &ident_for_lookup, &id_for_lookup)?;
-            let versions = match doc.as_ref() {
-                Some(doc) => db::list_api_doc_versions(&conn, &ident_for_lookup, &doc.id)?,
-                None => Vec::new(),
-            };
-            let selected_version = match (doc.as_ref(), requested_version_id.as_deref()) {
-                (Some(doc), Some(version_id)) => db::get_artifact_version(
-                    &conn,
-                    &ident_for_lookup,
-                    &doc.artifact_id,
-                    version_id,
-                )?,
-                _ => None,
-            };
-            let hierarchy =
-                db::api_doc_hierarchy(&conn, &ident_for_lookup, &db::ApiDocFilters::default())?;
-            let theme = db::get_theme(&conn)?;
-            Ok((project, doc, hierarchy, versions, selected_version, theme))
-        })
-        .await??;
-
-    let project = project.ok_or_else(|| {
-        AppError(
-            StatusCode::NOT_FOUND,
-            format!("project '{}' not found", ident),
-        )
-    })?;
-    let doc =
-        doc.ok_or_else(|| AppError(StatusCode::NOT_FOUND, format!("api doc '{}' not found", id)))?;
-
-    let selected_version_id = selected_version
-        .as_ref()
-        .map(|version| version.artifact_version_id.as_str());
-    let mut display_doc = doc.clone();
-    if let Some(version) = selected_version.as_ref() {
-        if let Some(body) = version.body.as_deref() {
-            display_doc.content =
-                serde_json::from_str(body).unwrap_or_else(|_| Value::String(body.to_string()));
-        }
-        display_doc.version = version.version_label.clone();
-        display_doc.updated_at = version.created_at;
-        display_doc.artifact_version_id = Some(version.artifact_version_id.clone());
-    }
-
-    let labels = if display_doc.labels.is_empty() {
-        String::new()
-    } else {
-        display_doc
-            .labels
-            .iter()
-            .map(|label| format!(r#"<span class="nd-badge nd-badge-sm">{}</span>"#, he(label)))
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    let chunks = api_doc_chunks(&display_doc)
-        .into_iter()
-        .map(|chunk| {
-            format!(
-                r#"<section class="nd-card nd-mb-md documentation-content">
-  <div class="nd-card-header"><strong>{chunk_type}</strong></div>
-  <div class="nd-card-body"><pre><code>{text}</code></pre></div>
-</section>"#,
-                chunk_type = he(&chunk.chunk_type),
-                text = he(&chunk.text),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let chunks = if chunks.is_empty() {
-        r#"<p class="nd-text-muted nd-text-sm">No indexed sections are available for this page yet.</p>"#.to_string()
-    } else {
-        chunks
-    };
-    let content_json = serde_json::to_string_pretty(&display_doc.content)
-        .unwrap_or_else(|_| display_doc.content.to_string());
-    let source_ref = display_doc.source_ref.as_deref().unwrap_or("");
-    let version = display_doc.version.as_deref().unwrap_or("");
-    let summary = display_doc.summary.as_deref().unwrap_or("");
-    let global_rank = display_doc
-        .global_rank
-        .map(|rank| format!("Global {rank}"))
-        .unwrap_or_else(|| "Local only".to_string());
-    let descendants = if display_doc.global_descendants {
-        "included"
-    } else {
-        "not included"
-    };
-    let ident_attr = he(&project.ident);
-    let nav = documentation_tree_nav(&project.ident, &hierarchy, Some(&doc.id));
-    let version_selector =
-        documentation_version_selector(&project.ident, &versions, selected_version_id);
-    let visibility_panel = documentation_visibility_panel(&project.ident, &display_doc);
-
-    let content = format!(
-        r#"  <div class="nd-flex nd-gap-md nd-mb-md">
-    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/documentation">Back to wiki</a>
-    <a class="nd-btn-secondary nd-btn-sm" href="/documentation">All documentation</a>
-  </div>
-
-  <div class="nd-row">
-    <aside class="nd-col-3">
-      <section class="nd-card">
-        <div class="nd-card-header"><strong>Wiki Navigation</strong></div>
-        <div class="nd-card-body">{nav}</div>
-      </section>
-    </aside>
-
-    <main class="nd-col-6">
-      <section class="nd-card nd-mb-lg">
-        <div class="nd-card-header"><strong>{title}</strong></div>
-        <div class="nd-card-body">
-          <p class="nd-text-muted documentation-summary">{summary}</p>
-          <div class="nd-mt-md">{labels}</div>
-        </div>
-      </section>
-
-      {chunks}
-
-      <section class="nd-card nd-mt-lg documentation-content">
-        <div class="nd-card-header"><strong>Source Record</strong></div>
-        <div class="nd-card-body"><pre><code>{content_json}</code></pre></div>
-      </section>
-    </main>
-
-    <aside class="nd-col-3">
-      <section class="nd-card">
-        <div class="nd-card-header"><strong>Page Info</strong></div>
-        <div class="nd-card-body">
-          <div class="nd-text-xs nd-text-muted">App</div><strong>{app}</strong>
-          <div class="nd-text-xs nd-text-muted nd-mt-sm">Kind</div><strong>{kind}</strong>
-          <div class="nd-text-xs nd-text-muted nd-mt-sm">Source</div><strong>{source}</strong>
-          <div class="nd-text-xs nd-text-muted nd-mt-sm">Owner</div><strong>{owner_project}</strong>
-          <div class="nd-text-xs nd-text-muted nd-mt-sm">Scope</div><strong>{scope}</strong>
-          <div class="nd-text-xs nd-text-muted nd-mt-sm">Wiki path</div><code>{wiki_path}</code>
-          <div class="nd-text-xs nd-text-muted nd-mt-sm">Global rank</div><strong>{global_rank}</strong>
-          <div class="nd-text-xs nd-text-muted nd-mt-sm">Descendants</div><strong>{descendants}</strong>
-          <div class="nd-mt-sm">{version_selector}</div>
-          <div class="nd-text-xs nd-text-muted nd-mt-sm">Current label</div><strong>{version}</strong>
-          <div class="nd-text-xs nd-text-muted nd-mt-sm">Source ref</div><div class="nd-text-sm">{source_ref}</div>
-          <div class="nd-text-xs nd-text-muted nd-mt-sm">Record ID</div><code>{artifact_id}</code>
-        </div>
-      </section>
-      {visibility_panel}
-    </aside>
-  </div>"#,
-        ident = ident_attr,
-        nav = nav,
-        title = he(&display_doc.title),
-        app = he(&display_doc.app),
-        kind = he(&display_doc.kind),
-        source = he(&display_doc.source_format),
-        owner_project = he(&display_doc.owner_project),
-        scope = he(&display_doc.scope),
-        wiki_path = he(&display_doc.wiki_path),
-        global_rank = he(&global_rank),
-        descendants = he(descendants),
-        version_selector = version_selector,
-        version = he(version),
-        summary = he(summary),
-        labels = labels,
-        source_ref = he(source_ref),
-        artifact_id = he(&display_doc.artifact_id),
-        content_json = he(&content_json),
-        chunks = chunks,
-        visibility_panel = visibility_panel,
-    );
-
-    let page_title = format!("{} - {}", doc.app, project.ident);
-    let html = format!(
-        "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
-        head = control_panel_head(
-            "agent-gateway - Documentation",
-            &theme,
-            documentation_head_extra()
-        ),
-        open = control_panel_open_project(&page_title, &ident, "documentation"),
-        content = content,
-        close = control_panel_close(),
-    );
-    Ok(Html(html))
-}
-
 pub async fn artifacts_index_page(State(state): State<AppState>) -> Result<Html<String>> {
     let db = state.db.clone();
     let (theme, projects) = spawn_blocking(move || -> anyhow::Result<_> {
@@ -7267,7 +5901,7 @@ pub async fn artifacts_index_page(State(state): State<AppState>) -> Result<Html<
     .await??;
 
     let rows = if projects.is_empty() {
-        r#"<tr><td colspan="5" class="nd-text-center nd-text-muted">No projects registered.</td></tr>"#
+        r#"<tr><td colspan="4" class="nd-text-center nd-text-muted">No projects registered.</td></tr>"#
             .to_string()
     } else {
         projects
@@ -7276,13 +5910,11 @@ pub async fn artifacts_index_page(State(state): State<AppState>) -> Result<Html<
                 format!(
                     r#"<tr>
   <td><a class="nd-btn-ghost nd-text-left" href="/projects/{ident}/artifacts"><strong>{ident}</strong></a></td>
-  <td>{api_docs}</td>
   <td>{tasks}</td>
   <td>{messages}</td>
   <td><a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/artifacts">Open records</a></td>
 </tr>"#,
                     ident = he(&project.ident),
-                    api_docs = project.api_doc_count,
                     tasks = "—",
                     messages = project.total_messages,
                 )
@@ -7298,7 +5930,7 @@ pub async fn artifacts_index_page(State(state): State<AppState>) -> Result<Html<
     <div class="nd-card-header"><strong>Advanced Record Workspaces</strong></div>
     <div class="nd-card-body nd-p-0">
       <table class="nd-table nd-table-hover">
-        <thead><tr><th>Project</th><th>Documentation</th><th>Tasks</th><th>Messages</th><th></th></tr></thead>
+        <thead><tr><th>Project</th><th>Tasks</th><th>Messages</th><th></th></tr></thead>
         <tbody>{rows}</tbody>
       </table>
     </div>
@@ -7329,7 +5961,7 @@ pub async fn artifact_workspace_page(
     let label = query.label.clone();
     let actor = query.actor.clone();
     let q = query.q.clone();
-    let (project, artifacts, docs, theme) = spawn_blocking(move || -> anyhow::Result<_> {
+    let (project, artifacts, theme) = spawn_blocking(move || -> anyhow::Result<_> {
         let conn = db.lock().unwrap();
         let project = db::get_project(&conn, &ident_for_lookup)?;
         let artifacts = db::list_artifacts(
@@ -7344,19 +5976,8 @@ pub async fn artifact_workspace_page(
                 query: q.as_deref(),
             },
         )?;
-        let docs = db::list_api_docs(
-            &conn,
-            &ident_for_lookup,
-            &db::ApiDocFilters {
-                query: q.as_deref(),
-                app: None,
-                label: label.as_deref(),
-                kind: None,
-                scope: None,
-            },
-        )?;
         let theme = db::get_theme(&conn)?;
-        Ok((project, artifacts, docs, theme))
+        Ok((project, artifacts, theme))
     })
     .await??;
 
@@ -7406,30 +6027,9 @@ pub async fn artifact_workspace_page(
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let docs_rows = if docs.is_empty() {
-        r#"<tr><td colspan="5" class="nd-text-center nd-text-muted">No documentation contexts match these filters.</td></tr>"#.to_string()
-    } else {
-        docs.iter()
-            .map(|doc| {
-                format!(
-                    r#"<tr><td><a href="/projects/{ident}/documentation/{id}">{app}</a></td><td>{kind}</td><td>{subkind}</td><td>{version}</td><td>{summary}</td></tr>"#,
-                    ident = ident_attr,
-                    id = he(&doc.id),
-                    app = he(&doc.app),
-                    kind = he(&doc.kind),
-                    subkind = he(&doc.subkind),
-                    version = he(doc.version.as_deref().unwrap_or("")),
-                    summary = he(doc.summary.as_deref().unwrap_or("")),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
     let filter_value = |value: &Option<String>| he(value.as_deref().unwrap_or(""));
     let content = format!(
         r#"  <div class="nd-flex nd-gap-md nd-mb-md">
-    <a class="nd-btn-secondary nd-btn-sm" href="/documentation">Documentation</a>
-    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/documentation">Project wiki</a>
     <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/tasks">Tasks</a>
   </div>
 
@@ -7439,8 +6039,8 @@ pub async fn artifact_workspace_page(
     <div class="nd-card-header"><strong>Record filters</strong></div>
     <div class="nd-card-body">
       <form class="nd-grid nd-gap-sm" method="get" action="/projects/{ident}/artifacts">
-        <input class="nd-input" name="q" placeholder="Search records, bodies, contributions, links, docs" value="{q}">
-        <input class="nd-input" name="kind" placeholder="kind: spec, design_review, documentation" value="{kind}">
+        <input class="nd-input" name="q" placeholder="Search records, bodies, contributions, links" value="{q}">
+        <input class="nd-input" name="kind" placeholder="kind: spec, design_review" value="{kind}">
         <input class="nd-input" name="status" placeholder="lifecycle status" value="{status}">
         <input class="nd-input" name="label" placeholder="label" value="{label}">
         <input class="nd-input" name="actor" placeholder="actor id" value="{actor}">
@@ -7459,15 +6059,7 @@ pub async fn artifact_workspace_page(
     </div>
   </section>
 
-  <section class="nd-card nd-mt-lg">
-    <div class="nd-card-header"><strong>Documentation Pages</strong></div>
-    <div class="nd-card-body nd-p-0">
-      <table class="nd-table nd-table-hover">
-        <thead><tr><th>App</th><th>Legacy kind</th><th>Subkind</th><th>Version</th><th>Summary</th></tr></thead>
-        <tbody>{docs_rows}</tbody>
-      </table>
-    </div>
-  </section>"#,
+"#,
         ident = ident_attr,
         q = filter_value(&query.q),
         kind = filter_value(&query.kind),
@@ -7476,7 +6068,6 @@ pub async fn artifact_workspace_page(
         actor = filter_value(&query.actor),
         auth_signal = he(artifact_auth_signal(&state)),
         artifacts_rows = artifacts_rows,
-        docs_rows = docs_rows,
     );
 
     let page_title = format!("Advanced records - {}", project.ident);
@@ -7493,91 +6084,68 @@ pub async fn artifact_workspace_page(
 pub async fn artifact_detail_page(
     State(state): State<AppState>,
     Path((ident, artifact_id)): Path<(String, String)>,
-    Query(query): Query<ArtifactWorkspaceQuery>,
+    Query(_query): Query<ArtifactWorkspaceQuery>,
 ) -> Result<Html<String>> {
     let db = state.db.clone();
     let ident_for_lookup = ident.clone();
     let artifact_for_lookup = artifact_id.clone();
-    let chunk_q = query.chunk_q.clone();
-    let include_history = query.include_history.unwrap_or(false);
-    let (
-        project,
-        detail,
-        versions,
-        contributions,
-        comments,
-        links,
-        chunks,
-        review_contributions,
-        theme,
-    ) = spawn_blocking(move || -> anyhow::Result<_> {
-        let conn = db.lock().unwrap();
-        let project = db::get_project(&conn, &ident_for_lookup)?;
-        let detail = db::get_artifact(&conn, &ident_for_lookup, &artifact_for_lookup)?;
-        let versions = db::list_artifact_versions(&conn, &ident_for_lookup, &artifact_for_lookup)?;
-        let contributions =
-            db::list_artifact_contributions(&conn, &ident_for_lookup, &artifact_for_lookup)?;
-        let comments = db::list_artifact_comments(&conn, &ident_for_lookup, &artifact_for_lookup)?;
-        let mut links = db::list_artifact_links(
-            &conn,
-            &ident_for_lookup,
-            &db::ArtifactLinkFilters::default(),
-        )?;
-        links.retain(|link| {
-            link.source_id == artifact_for_lookup
-                || link.target_id == artifact_for_lookup
-                || detail.as_ref().is_some_and(|d| {
-                    let current = d.artifact.current_version_id.as_deref();
-                    let accepted = d.artifact.accepted_version_id.as_deref();
-                    [
-                        link.source_version_id.as_deref(),
-                        link.target_version_id.as_deref(),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .any(|id| Some(id) == current || Some(id) == accepted)
-                })
-        });
-        let chunks = db::list_artifact_chunks(
-            &conn,
-            &ident_for_lookup,
-            &artifact_for_lookup,
-            &db::ArtifactChunkFilters {
-                artifact_version_id: None,
-                app: None,
-                label: None,
-                kind: None,
-                include_superseded: include_history,
-                query: chunk_q.as_deref(),
-            },
-        )?;
-        let review_contributions = if detail
-            .as_ref()
-            .is_some_and(|d| d.artifact.kind == "design_review")
-        {
-            db::list_design_review_contributions(
+    let (project, detail, versions, contributions, comments, links, review_contributions, theme) =
+        spawn_blocking(move || -> anyhow::Result<_> {
+            let conn = db.lock().unwrap();
+            let project = db::get_project(&conn, &ident_for_lookup)?;
+            let detail = db::get_artifact(&conn, &ident_for_lookup, &artifact_for_lookup)?;
+            let versions =
+                db::list_artifact_versions(&conn, &ident_for_lookup, &artifact_for_lookup)?;
+            let contributions =
+                db::list_artifact_contributions(&conn, &ident_for_lookup, &artifact_for_lookup)?;
+            let comments =
+                db::list_artifact_comments(&conn, &ident_for_lookup, &artifact_for_lookup)?;
+            let mut links = db::list_artifact_links(
                 &conn,
                 &ident_for_lookup,
-                &artifact_for_lookup,
-                &db::DesignReviewContributionFilters::default(),
-            )?
-        } else {
-            Vec::new()
-        };
-        let theme = db::get_theme(&conn)?;
-        Ok((
-            project,
-            detail,
-            versions,
-            contributions,
-            comments,
-            links,
-            chunks,
-            review_contributions,
-            theme,
-        ))
-    })
-    .await??;
+                &db::ArtifactLinkFilters::default(),
+            )?;
+            links.retain(|link| {
+                link.source_id == artifact_for_lookup
+                    || link.target_id == artifact_for_lookup
+                    || detail.as_ref().is_some_and(|d| {
+                        let current = d.artifact.current_version_id.as_deref();
+                        let accepted = d.artifact.accepted_version_id.as_deref();
+                        [
+                            link.source_version_id.as_deref(),
+                            link.target_version_id.as_deref(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .any(|id| Some(id) == current || Some(id) == accepted)
+                    })
+            });
+            let review_contributions = if detail
+                .as_ref()
+                .is_some_and(|d| d.artifact.kind == "design_review")
+            {
+                db::list_design_review_contributions(
+                    &conn,
+                    &ident_for_lookup,
+                    &artifact_for_lookup,
+                    &db::DesignReviewContributionFilters::default(),
+                )?
+            } else {
+                Vec::new()
+            };
+            let theme = db::get_theme(&conn)?;
+            Ok((
+                project,
+                detail,
+                versions,
+                contributions,
+                comments,
+                links,
+                review_contributions,
+                theme,
+            ))
+        })
+        .await??;
 
     let project = project.ok_or_else(|| {
         AppError(
@@ -7593,7 +6161,6 @@ pub async fn artifact_detail_page(
     })?;
     let artifact = &detail.artifact;
     let ident_attr = he(&project.ident);
-    let artifact_attr = he(&artifact.artifact_id);
     let version_rows = versions
         .iter()
         .map(|version| {
@@ -7646,26 +6213,6 @@ pub async fn artifact_detail_page(
                 target = he(&format!("{}:{}", link.target_kind, link.target_id)),
                 source_version = he(link.source_version_id.as_deref().unwrap_or("")),
                 target_version = he(link.target_version_id.as_deref().unwrap_or("")),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let chunk_rows = chunks
-        .iter()
-        .map(|chunk| {
-            let status = chunk
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("status").or_else(|| m.get("chunking_status")))
-                .and_then(Value::as_str)
-                .unwrap_or("ok");
-            format!(
-                r#"<tr><td><code>{address}</code></td><td>{kind}</td><td>{label}</td><td>{status}</td><td>{text}</td></tr>"#,
-                address = he(&chunk.child_address),
-                kind = he(chunk.kind.as_deref().unwrap_or("")),
-                label = he(chunk.label.as_deref().unwrap_or("")),
-                status = he(status),
-                text = he(&truncate_text(&chunk.text, 180)),
             )
         })
         .collect::<Vec<_>>()
@@ -7743,37 +6290,9 @@ pub async fn artifact_detail_page(
     } else {
         String::new()
     };
-    let docs_section = if artifact.kind == "documentation" {
-        format!(
-            r#"<section class="nd-card nd-mt-lg">
-  <div class="nd-card-header"><strong>Documentation chunks</strong></div>
-  <div class="nd-card-body">
-    <form class="nd-grid nd-gap-sm" method="get" action="/projects/{ident}/artifacts/{artifact_id}">
-      <input class="nd-input" name="chunk_q" placeholder="Search chunks" value="{chunk_q}">
-      <label><input type="checkbox" name="include_history" value="true" {checked}> Include superseded/history chunks</label>
-      <button class="nd-btn-secondary" type="submit">Search chunks</button>
-    </form>
-  </div>
-  <div class="nd-card-body nd-p-0"><table class="nd-table nd-table-hover"><thead><tr><th>Address</th><th>Kind</th><th>Label</th><th>Status</th><th>Text</th></tr></thead><tbody>{chunk_rows}</tbody></table></div>
-</section>"#,
-            ident = ident_attr,
-            artifact_id = artifact_attr,
-            chunk_q = he(query.chunk_q.as_deref().unwrap_or("")),
-            checked = if include_history { "checked" } else { "" },
-            chunk_rows = if chunk_rows.is_empty() {
-                r#"<tr><td colspan="5" class="nd-text-center nd-text-muted">No chunks match.</td></tr>"#.to_string()
-            } else {
-                chunk_rows.clone()
-            },
-        )
-    } else {
-        String::new()
-    };
-
     let content = format!(
         r#"  <div class="nd-flex nd-gap-md nd-mb-md">
     <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/artifacts">Back to records</a>
-    <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/documentation">Documentation</a>
     <a class="nd-btn-secondary nd-btn-sm" href="/projects/{ident}/tasks">Tasks</a>
   </div>
 
@@ -7799,7 +6318,6 @@ pub async fn artifact_detail_page(
   {diff_section}
   {spec_section}
   {review_section}
-  {docs_section}
 
   <section class="nd-card nd-mt-lg" id="versions"><div class="nd-card-header"><strong>Version history</strong></div><div class="nd-card-body nd-p-0"><table class="nd-table nd-table-hover"><thead><tr><th>Version</th><th>Label</th><th>State</th><th>Format</th><th>Parent</th><th>Body bytes</th></tr></thead><tbody>{version_rows}</tbody></table></div></section>
   <section class="nd-card nd-mt-lg"><div class="nd-card-header"><strong>Contributions</strong></div><div class="nd-card-body nd-p-0"><table class="nd-table nd-table-hover"><thead><tr><th>Kind</th><th>Phase</th><th>Role</th><th>Target</th><th>Body</th></tr></thead><tbody>{contribution_rows}</tbody></table></div></section>
@@ -7823,7 +6341,6 @@ pub async fn artifact_detail_page(
         diff_section = diff_section,
         spec_section = spec_section,
         review_section = review_section,
-        docs_section = docs_section,
         version_rows = empty_table_rows(version_rows, 6),
         contribution_rows = empty_table_rows(contribution_rows, 5),
         comment_rows = empty_table_rows(comment_rows, 4),
@@ -11525,15 +10042,12 @@ mod tests {
     }
 
     #[test]
-    fn control_panel_nav_maps_documentation_and_memories_to_projects() {
-        for active in ["documentation", "api-docs", "memories"] {
-            let html = control_panel_open("Page", active);
-            assert!(
-                html.contains(r#"<li><a href="/projects" class="nd-active">Projects</a></li>"#),
-                "{active}"
-            );
-            assert!(!html.contains(r#"href="/documentation""#));
-        }
+    fn control_panel_nav_maps_memories_to_projects() {
+        let html = control_panel_open("Page", "memories");
+        assert!(html.contains(r#"<li><a href="/projects" class="nd-active">Projects</a></li>"#));
+        let project = control_panel_open_project("Overview", "demo", "overview");
+        assert!(!project.contains("/documentation"));
+        assert!(!project.contains("/api-docs"));
     }
 
     #[test]
@@ -11631,44 +10145,6 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn insert_ui_doc(
-        conn: &rusqlite::Connection,
-        project_ident: &str,
-        title: &str,
-        slug: &str,
-        parent_id: Option<&str>,
-        sort_order: i64,
-        global_rank: Option<i64>,
-        global_descendants: bool,
-    ) -> db::ApiDoc {
-        let labels = vec!["docs".to_string()];
-        let content = serde_json::json!({
-            "purpose": format!("{title} documentation"),
-        });
-        db::insert_api_doc(
-            conn,
-            project_ident,
-            &db::ApiDocInsert {
-                app: "docs",
-                title,
-                summary: Some(title),
-                kind: "agent_context",
-                source_format: "agent_context",
-                source_ref: None,
-                version: None,
-                labels: &labels,
-                parent_id: parent_id.map(Some),
-                slug: Some(Some(slug)),
-                sort_order: Some(sort_order),
-                global_rank: global_rank.map(Some),
-                global_descendants: Some(global_descendants),
-                content: &content,
-                author: "tester",
-            },
-        )
-        .unwrap()
-    }
-
     async fn create_test_artifact(state: &AppState, key: &str) -> String {
         let response = create_artifact_handler(
             State(state.clone()),
@@ -11820,14 +10296,12 @@ mod tests {
                 label: Some("test".to_string()),
                 actor: None,
                 q: Some("Test spec".to_string()),
-                chunk_q: None,
-                include_history: None,
             }),
         )
         .await
         .unwrap();
         assert!(list.0.contains("Record filters"));
-        assert!(list.0.contains("Documentation Pages"));
+        assert!(!list.0.contains("Documentation Pages"));
         assert!(list.0.contains(&artifact_id));
 
         let detail = artifact_detail_page(
@@ -11842,44 +10316,6 @@ mod tests {
         assert!(detail.0.contains("Comments"));
         assert!(detail.0.contains("Links"));
         assert!(detail.0.contains("Test spec"));
-    }
-
-    #[tokio::test]
-    async fn artifact_workspace_page_survives_lazy_oversized_api_doc_chunking() {
-        let state = test_state();
-        {
-            let conn = state.db.lock().unwrap();
-            let content = serde_json::json!({
-                "workflows": format!("{}needle-tail", "x".repeat(9 * 1024)),
-            });
-            conn.execute(
-                "INSERT INTO api_docs (
-                     id, project_ident, app, title, summary, kind, source_format,
-                     source_ref, version, labels, content_json, author, created_at,
-                     updated_at
-                 )
-                 VALUES (?1, 'demo', 'gateway-smoke', 'Gateway smoke context',
-                         NULL, 'agent_context', 'agent_context', '.agent/api/smoke.yaml',
-                         '2026-05-14', ?2, ?3, 'tester', ?4, ?4)",
-                rusqlite::params![
-                    "legacy-smoke-doc",
-                    serde_json::to_string(&vec!["smoke"]).unwrap(),
-                    serde_json::to_string(&content).unwrap(),
-                    db::now_ms(),
-                ],
-            )
-            .unwrap();
-        }
-
-        let page = artifact_workspace_page(
-            State(state),
-            Path("demo".to_string()),
-            Query(ArtifactWorkspaceQuery::default()),
-        )
-        .await
-        .unwrap();
-        assert!(page.0.contains("Record filters"));
-        assert!(page.0.contains("gateway-smoke"));
     }
 
     #[tokio::test]
@@ -12952,316 +11388,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_doc_chunks_route_keeps_legacy_array_and_opt_in_envelope() {
-        let state = test_state();
-        let created = create_api_doc_handler(
-            State(state.clone()),
-            HeaderMap::new(),
-            Path("demo".to_string()),
-            Json(CreateApiDocRequest {
-                app: "billing-api".to_string(),
-                title: "Billing API agent context".to_string(),
-                summary: Some("System of record for invoices.".to_string()),
-                kind: "agent_context".to_string(),
-                source_format: "agent_context".to_string(),
-                source_ref: Some(".agent/api/billing.yaml".to_string()),
-                version: Some("2026-05-13".to_string()),
-                labels: serde_json::json!(["billing"]),
-                parent_id: None,
-                slug: None,
-                sort_order: None,
-                global_rank: None,
-                global_descendants: None,
-                content: serde_json::json!({
-                    "purpose": "Owns invoice state.",
-                    "endpoints": [{
-                        "method": "POST",
-                        "path": "/v1/invoices",
-                        "intent": "Create draft invoice"
-                    }]
-                }),
-                author: Some("tester".to_string()),
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(created.0.kind, "agent_context");
-        assert_eq!(created.0.subkind, "api_context");
-
-        let legacy = list_api_doc_chunks_handler(
-            State(state.clone()),
-            Path("demo".to_string()),
-            Query(ListApiDocsQuery {
-                q: Some("draft invoice".to_string()),
-                app: None,
-                label: Some("billing".to_string()),
-                kind: Some("agent_context".to_string()),
-                scope: None,
-                include_history: false,
-                envelope: false,
-            }),
-        )
-        .await
-        .unwrap();
-        let (status, value) = response_json(legacy).await;
-        assert_eq!(status, StatusCode::OK);
-        let chunks = value.as_array().unwrap();
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0]["doc_id"], created.0.id);
-        assert_eq!(chunks[0]["chunk_type"], "endpoints");
-        assert_eq!(chunks[0]["freshness"], "current");
-        assert_eq!(chunks[0]["retrieval_scope"], "current");
-        assert_eq!(chunks[0]["scope"], "local");
-        assert_eq!(chunks[0]["owner_project"], "demo");
-        assert_eq!(chunks[0]["wiki_path"], "/billing-api-agent-context");
-        assert_eq!(chunks[0]["artifact_id"], created.0.artifact_id);
-        assert_eq!(
-            chunks[0]["artifact_version_id"],
-            created.0.artifact_version_id.clone().unwrap()
-        );
-
-        let hierarchy = api_doc_hierarchy_handler(
-            State(state.clone()),
-            Path("demo".to_string()),
-            Query(ListApiDocsQuery {
-                q: None,
-                app: None,
-                label: None,
-                kind: None,
-                scope: None,
-                include_history: false,
-                envelope: false,
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(hierarchy.0.len(), 1);
-        assert_eq!(hierarchy.0[0].id, created.0.id);
-        assert_eq!(hierarchy.0[0].scope, "local");
-        assert_eq!(hierarchy.0[0].wiki_path, "/billing-api-agent-context");
-
-        let envelope = list_api_doc_chunks_handler(
-            State(state),
-            Path("demo".to_string()),
-            Query(ListApiDocsQuery {
-                q: Some("draft invoice".to_string()),
-                app: None,
-                label: Some("billing".to_string()),
-                kind: Some("agent_context".to_string()),
-                scope: None,
-                include_history: false,
-                envelope: true,
-            }),
-        )
-        .await
-        .unwrap();
-        let (status, value) = response_json(envelope).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(value["retrieval_scope"], "current");
-        assert_eq!(value["include_history"], false);
-        assert_eq!(value["chunking_status"]["status"], "current");
-        assert_eq!(value["chunking_status"]["current_chunk_count"], 1);
-        assert_eq!(value["chunks"].as_array().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn api_docs_ui_renders_hierarchy_groups_and_visibility_controls() {
-        let state = test_state();
-        let (local_root_id, global_id) = {
-            let conn = state.db.lock().unwrap();
-            db::insert_project(
-                &conn,
-                &db::Project {
-                    ident: "platform".to_string(),
-                    channel_name: "discord".to_string(),
-                    room_id: "room-platform".to_string(),
-                    last_msg_id: None,
-                    created_at: db::now_ms(),
-                    repo_provider: None,
-                    repo_namespace: None,
-                    repo_name: None,
-                    repo_full_name: None,
-                    kind: db::PROJECT_KIND_REPO.to_string(),
-                    archived_at: None,
-                    canonical_remote: None,
-                },
-            )
-            .unwrap();
-
-            let local_root = insert_ui_doc(
-                &conn,
-                "demo",
-                "Local Root",
-                "local-root",
-                None,
-                0,
-                None,
-                true,
-            );
-            insert_ui_doc(
-                &conn,
-                "demo",
-                "Local Child",
-                "child",
-                Some(local_root.id.as_str()),
-                1,
-                None,
-                false,
-            );
-            let global = insert_ui_doc(
-                &conn,
-                "platform",
-                "Platform Guide",
-                "platform-guide",
-                None,
-                0,
-                Some(1),
-                false,
-            );
-            (local_root.id, global.id)
-        };
-
-        let html = api_docs_page(
-            State(state.clone()),
-            Path("demo".to_string()),
-            Query(ListApiDocsQuery {
-                q: None,
-                app: None,
-                label: None,
-                kind: None,
-                scope: Some("all".to_string()),
-                include_history: false,
-                envelope: false,
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-
-        assert!(html.contains(r#"class="documentation-tree""#));
-        assert!(html.contains("Project docs"));
-        assert!(html.contains("Global docs"));
-        assert!(html.contains("/local-root/child"));
-        assert!(html.contains(r#"name="scope""#));
-        assert!(html.contains("Project + Global"));
-        assert!(html.contains(&format!(
-            r#"data-nd-action="PATCH /v1/projects/demo/api-docs/{local_root_id}""#
-        )));
-        assert!(html.contains("Global 1"));
-        assert!(html.contains("owner platform"));
-        assert!(html.contains("Read-only global page from <strong>platform</strong>"));
-        assert!(html.contains("Page only"));
-        assert!(html.contains("Page and descendants"));
-        assert!(!html.contains(&format!(
-            r#"data-nd-action="PATCH /v1/projects/demo/api-docs/{global_id}""#
-        )));
-
-        let detail_html = api_doc_detail_page(
-            State(state),
-            Path(("demo".to_string(), global_id.clone())),
-            Query(ApiDocDetailQuery { version_id: None }),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert!(detail_html.contains("Read-only global page from <strong>platform</strong>"));
-        assert!(!detail_html.contains(&format!(
-            r#"data-nd-action="PATCH /v1/projects/demo/api-docs/{global_id}""#
-        )));
-    }
-
-    #[tokio::test]
-    async fn update_api_doc_accepts_ndesign_visibility_form_values() {
-        let state = test_state();
-        let created = create_api_doc_handler(
-            State(state.clone()),
-            HeaderMap::new(),
-            Path("demo".to_string()),
-            Json(CreateApiDocRequest {
-                app: "docs".to_string(),
-                title: "Visibility Controls".to_string(),
-                summary: Some("Visibility control test".to_string()),
-                kind: "agent_context".to_string(),
-                source_format: "agent_context".to_string(),
-                source_ref: None,
-                version: None,
-                labels: serde_json::json!(["docs"]),
-                parent_id: None,
-                slug: Some(serde_json::json!("visibility-controls")),
-                sort_order: Some(0),
-                global_rank: None,
-                global_descendants: None,
-                content: serde_json::json!({"purpose": "visibility controls"}),
-                author: Some("tester".to_string()),
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-
-        let updated = update_api_doc_handler(
-            State(state.clone()),
-            Path(("demo".to_string(), created.id.clone())),
-            Json(UpdateApiDocRequest {
-                app: None,
-                title: None,
-                summary: None,
-                kind: None,
-                source_format: None,
-                source_ref: None,
-                version: None,
-                labels: None,
-                parent_id: None,
-                slug: None,
-                sort_order: None,
-                global_rank: Some(Value::String("2".to_string())),
-                global_descendants: Some(Value::String("true".to_string())),
-                content: None,
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert_eq!(updated.direct_global_rank, Some(2));
-        assert_eq!(updated.global_rank, Some(2));
-        assert!(updated.global_descendants);
-
-        let cleared = update_api_doc_handler(
-            State(state),
-            Path(("demo".to_string(), created.id)),
-            Json(UpdateApiDocRequest {
-                app: None,
-                title: None,
-                summary: None,
-                kind: None,
-                source_format: None,
-                source_ref: None,
-                version: None,
-                labels: None,
-                parent_id: None,
-                slug: None,
-                sort_order: None,
-                global_rank: Some(Value::String(String::new())),
-                global_descendants: Some(Value::String("false".to_string())),
-                content: None,
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert_eq!(cleared.direct_global_rank, None);
-        assert_eq!(cleared.global_rank, None);
-        assert!(!cleared.global_descendants);
-    }
-
-    /// Regression for T030: after consolidating artifact mutation route
-    /// scaffolding into `begin_artifact_mutation` / `finalize_mutation`,
-    /// replayed mutations across the four create-style handlers must still
-    /// return `200 OK`, surface `provenance.replay == true`, echo the
-    /// originally-generated resource id, and not double-count metric writes.
-    /// The original (first) responses must continue to return `201 CREATED`
-    /// with `provenance.replay == false`.
-    #[tokio::test]
     async fn artifact_mutation_helpers_preserve_replay_envelope_after_consolidation() {
         let state = test_state();
         let artifact_id = create_test_artifact(&state, "t030-artifact").await;
@@ -13494,7 +11620,7 @@ mod tests {
             Path(("demo".to_string(), artifact_id.clone())),
             mutation_headers("run-cancelled"),
             Json(StartWorkflowRunRequest {
-                workflow_kind: "doc_publish".to_string(),
+                workflow_kind: "spec_task_generation".to_string(),
                 phase: None,
                 round_id: None,
                 participant_actor_ids: None,

@@ -26,14 +26,13 @@ Required `agent-tools` client work, owned by the agent-tools project:
 
 | Area | Target command | Gateway route family | Validation |
 |---|---|---|---|
-| Generic artifacts | `agent-tools artifacts list [--kind --status --label --actor --query]` | `GET /v1/projects/:ident/artifacts` | List seeded design-review, spec, and docs artifacts by filters. |
+| Generic artifacts | `agent-tools artifacts list [--kind --status --label --actor --query]` | `GET /v1/projects/:ident/artifacts` | List seeded design-review and spec artifacts by filters. |
 | Generic artifacts | `agent-tools artifacts get <artifact_id>` | `GET /v1/projects/:ident/artifacts/:artifact_id` | Shows current/accepted versions, comments, links, and chunking status. |
 | Versions | `agent-tools artifacts versions <artifact_id>` | `GET /versions` | Shows immutable version IDs and state. |
 | Diffs | `agent-tools artifacts diff <artifact_id> <from> <to>` | `GET /versions/:version_id/diff?base_version_id=...` | Diff output matches route response. |
 | Comments | `agent-tools artifacts comments <artifact_id>` and `comment` | `/comments` | Create/list/resolve/reopen round-trips with actor provenance. |
 | Reviews | `agent-tools reviews create/start/contribute/synthesize/state` | `/design-reviews` | Two-pass review stores pass 1, pass 2, synthesis, read-set, and decision state by artifact ID. |
 | Specs | `agent-tools specs import/version/accept/manifest/generate-tasks/link-task` | `/specs` | Accepted spec artifact generates idempotent gateway tasks and links existing tasks. |
-| Docs | `agent-tools docs export` | docs compatibility + artifact routes | Export accepted docs artifact to source-adjacent files using a manifest and propose-by-default conflict policy. |
 
 Delegated tracking:
 
@@ -131,8 +130,6 @@ Scratch-file deprecation is blocked until all of the following are true:
   artifact and delegated exact task IDs.
 - Dual-read fallback has been tested for legacy task specifications and local
   scratch directories.
-- `agent-tools docs export` has dry-run or materialized source-adjacent docs
-  with an export manifest and propose-by-default conflict handling.
 - T014 rollout validation has exercised restore checks, idempotent task links,
   rollback instructions, metrics, and authorization mode signals.
 

@@ -1,5 +1,9 @@
 # Workflow Mutation Contract (v1)
 
+> Gateway-backed API and agent documentation are retired. Historical references
+> to documentation artifacts, publication, retrieval, export, or migration are
+> obsolete. The supported artifact workflows are specs and design reviews.
+
 **Status:** Draft contract (Phase 1, gateway-features_spec T003)
 **Audience:** gateway backend implementers (T004 ops/rollback, T005 schema,
 T006 repository, T007 generic HTTP API, T009 spec workflow, T010 design-review

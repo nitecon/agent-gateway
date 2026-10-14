@@ -9,7 +9,7 @@ use rusqlite::{
 };
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fmt,
     sync::{Arc, LockResult, Mutex, MutexGuard},
 };
@@ -842,7 +842,6 @@ fn validate_project_casing(conn: &Connection) -> Result<()> {
         ("tasks", "delegated_to_project_ident"),
         ("task_delegations", "source_project_ident"),
         ("task_delegations", "target_project_ident"),
-        ("api_docs", "project_ident"),
         ("gateway_memories", "project_ident"),
         ("gateway_memory_client_links", "project_ident"),
         ("artifacts", "project_ident"),
@@ -1248,47 +1247,6 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         [],
     )?;
 
-    // ── Agent API docs: project-scoped, agent-native API context ─────────────
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS api_docs (
-            id             TEXT PRIMARY KEY,
-            project_ident  TEXT NOT NULL REFERENCES projects(ident) ON DELETE CASCADE,
-            app            TEXT NOT NULL,
-            title          TEXT NOT NULL,
-            summary        TEXT,
-            kind           TEXT NOT NULL DEFAULT 'agent_context',
-            source_format  TEXT NOT NULL DEFAULT 'agent_context',
-            source_ref     TEXT,
-            version        TEXT,
-            labels         TEXT,
-            content_json   TEXT NOT NULL,
-            author         TEXT NOT NULL,
-            created_at     INTEGER NOT NULL,
-            updated_at     INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_api_docs_project_app
-            ON api_docs(project_ident, app, updated_at DESC);
-         CREATE INDEX IF NOT EXISTS idx_api_docs_project_updated
-             ON api_docs(project_ident, updated_at DESC);",
-    )?;
-    let _ = conn.execute("ALTER TABLE api_docs ADD COLUMN parent_id TEXT", []);
-    let _ = conn.execute("ALTER TABLE api_docs ADD COLUMN slug TEXT", []);
-    let _ = conn.execute(
-        "ALTER TABLE api_docs ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0",
-        [],
-    );
-    let _ = conn.execute("ALTER TABLE api_docs ADD COLUMN global_rank INTEGER", []);
-    let _ = conn.execute(
-        "ALTER TABLE api_docs ADD COLUMN global_descendants INTEGER NOT NULL DEFAULT 0",
-        [],
-    );
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_api_docs_project_parent_order
-             ON api_docs(project_ident, parent_id, sort_order, title);
-         CREATE INDEX IF NOT EXISTS idx_api_docs_global_rank
-             ON api_docs(global_rank) WHERE global_rank IS NOT NULL;",
-    )?;
-
     // ── Agent memory gateway: project-scoped durable memories only ───────────
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS gateway_memories (
@@ -1335,19 +1293,59 @@ fn apply_schema(conn: &Connection) -> Result<()> {
 
     crate::task_events::initialize(conn)?;
     apply_artifact_substrate_schema(conn)?;
+    retire_documentation(conn)?;
     validate_project_casing(conn)?;
     ensure_project_uniqueness_indexes(conn)?;
 
     Ok(())
 }
 
+/// Remove retired documentation in one transaction. A retained record with a
+/// foreign key to deleted content aborts the migration rather than being erased.
+fn retire_documentation(conn: &Connection) -> Result<()> {
+    conn.pragma_update(None, "secure_delete", "ON")?;
+    let tx = conn.unchecked_transaction()?;
+    tx.pragma_update(None, "defer_foreign_keys", "ON")?;
+    tx.execute_batch("CREATE TEMP TABLE retired_legacy_doc_ids(id TEXT PRIMARY KEY);")?;
+    let legacy_exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='api_docs')",
+        [],
+        |row| row.get(0),
+    )?;
+    let legacy_count = if legacy_exists {
+        tx.execute(
+            "INSERT INTO retired_legacy_doc_ids SELECT id FROM api_docs",
+            [],
+        )?
+    } else {
+        0
+    };
+    let artifact_count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM artifacts WHERE kind='documentation'",
+        [],
+        |row| row.get(0),
+    )?;
+    tx.execute_batch(include_str!("../migrations/retire_documentation.sql"))?;
+    // COMMIT enforces the deferred references, including cross-artifact parents.
+    tx.commit()
+        .context("retire documentation without deleting retained records")?;
+    if legacy_count > 0 || artifact_count > 0 {
+        tracing::info!(
+            legacy_count,
+            artifact_count,
+            "retired gateway documentation data"
+        );
+    }
+    Ok(())
+}
+
 // ─── Artifact substrate v1 (T002 / T003 / T004) ──────────────────────────────
 //
 // This block introduces the shared artifact substrate that backs spec, design-
-// review, and documentation workflows on the gateway. Migrations are additive:
+// review workflows on the gateway. Migrations are additive:
 // every statement is `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`
 // or a tolerant `ALTER TABLE` so re-running on an existing database (with the
-// pre-existing `tasks`, `api_docs`, `messages` tables) preserves prior data.
+// pre-existing `tasks`, `messages` tables) preserves prior data.
 //
 // Contract-to-table traceability matrix
 // ─────────────────────────────────────
@@ -1421,7 +1419,7 @@ fn apply_artifact_substrate_schema(conn: &Connection) -> Result<()> {
             artifact_id            TEXT PRIMARY KEY,
             project_ident          TEXT NOT NULL REFERENCES projects(ident),
             kind                   TEXT NOT NULL
-                                   CHECK(kind IN ('design_review','spec','documentation')),
+                                   CHECK(kind IN ('design_review','spec')),
             subkind                TEXT,
             title                  TEXT NOT NULL,
             labels                 TEXT,
@@ -1450,7 +1448,7 @@ fn apply_artifact_substrate_schema(conn: &Connection) -> Result<()> {
             version_label                TEXT,
             parent_version_id            TEXT REFERENCES artifact_versions(artifact_version_id),
             body_format                  TEXT NOT NULL
-                                          CHECK(body_format IN ('markdown','application/agent-context+json','openapi','swagger')),
+                                          CHECK(body_format = 'markdown'),
             body                         TEXT,
             structured_payload           TEXT,
             source_format                TEXT,
@@ -1520,7 +1518,7 @@ fn apply_artifact_substrate_schema(conn: &Connection) -> Result<()> {
             workflow_run_id               TEXT PRIMARY KEY,
             artifact_id                   TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
             workflow_kind                 TEXT NOT NULL
-                                           CHECK(workflow_kind IN ('design_review_round','spec_iteration','spec_acceptance','spec_task_generation','doc_publish')),
+                                           CHECK(workflow_kind IN ('design_review_round','spec_iteration','spec_acceptance','spec_task_generation')),
             phase                         TEXT,
             round_id                      TEXT,
             coordinator_actor_id          TEXT NOT NULL REFERENCES artifact_actors(actor_id),
@@ -1584,7 +1582,7 @@ fn apply_artifact_substrate_schema(conn: &Connection) -> Result<()> {
             workflow_run_id        TEXT REFERENCES workflow_runs(workflow_run_id),
             read_set               TEXT,
             body_format            TEXT NOT NULL
-                                   CHECK(body_format IN ('markdown','application/agent-context+json','openapi','swagger')),
+                                   CHECK(body_format = 'markdown'),
             body                   TEXT NOT NULL,
             idempotency_key        TEXT,
             created_at             INTEGER NOT NULL
@@ -1684,7 +1682,7 @@ fn apply_artifact_substrate_schema(conn: &Connection) -> Result<()> {
             text                      TEXT NOT NULL,
             embedding_model           TEXT,
             embedding_vector          BLOB,
-            -- Retrieval filters (T002 §Chunk + T011 documentation needs).
+            -- Retrieval filters (T002 §Chunk retrieval filters).
             app                       TEXT,
             label                     TEXT,
             kind                      TEXT,
@@ -2124,10 +2122,8 @@ pub struct DesignReviewContributionFilters<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum SizeLimitKind {
-    /// `artifact_version.body` for markdown / agent-context+json (T004 §1).
+    /// `artifact_version.body` (markdown).
     ArtifactVersionBody,
-    /// `artifact_version.body` for openapi / swagger source.
-    ArtifactVersionSourceBody,
     /// `artifact_version.structured_payload`, serialized JSON.
     ArtifactVersionStructuredPayload,
     /// `contribution.body`.
@@ -2151,7 +2147,6 @@ impl SizeLimitKind {
     pub fn token(self) -> &'static str {
         match self {
             SizeLimitKind::ArtifactVersionBody => "artifact_version_body",
-            SizeLimitKind::ArtifactVersionSourceBody => "artifact_version_source_body",
             SizeLimitKind::ArtifactVersionStructuredPayload => "structured_payload",
             SizeLimitKind::ContributionBody => "contribution_body",
             SizeLimitKind::CommentBody => "comment_body",
@@ -2294,7 +2289,6 @@ impl QuotaWarning {
 #[allow(dead_code)]
 pub struct SizeLimits {
     pub artifact_version_body_max_bytes: usize,
-    pub artifact_version_source_body_max_bytes: usize,
     pub artifact_version_structured_payload_max_bytes: usize,
     pub contribution_body_max_bytes: usize,
     pub comment_body_max_bytes: usize,
@@ -2311,7 +2305,6 @@ impl SizeLimits {
     pub const fn production_defaults() -> Self {
         Self {
             artifact_version_body_max_bytes: 1024 * 1024, // 1 MiB
-            artifact_version_source_body_max_bytes: 4 * 1024 * 1024, // 4 MiB
             artifact_version_structured_payload_max_bytes: 512 * 1024, // 512 KiB
             contribution_body_max_bytes: 256 * 1024,      // 256 KiB
             comment_body_max_bytes: 32 * 1024,            // 32 KiB
@@ -2327,7 +2320,6 @@ impl SizeLimits {
     pub fn limit_for(&self, kind: SizeLimitKind) -> usize {
         match kind {
             SizeLimitKind::ArtifactVersionBody => self.artifact_version_body_max_bytes,
-            SizeLimitKind::ArtifactVersionSourceBody => self.artifact_version_source_body_max_bytes,
             SizeLimitKind::ArtifactVersionStructuredPayload => {
                 self.artifact_version_structured_payload_max_bytes
             }
@@ -2588,10 +2580,6 @@ impl ArtifactOperationsEnvelope {
             artifact_version_body_max_bytes
         );
         size!(
-            "ARTIFACT_VERSION_SOURCE_BODY_MAX_BYTES",
-            artifact_version_source_body_max_bytes
-        );
-        size!(
             "ARTIFACT_VERSION_STRUCTURED_PAYLOAD_MAX_BYTES",
             artifact_version_structured_payload_max_bytes
         );
@@ -2697,7 +2685,6 @@ pub(crate) fn t008_shrunken_artifact_operations_fixture_env(
 ) -> std::collections::HashMap<&'static str, &'static str> {
     [
         ("ARTIFACT_VERSION_BODY_MAX_BYTES", "4096"),
-        ("ARTIFACT_VERSION_SOURCE_BODY_MAX_BYTES", "8192"),
         ("ARTIFACT_VERSION_STRUCTURED_PAYLOAD_MAX_BYTES", "2048"),
         ("CONTRIBUTION_BODY_MAX_BYTES", "2048"),
         ("COMMENT_BODY_MAX_BYTES", "512"),
@@ -3304,10 +3291,6 @@ pub fn restore_check_idempotency_mappings(
 ///   different `artifact_id` than its declared owner — schema-level FKs
 ///   prevent this, but the helper still reports if it appears).
 ///
-/// `manifest.chunk_count` validation (T004 §4.3 step 6) requires the T011
-/// documentation workflow's structured_payload schema, which is not in
-/// scope for T016; that check ships with T011/T014 and uses the same
-/// finding shape.
 #[allow(dead_code)]
 pub fn restore_check_chunks(conn: &Connection) -> Result<Vec<RestoreFinding>> {
     RestoreFindingCollector::new(
@@ -3330,9 +3313,7 @@ pub fn restore_check_chunks(conn: &Connection) -> Result<Vec<RestoreFinding>> {
                     tag: "restore:chunk_count_mismatch".into(),
                     entity_kind: "artifact".into(),
                     entity_id: artifact_id,
-                    detail: format!(
-                        "accepted_version_id={accepted} has zero live chunks (regenerate via doc_publish)"
-                    ),
+                    detail: format!("accepted_version_id={accepted} has zero live chunks"),
                 }])
             } else {
                 Ok(Vec::new())
@@ -4544,14 +4525,9 @@ pub fn create_artifact_version(
         return Ok(replayed_write_result(existing));
     }
     if let Some(body) = input.body {
-        let kind = if input.body_format == "openapi" || input.body_format == "swagger" {
-            SizeLimitKind::ArtifactVersionSourceBody
-        } else {
-            SizeLimitKind::ArtifactVersionBody
-        };
         envelope
             .sizes
-            .check(kind, body.len())
+            .check(SizeLimitKind::ArtifactVersionBody, body.len())
             .map_err(anyhow::Error::new)?;
     }
     if let Some(payload) = input.structured_payload {
@@ -7309,7 +7285,6 @@ pub struct ProjectStats {
     pub todo_count: i64,
     pub in_progress_count: i64,
     pub done_count: i64,
-    pub api_doc_count: i64,
     pub memory_count: i64,
     pub repo_provider: Option<String>,
     pub repo_namespace: Option<String>,
@@ -7335,7 +7310,6 @@ pub struct DashboardData {
     pub agent_messages: i64,
     pub user_messages: i64,
     pub skill_count: i64,
-    pub api_doc_count: i64,
     pub memory_count: i64,
     pub projects: Vec<ProjectStats>,
 }
@@ -7380,7 +7354,6 @@ pub fn list_project_stats_filtered(
                 (SELECT COUNT(*) FROM tasks t
                  WHERE t.project_ident = p.ident
                    AND t.status = 'done'),
-                {API_DOC_LOGICAL_COUNT_PROJECT_SQL},
                 (SELECT COUNT(*) FROM gateway_memories gm
                  WHERE gm.project_ident = p.ident
                    AND gm.tombstoned_at IS NULL),
@@ -7419,17 +7392,16 @@ pub fn list_project_stats_filtered(
                 todo_count: r.get(5)?,
                 in_progress_count: r.get(6)?,
                 done_count: r.get(7)?,
-                api_doc_count: r.get(8)?,
-                memory_count: r.get(9)?,
-                repo_provider: r.get(10)?,
-                repo_namespace: r.get(11)?,
-                repo_name: r.get(12)?,
-                repo_full_name: r.get(13)?,
+                memory_count: r.get(8)?,
+                repo_provider: r.get(9)?,
+                repo_namespace: r.get(10)?,
+                repo_name: r.get(11)?,
+                repo_full_name: r.get(12)?,
                 kind: r
-                    .get::<_, Option<String>>(14)?
+                    .get::<_, Option<String>>(13)?
                     .unwrap_or_else(|| PROJECT_KIND_REPO.to_string()),
-                archived_at: r.get(15)?,
-                canonical_remote: r.get(16)?,
+                archived_at: r.get(14)?,
+                canonical_remote: r.get(15)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -7483,7 +7455,6 @@ pub fn get_dashboard_data(conn: &Connection) -> Result<DashboardData> {
         |r| r.get(0),
     )?;
     let skill_count: i64 = conn.query_row("SELECT COUNT(*) FROM skills", [], |r| r.get(0))?;
-    let api_doc_count: i64 = conn.query_row(API_DOC_LOGICAL_COUNT_TOTAL_SQL, [], |r| r.get(0))?;
     let memory_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM gateway_memories WHERE tombstoned_at IS NULL",
         [],
@@ -7498,7 +7469,6 @@ pub fn get_dashboard_data(conn: &Connection) -> Result<DashboardData> {
         agent_messages,
         user_messages,
         skill_count,
-        api_doc_count,
         memory_count,
         projects,
     })
@@ -8111,1847 +8081,6 @@ pub fn delete_pattern(conn: &Connection, id_or_slug: &str) -> Result<bool> {
     };
     let n = crud(conn).delete("patterns", &[crud_eq("id", existing.id.as_str())])?;
     Ok(n > 0)
-}
-
-// ── Agent API docs ───────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ApiDoc {
-    pub id: String,
-    pub project_ident: String,
-    pub owner_project: String,
-    pub scope: String,
-    pub app: String,
-    pub title: String,
-    pub summary: Option<String>,
-    pub kind: String,
-    pub source_format: String,
-    pub source_ref: Option<String>,
-    pub version: Option<String>,
-    pub labels: Vec<String>,
-    pub parent_id: Option<String>,
-    pub slug: String,
-    pub sort_order: i64,
-    pub wiki_path: String,
-    pub global_rank: Option<i64>,
-    pub direct_global_rank: Option<i64>,
-    pub global_descendants: bool,
-    pub content: serde_json::Value,
-    pub author: String,
-    pub created_at: i64,
-    pub updated_at: i64,
-    pub artifact_id: String,
-    pub artifact_version_id: Option<String>,
-    pub subkind: String,
-    pub manifest_chunk_count: Option<usize>,
-    pub chunking_status: String,
-    pub linked_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ApiDocSummary {
-    pub id: String,
-    pub project_ident: String,
-    pub owner_project: String,
-    pub scope: String,
-    pub app: String,
-    pub title: String,
-    pub summary: Option<String>,
-    pub kind: String,
-    pub source_format: String,
-    pub source_ref: Option<String>,
-    pub version: Option<String>,
-    pub labels: Vec<String>,
-    pub parent_id: Option<String>,
-    pub slug: String,
-    pub sort_order: i64,
-    pub wiki_path: String,
-    pub global_rank: Option<i64>,
-    pub direct_global_rank: Option<i64>,
-    pub global_descendants: bool,
-    pub author: String,
-    pub created_at: i64,
-    pub updated_at: i64,
-    pub artifact_id: String,
-    pub artifact_version_id: Option<String>,
-    pub subkind: String,
-    pub manifest_chunk_count: Option<usize>,
-    pub chunking_status: String,
-    pub linked_ids: Vec<String>,
-    #[serde(skip)]
-    pub content_search: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ApiDocHierarchyNode {
-    pub id: String,
-    pub node_type: String,
-    pub owner_project: String,
-    pub scope: String,
-    pub app: String,
-    pub title: String,
-    pub summary: Option<String>,
-    pub kind: String,
-    pub labels: Vec<String>,
-    pub parent_id: Option<String>,
-    pub slug: String,
-    pub sort_order: i64,
-    pub wiki_path: String,
-    pub breadcrumbs: Vec<String>,
-    pub global_rank: Option<i64>,
-    pub direct_global_rank: Option<i64>,
-    pub global_descendants: bool,
-    pub artifact_id: String,
-    pub artifact_version_id: Option<String>,
-    pub children: Vec<ApiDocHierarchyNode>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ApiDocVersionSummary {
-    pub doc_id: String,
-    pub artifact_id: String,
-    pub artifact_version_id: String,
-    pub version_label: Option<String>,
-    pub created_at: i64,
-    pub is_latest: bool,
-    pub body_available: bool,
-}
-
-#[derive(Debug, Default)]
-pub struct ApiDocFilters<'a> {
-    pub query: Option<&'a str>,
-    pub app: Option<&'a str>,
-    pub label: Option<&'a str>,
-    pub kind: Option<&'a str>,
-    pub scope: Option<&'a str>,
-}
-
-pub struct ApiDocInsert<'a> {
-    pub app: &'a str,
-    pub title: &'a str,
-    pub summary: Option<&'a str>,
-    pub kind: &'a str,
-    pub source_format: &'a str,
-    pub source_ref: Option<&'a str>,
-    pub version: Option<&'a str>,
-    pub labels: &'a [String],
-    pub parent_id: Option<Option<&'a str>>,
-    pub slug: Option<Option<&'a str>>,
-    pub sort_order: Option<i64>,
-    pub global_rank: Option<Option<i64>>,
-    pub global_descendants: Option<bool>,
-    pub content: &'a serde_json::Value,
-    pub author: &'a str,
-}
-
-#[derive(Default)]
-pub struct ApiDocUpdate<'a> {
-    pub app: Option<&'a str>,
-    pub title: Option<&'a str>,
-    pub summary: Option<Option<&'a str>>,
-    pub kind: Option<&'a str>,
-    pub source_format: Option<&'a str>,
-    pub source_ref: Option<Option<&'a str>>,
-    pub version: Option<Option<&'a str>>,
-    pub labels: Option<&'a [String]>,
-    pub parent_id: Option<Option<&'a str>>,
-    pub slug: Option<Option<&'a str>>,
-    pub sort_order: Option<i64>,
-    pub global_rank: Option<Option<i64>>,
-    pub global_descendants: Option<bool>,
-    pub content: Option<&'a serde_json::Value>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ApiDocChunkRecord {
-    pub doc_id: String,
-    pub project_ident: String,
-    pub owner_project: String,
-    pub scope: String,
-    pub global_rank: Option<i64>,
-    pub wiki_path: String,
-    pub app: String,
-    pub title: String,
-    pub chunk_type: String,
-    pub labels: Vec<String>,
-    pub text: String,
-    pub updated_at: i64,
-    pub chunk_id: String,
-    pub artifact_id: String,
-    pub artifact_version_id: String,
-    pub accepted_version_id: Option<String>,
-    pub child_address: String,
-    pub subkind: String,
-    pub freshness: String,
-    pub retrieval_scope: String,
-    pub chunking_status: String,
-    pub linked_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ApiDocChunkingStatus {
-    pub status: String,
-    pub current_chunk_count: usize,
-    pub stale_chunk_count: usize,
-    pub superseded_chunk_count: usize,
-    pub failed_addresses: Vec<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ApiDocChunkList {
-    pub chunks: Vec<ApiDocChunkRecord>,
-    pub chunking_status: ApiDocChunkingStatus,
-    pub retrieval_scope: String,
-    pub include_history: bool,
-}
-
-fn parse_content_json(raw: String) -> serde_json::Value {
-    serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({ "raw": raw }))
-}
-
-fn parse_newline_strings(raw: Option<String>) -> Vec<String> {
-    raw.unwrap_or_default()
-        .lines()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-fn api_doc_slug(title: &str, id: &str) -> String {
-    let mut out = String::new();
-    let mut last_dash = false;
-    for ch in title.chars().flat_map(char::to_lowercase) {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch);
-            last_dash = false;
-        } else if !last_dash && !out.is_empty() {
-            out.push('-');
-            last_dash = true;
-        }
-    }
-    while out.ends_with('-') {
-        out.pop();
-    }
-    if out.is_empty() {
-        id.to_string()
-    } else {
-        out
-    }
-}
-
-fn clean_api_doc_slug(slug: Option<&str>, title: &str, id: &str) -> String {
-    slug.map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| api_doc_slug(title, id))
-}
-
-fn normalize_global_rank(rank: Option<i64>) -> Option<i64> {
-    rank.filter(|value| *value > 0)
-}
-
-fn api_doc_logical_key_for_parts(
-    project_ident: &str,
-    app: &str,
-    title: &str,
-    kind: &str,
-) -> String {
-    [project_ident, app, title, kind]
-        .into_iter()
-        .map(api_doc_key_part)
-        .collect::<Vec<_>>()
-        .join("\x1f")
-}
-
-fn api_doc_effective_global_rank(
-    doc: &ApiDocSummary,
-    docs_by_id: &HashMap<String, ApiDocSummary>,
-) -> Option<i64> {
-    if let Some(rank) = normalize_global_rank(doc.direct_global_rank) {
-        return Some(rank);
-    }
-
-    let mut seen = HashSet::new();
-    let mut parent_id = doc.parent_id.as_deref();
-    while let Some(id) = parent_id {
-        if !seen.insert(id.to_string()) {
-            return None;
-        }
-        let parent = docs_by_id.get(id)?;
-        if parent.project_ident != doc.project_ident {
-            return None;
-        }
-        if parent.global_descendants {
-            if let Some(rank) = normalize_global_rank(parent.direct_global_rank) {
-                return Some(rank);
-            }
-        }
-        parent_id = parent.parent_id.as_deref();
-    }
-    None
-}
-
-fn api_doc_wiki_path(doc: &ApiDocSummary, docs_by_id: &HashMap<String, ApiDocSummary>) -> String {
-    let mut parts = vec![doc.slug.clone()];
-    let mut seen = HashSet::new();
-    let mut parent_id = doc.parent_id.as_deref();
-    while let Some(id) = parent_id {
-        if !seen.insert(id.to_string()) {
-            break;
-        }
-        let Some(parent) = docs_by_id.get(id) else {
-            break;
-        };
-        if parent.project_ident != doc.project_ident {
-            break;
-        }
-        parts.push(parent.slug.clone());
-        parent_id = parent.parent_id.as_deref();
-    }
-    parts.reverse();
-    format!("/{}", parts.join("/"))
-}
-
-fn api_doc_breadcrumbs(wiki_path: &str) -> Vec<String> {
-    wiki_path
-        .split('/')
-        .filter(|part| !part.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-fn enrich_api_doc_summary(
-    mut doc: ApiDocSummary,
-    request_project_ident: &str,
-    docs_by_id: &HashMap<String, ApiDocSummary>,
-) -> Option<ApiDocSummary> {
-    let effective_rank = api_doc_effective_global_rank(&doc, docs_by_id);
-    let is_local = doc.project_ident == request_project_ident;
-    if !is_local && effective_rank.is_none() {
-        return None;
-    }
-    doc.owner_project = doc.project_ident.clone();
-    doc.scope = if is_local { "local" } else { "global" }.to_string();
-    doc.global_rank = effective_rank;
-    doc.wiki_path = api_doc_wiki_path(&doc, docs_by_id);
-    Some(doc)
-}
-
-fn api_doc_text_score(haystack: &str, needle: &str, weight: i64) -> i64 {
-    let haystack = haystack.to_ascii_lowercase();
-    let needle = needle.to_ascii_lowercase();
-    if needle.is_empty() || haystack.is_empty() {
-        return 0;
-    }
-    haystack.matches(&needle).count() as i64 * weight
-}
-
-fn api_doc_relevance_score(doc: &ApiDocSummary, query: Option<&str>) -> i64 {
-    let Some(query) = query.map(str::trim).filter(|value| !value.is_empty()) else {
-        return 0;
-    };
-    let mut score = 0;
-    score += api_doc_text_score(&doc.title, query, 10);
-    score += api_doc_text_score(&doc.app, query, 6);
-    score += api_doc_text_score(doc.summary.as_deref().unwrap_or(""), query, 5);
-    score += api_doc_text_score(&doc.kind, query, 3);
-    score += api_doc_text_score(&doc.source_format, query, 2);
-    score += api_doc_text_score(doc.source_ref.as_deref().unwrap_or(""), query, 2);
-    score += api_doc_text_score(doc.version.as_deref().unwrap_or(""), query, 2);
-    score += api_doc_text_score(&doc.labels.join("\n"), query, 3);
-    score += api_doc_text_score(&doc.content_search, query, 1);
-    score += api_doc_text_score(&doc.artifact_id, query, 2);
-    score += api_doc_text_score(doc.artifact_version_id.as_deref().unwrap_or(""), query, 2);
-    score += api_doc_text_score(&doc.linked_ids.join("\n"), query, 2);
-    score
-}
-
-fn api_doc_matches_filters(doc: &ApiDocSummary, filters: &ApiDocFilters<'_>) -> bool {
-    if let Some(scope) = filters
-        .scope
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && *value != "all")
-    {
-        if doc.scope != scope {
-            return false;
-        }
-    }
-    if let Some(app) = filters.app.map(str::trim).filter(|value| !value.is_empty()) {
-        if doc.app != app {
-            return false;
-        }
-    }
-    if let Some(kind) = filters
-        .kind
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        if doc.kind != kind {
-            return false;
-        }
-    }
-    if let Some(label) = filters
-        .label
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        if !doc.labels.iter().any(|value| value == label) {
-            return false;
-        }
-    }
-    if filters
-        .query
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_some()
-        && api_doc_relevance_score(doc, filters.query) == 0
-    {
-        return false;
-    }
-    true
-}
-
-fn manifest_chunk_count(payload: Option<String>) -> Option<usize> {
-    payload
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-        .and_then(|value| {
-            value
-                .get("manifest")
-                .and_then(|manifest| manifest.get("chunk_count"))
-                .and_then(serde_json::Value::as_u64)
-        })
-        .map(|count| count as usize)
-}
-
-fn api_doc_chunking_status_value(
-    manifest_chunk_count: Option<usize>,
-    current: usize,
-    stale: usize,
-    superseded: usize,
-    failed_addresses: &[String],
-) -> String {
-    if !failed_addresses.is_empty()
-        || manifest_chunk_count.is_some_and(|expected| expected > current)
-    {
-        "partial".to_string()
-    } else if stale > 0 {
-        "stale".to_string()
-    } else if current > 0 {
-        "current".to_string()
-    } else if superseded > 0 {
-        "history_only".to_string()
-    } else {
-        "none".to_string()
-    }
-}
-
-fn row_to_api_doc(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiDoc> {
-    let content_json: String = row.get(10)?;
-    let id: String = row.get(0)?;
-    let project_ident: String = row.get(1)?;
-    let title: String = row.get(3)?;
-    let parent_id: Option<String> = row.get(14)?;
-    let slug = clean_api_doc_slug(row.get::<_, Option<String>>(15)?.as_deref(), &title, &id);
-    let direct_global_rank = normalize_global_rank(row.get(17)?);
-    let failed_addresses = parse_newline_strings(row.get(25)?);
-    let manifest_chunk_count = manifest_chunk_count(row.get(22)?);
-    let current = row.get::<_, i64>(23)? as usize;
-    let stale = row.get::<_, i64>(24)? as usize;
-    let superseded = row.get::<_, i64>(27)? as usize;
-    Ok(ApiDoc {
-        id: id.clone(),
-        project_ident: project_ident.clone(),
-        owner_project: project_ident,
-        scope: "local".to_string(),
-        app: row.get(2)?,
-        title,
-        summary: row.get(4)?,
-        kind: row.get(5)?,
-        source_format: row.get(6)?,
-        source_ref: row.get(7)?,
-        version: row.get(8)?,
-        labels: parse_labels(row.get::<_, Option<String>>(9)?),
-        parent_id,
-        slug,
-        sort_order: row.get(16)?,
-        wiki_path: String::new(),
-        global_rank: direct_global_rank,
-        direct_global_rank,
-        global_descendants: row.get::<_, i64>(18)? != 0,
-        content: parse_content_json(content_json),
-        author: row.get(11)?,
-        created_at: row.get(12)?,
-        updated_at: row.get(13)?,
-        artifact_id: row
-            .get::<_, Option<String>>(19)?
-            .unwrap_or_else(|| row.get(0).unwrap()),
-        artifact_version_id: row.get(20)?,
-        subkind: row
-            .get::<_, Option<String>>(21)?
-            .unwrap_or_else(|| API_DOC_SUBKIND.to_string()),
-        manifest_chunk_count,
-        chunking_status: api_doc_chunking_status_value(
-            manifest_chunk_count,
-            current,
-            stale,
-            superseded,
-            &failed_addresses,
-        ),
-        linked_ids: parse_newline_strings(row.get(26)?),
-    })
-}
-
-fn row_to_api_doc_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiDocSummary> {
-    let id: String = row.get(0)?;
-    let project_ident: String = row.get(1)?;
-    let title: String = row.get(3)?;
-    let parent_id: Option<String> = row.get(14)?;
-    let slug = clean_api_doc_slug(row.get::<_, Option<String>>(15)?.as_deref(), &title, &id);
-    let direct_global_rank = normalize_global_rank(row.get(17)?);
-    let failed_addresses = parse_newline_strings(row.get(25)?);
-    let manifest_chunk_count = manifest_chunk_count(row.get(22)?);
-    let current = row.get::<_, i64>(23)? as usize;
-    let stale = row.get::<_, i64>(24)? as usize;
-    let superseded = row.get::<_, i64>(27)? as usize;
-    Ok(ApiDocSummary {
-        id: id.clone(),
-        project_ident: project_ident.clone(),
-        owner_project: project_ident,
-        scope: "local".to_string(),
-        app: row.get(2)?,
-        title,
-        summary: row.get(4)?,
-        kind: row.get(5)?,
-        source_format: row.get(6)?,
-        source_ref: row.get(7)?,
-        version: row.get(8)?,
-        labels: parse_labels(row.get::<_, Option<String>>(9)?),
-        parent_id,
-        slug,
-        sort_order: row.get(16)?,
-        wiki_path: String::new(),
-        global_rank: direct_global_rank,
-        direct_global_rank,
-        global_descendants: row.get::<_, i64>(18)? != 0,
-        author: row.get(10)?,
-        created_at: row.get(11)?,
-        updated_at: row.get(12)?,
-        artifact_id: row
-            .get::<_, Option<String>>(19)?
-            .unwrap_or_else(|| row.get(0).unwrap()),
-        artifact_version_id: row.get(20)?,
-        subkind: row
-            .get::<_, Option<String>>(21)?
-            .unwrap_or_else(|| API_DOC_SUBKIND.to_string()),
-        manifest_chunk_count,
-        chunking_status: api_doc_chunking_status_value(
-            manifest_chunk_count,
-            current,
-            stale,
-            superseded,
-            &failed_addresses,
-        ),
-        linked_ids: parse_newline_strings(row.get(26)?),
-        content_search: row.get(13)?,
-    })
-}
-
-const API_DOC_SUBKIND: &str = "api_context";
-const API_DOC_RETAIN_LABEL: &str = "retain:permanent";
-const API_DOC_ARTIFACT_KIND: &str = "documentation";
-const API_DOC_BODY_FORMAT: &str = "application/agent-context+json";
-
-const API_DOC_ARTIFACT_SELECT_COLS: &str = "a.artifact_id, a.accepted_version_id, a.subkind, av.structured_payload,
-    (SELECT COUNT(*) FROM artifact_chunks c WHERE c.artifact_id = d.id AND c.superseded_by_chunk_id IS NULL AND a.accepted_version_id IS NOT NULL AND c.artifact_version_id = a.accepted_version_id),
-    (SELECT COUNT(*) FROM artifact_chunks c WHERE c.artifact_id = d.id AND c.superseded_by_chunk_id IS NULL AND (a.accepted_version_id IS NULL OR c.artifact_version_id != a.accepted_version_id)),
-    (SELECT GROUP_CONCAT(c.child_address, char(10)) FROM artifact_chunks c WHERE c.artifact_id = d.id AND (json_extract(c.metadata_json, '$.status') = 'failed' OR json_extract(c.metadata_json, '$.chunking_status') = 'failed')),
-    (SELECT GROUP_CONCAT(linked_id, char(10)) FROM (
-        SELECT CASE WHEN l.source_id = d.id THEN l.target_id ELSE l.source_id END AS linked_id
-        FROM artifact_links l
-        WHERE l.source_id = d.id OR l.target_id = d.id
-    )),
-    (SELECT COUNT(*) FROM artifact_chunks c WHERE c.artifact_id = d.id AND c.superseded_by_chunk_id IS NOT NULL)";
-
-const API_DOC_SELECT_COLS: &str = "d.id, d.project_ident, d.app, d.title, d.summary, d.kind, d.source_format, d.source_ref, d.version, d.labels, d.content_json, d.author, d.created_at, d.updated_at, d.parent_id, d.slug, d.sort_order, d.global_rank, d.global_descendants";
-const API_DOC_SUMMARY_SELECT_COLS: &str = "d.id, d.project_ident, d.app, d.title, d.summary, d.kind, d.source_format, d.source_ref, d.version, d.labels, d.author, d.created_at, d.updated_at, d.content_json, d.parent_id, d.slug, d.sort_order, d.global_rank, d.global_descendants";
-const API_DOC_LOGICAL_COUNT_PROJECT_SQL: &str = "(SELECT COUNT(*) FROM (
-    SELECT 1 FROM api_docs d
-    WHERE d.project_ident = p.ident
-    GROUP BY lower(trim(d.app)), lower(trim(d.title)), lower(trim(d.kind))
-))";
-const API_DOC_LOGICAL_COUNT_TOTAL_SQL: &str = "SELECT COUNT(*) FROM (
-    SELECT 1 FROM api_docs d
-    GROUP BY d.project_ident, lower(trim(d.app)), lower(trim(d.title)), lower(trim(d.kind))
-)";
-
-fn api_doc_select_sql(full: bool) -> String {
-    let cols = if full {
-        API_DOC_SELECT_COLS
-    } else {
-        API_DOC_SUMMARY_SELECT_COLS
-    };
-    format!(
-        "SELECT {cols}, {API_DOC_ARTIFACT_SELECT_COLS}
-         FROM api_docs d
-         LEFT JOIN artifacts a
-           ON a.artifact_id = d.id
-          AND a.project_ident = d.project_ident
-          AND a.kind = '{API_DOC_ARTIFACT_KIND}'
-          AND a.subkind = '{API_DOC_SUBKIND}'
-         LEFT JOIN artifact_versions av
-           ON av.artifact_version_id = a.accepted_version_id"
-    )
-}
-
-fn api_doc_key_part(value: &str) -> String {
-    value.trim().to_ascii_lowercase()
-}
-
-fn api_doc_logical_key(app: &str, title: &str, kind: &str) -> String {
-    [app, title, kind]
-        .into_iter()
-        .map(api_doc_key_part)
-        .collect::<Vec<_>>()
-        .join("\x1f")
-}
-
-fn api_doc_summary_logical_key(doc: &ApiDocSummary) -> String {
-    api_doc_logical_key_for_parts(&doc.project_ident, &doc.app, &doc.title, &doc.kind)
-}
-
-fn find_api_doc_by_logical_key(
-    conn: &Connection,
-    project_ident: &str,
-    app: &str,
-    title: &str,
-    kind: &str,
-) -> Result<Option<String>> {
-    conn.query_row(
-        "SELECT id FROM api_docs
-         WHERE project_ident = ?1
-           AND lower(trim(app)) = ?2
-           AND lower(trim(title)) = ?3
-           AND lower(trim(kind)) = ?4
-         ORDER BY updated_at DESC, id DESC
-         LIMIT 1",
-        params![
-            project_ident,
-            api_doc_key_part(app),
-            api_doc_key_part(title),
-            api_doc_key_part(kind)
-        ],
-        |r| r.get(0),
-    )
-    .optional()
-    .map_err(Into::into)
-}
-
-fn api_doc_summaries_for_logical_key(
-    conn: &Connection,
-    project_ident: &str,
-    app: &str,
-    title: &str,
-    kind: &str,
-) -> Result<Vec<ApiDocSummary>> {
-    let sql = format!(
-        "{} WHERE d.project_ident = ?1
-              AND lower(trim(d.app)) = ?2
-              AND lower(trim(d.title)) = ?3
-              AND lower(trim(d.kind)) = ?4
-         ORDER BY d.updated_at DESC, d.id DESC",
-        api_doc_select_sql(false)
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt
-        .query_map(
-            params![
-                project_ident,
-                api_doc_key_part(app),
-                api_doc_key_part(title),
-                api_doc_key_part(kind)
-            ],
-            row_to_api_doc_summary,
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
-}
-
-fn latest_api_doc_summary_for_key(
-    conn: &Connection,
-    project_ident: &str,
-    doc: &ApiDocSummary,
-) -> Result<Option<ApiDocSummary>> {
-    Ok(
-        api_doc_summaries_for_logical_key(conn, project_ident, &doc.app, &doc.title, &doc.kind)?
-            .into_iter()
-            .next(),
-    )
-}
-
-fn api_doc_actor(conn: &Connection, author: &str) -> Result<String> {
-    artifact_actor_upsert(
-        conn,
-        &ArtifactActorIdentity {
-            actor_type: "user",
-            agent_system: None,
-            agent_system_label: None,
-            agent_id: Some(author),
-            host: None,
-            display_name: author,
-            runtime_metadata: None,
-        },
-    )
-}
-
-fn api_doc_artifact_labels(labels: &[String]) -> Vec<String> {
-    let mut out = labels.to_vec();
-    if !out.iter().any(|label| label == API_DOC_RETAIN_LABEL) {
-        out.push(API_DOC_RETAIN_LABEL.to_string());
-    }
-    out
-}
-
-fn api_doc_chunk_specs(
-    app: &str,
-    title: &str,
-    summary: Option<&str>,
-    kind: &str,
-    source_format: &str,
-    version: Option<&str>,
-    content: &serde_json::Value,
-) -> Vec<(String, String, String)> {
-    let mut chunks = Vec::new();
-    let mut overview = format!("{title} ({app})");
-    if let Some(summary) = summary.map(str::trim).filter(|s| !s.is_empty()) {
-        overview.push_str("\n\n");
-        overview.push_str(summary);
-    }
-    overview.push_str("\n\nkind: ");
-    overview.push_str(kind);
-    overview.push_str("\nsource_format: ");
-    overview.push_str(source_format);
-    if let Some(version) = version.map(str::trim).filter(|s| !s.is_empty()) {
-        overview.push_str("\nversion: ");
-        overview.push_str(version);
-    }
-    push_api_doc_chunk_spec(&mut chunks, "overview", overview, "overview");
-
-    if let serde_json::Value::Object(map) = content {
-        for key in [
-            "purpose",
-            "workflows",
-            "endpoints",
-            "auth",
-            "safety",
-            "relationships",
-            "examples",
-            "operations",
-            "schemas",
-        ] {
-            if let Some(value) = map.get(key) {
-                let rendered = match value {
-                    serde_json::Value::String(s) => s.clone(),
-                    _ => serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
-                };
-                if rendered.trim().is_empty() {
-                    continue;
-                }
-                push_api_doc_chunk_spec(&mut chunks, key, rendered, key);
-            }
-        }
-    } else {
-        push_api_doc_chunk_spec(&mut chunks, "content", content.to_string(), "content");
-    }
-    chunks
-}
-
-fn push_api_doc_chunk_spec(
-    chunks: &mut Vec<(String, String, String)>,
-    address: &str,
-    text: String,
-    kind: &str,
-) {
-    let max_bytes = ArtifactOperationsEnvelope::production_defaults()
-        .sizes
-        .limit_for(SizeLimitKind::ChunkText);
-    if text.len() <= max_bytes {
-        chunks.push((address.to_string(), text, kind.to_string()));
-        return;
-    }
-
-    let mut part = 1usize;
-    let mut start = 0usize;
-    while start < text.len() {
-        let mut end = (start + max_bytes).min(text.len());
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        if end == start {
-            if let Some((offset, ch)) = text[start..].char_indices().next() {
-                end = start + offset + ch.len_utf8();
-            } else {
-                break;
-            }
-        }
-        chunks.push((
-            format!("{address}/part-{part:03}"),
-            text[start..end].to_string(),
-            kind.to_string(),
-        ));
-        start = end;
-        part += 1;
-    }
-}
-
-fn api_doc_chunk_base_address(address: &str) -> &str {
-    address
-        .split_once("/part-")
-        .map_or(address, |(base, _)| base)
-}
-
-struct ApiDocArtifactVersionInput<'a> {
-    id: &'a str,
-    project_ident: &'a str,
-    app: &'a str,
-    title: &'a str,
-    summary: Option<&'a str>,
-    kind: &'a str,
-    source_format: &'a str,
-    source_ref: Option<&'a str>,
-    version: Option<&'a str>,
-    labels: &'a [String],
-    content: &'a serde_json::Value,
-    parent_id: Option<&'a str>,
-    slug: &'a str,
-    sort_order: i64,
-    global_rank: Option<i64>,
-    global_descendants: bool,
-    author: &'a str,
-    created_at: i64,
-}
-
-fn ensure_api_doc_artifact_version(
-    conn: &Connection,
-    input: &ApiDocArtifactVersionInput<'_>,
-) -> Result<String> {
-    let project_ident = normalize_project_ident(input.project_ident);
-    let actor_id = api_doc_actor(conn, input.author)?;
-    let artifact_labels = api_doc_artifact_labels(input.labels);
-    let labels_json = serialize_string_array(&artifact_labels);
-    let existing_artifact: Option<String> = conn
-        .query_row(
-            "SELECT artifact_id FROM artifacts WHERE artifact_id = ?1",
-            params![input.id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if existing_artifact.is_none() {
-        crud(conn).insert(
-            "artifacts",
-            &[
-                crud_col("artifact_id", input.id),
-                crud_col("project_ident", project_ident.as_str()),
-                crud_col("kind", API_DOC_ARTIFACT_KIND),
-                crud_col("subkind", API_DOC_SUBKIND),
-                crud_col("title", input.title),
-                crud_col("labels", labels_json.as_deref()),
-                crud_col("lifecycle_state", "active"),
-                crud_col("review_state", "none"),
-                crud_col("implementation_state", "not_applicable"),
-                crud_col("current_version_id", DbValue::null()),
-                crud_col("accepted_version_id", DbValue::null()),
-                crud_col("created_by_actor_id", actor_id.as_str()),
-                crud_col("created_at", input.created_at),
-                crud_col("updated_at", input.created_at),
-            ],
-        )?;
-    } else {
-        crud(conn).update(
-            "artifacts",
-            &[
-                crud_col("title", input.title),
-                crud_col("labels", labels_json.as_deref()),
-                crud_col("subkind", API_DOC_SUBKIND),
-                crud_col("lifecycle_state", "active"),
-                crud_col("updated_at", now_ms()),
-            ],
-            &[crud_eq("artifact_id", input.id)],
-        )?;
-    }
-
-    let chunks = api_doc_chunk_specs(
-        input.app,
-        input.title,
-        input.summary,
-        input.kind,
-        input.source_format,
-        input.version,
-        input.content,
-    );
-    let payload = serde_json::json!({
-        "manifest": {
-            "chunk_count": chunks.len(),
-            "chunk_store": "artifact_chunks",
-            "chunk_source": "artifact_version_id",
-            "retrieval_default": "current",
-            "include_history_supported": true
-        },
-        "compatibility": {
-            "api_doc_id": input.id,
-            "legacy_kind": input.kind,
-            "subkind": API_DOC_SUBKIND,
-            "source_ref": input.source_ref
-        },
-        "wiki": {
-            "parent_id": input.parent_id,
-            "slug": input.slug,
-            "sort_order": input.sort_order,
-            "global_rank": input.global_rank,
-            "global_descendants": input.global_descendants
-        }
-    });
-    let content_json = serde_json::to_string(input.content)?;
-    let parent_version_id: Option<String> = conn
-        .query_row(
-            "SELECT current_version_id FROM artifacts WHERE artifact_id = ?1",
-            params![input.id],
-            |r| r.get(0),
-        )
-        .optional()?
-        .flatten();
-    let version_id = artifact_version_insert(
-        conn,
-        &ArtifactVersionInsert {
-            artifact_id: input.id,
-            version_label: input.version,
-            parent_version_id: parent_version_id.as_deref(),
-            body_format: API_DOC_BODY_FORMAT,
-            body: Some(&content_json),
-            structured_payload: Some(&payload),
-            source_format: Some(input.source_format),
-            created_by_actor_id: &actor_id,
-            created_via_workflow_run_id: None,
-            version_state: "accepted",
-            idempotency_key: None,
-        },
-    )?;
-    artifact_set_pointers(conn, input.id, Some(&version_id), Some(&version_id))?;
-
-    for (child_address, text, chunk_kind) in chunks {
-        let metadata = serde_json::json!({
-            "status": "ok",
-            "labels": input.labels,
-            "legacy_kind": input.kind,
-            "source_format": input.source_format,
-            "source_ref": input.source_ref,
-            "owner_project": input.project_ident,
-            "parent_id": input.parent_id,
-            "slug": input.slug,
-            "sort_order": input.sort_order,
-            "global_rank": input.global_rank,
-            "global_descendants": input.global_descendants
-        });
-        let result = create_artifact_chunk(
-            conn,
-            &ArtifactOperationsEnvelope::production_defaults(),
-            &ArtifactChunkInsert {
-                artifact_id: input.id,
-                artifact_version_id: &version_id,
-                child_address: &child_address,
-                text: &text,
-                embedding_model: None,
-                embedding_vector: None,
-                app: Some(input.app),
-                label: input.labels.first().map(String::as_str),
-                kind: Some(&chunk_kind),
-                metadata: Some(&metadata),
-            },
-        )?;
-        if let Some(parent_version_id) = parent_version_id.as_deref() {
-            supersede_api_doc_parent_chunks(
-                conn,
-                input.id,
-                parent_version_id,
-                &child_address,
-                &result.record.chunk_id,
-            )?;
-        }
-    }
-
-    Ok(version_id)
-}
-
-fn supersede_api_doc_parent_chunks(
-    conn: &Connection,
-    artifact_id: &str,
-    parent_version_id: &str,
-    child_address: &str,
-    new_chunk_id: &str,
-) -> Result<()> {
-    let base_address = api_doc_chunk_base_address(child_address);
-    let part_prefix = format!("{base_address}/part-%");
-    let sql = "SELECT chunk_id FROM artifact_chunks
-               WHERE artifact_id = ?1
-                 AND artifact_version_id = ?2
-                 AND superseded_by_chunk_id IS NULL
-                 AND (child_address = ?3 OR child_address LIKE ?4)";
-    let old_chunk_ids = {
-        let mut stmt = conn.prepare(sql)?;
-        let ids = stmt
-            .query_map(
-                params![artifact_id, parent_version_id, base_address, part_prefix],
-                |row| row.get::<_, String>(0),
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        ids
-    };
-    for old_chunk_id in old_chunk_ids {
-        artifact_chunk_mark_superseded(conn, &old_chunk_id, new_chunk_id)?;
-    }
-    Ok(())
-}
-
-fn ensure_existing_api_doc_artifacts(conn: &Connection, project_ident: &str) -> Result<()> {
-    let project_ident = normalize_project_ident(project_ident);
-    let mut stmt = conn.prepare(
-        "SELECT d.id, d.project_ident, d.app, d.title, d.summary, d.kind,
-                d.source_format, d.source_ref, d.version, d.labels, d.content_json,
-                d.author, d.created_at
-         FROM api_docs d
-         LEFT JOIN artifacts a ON a.artifact_id = d.id
-         WHERE d.project_ident = ?1 AND a.artifact_id IS NULL",
-    )?;
-    let rows = stmt
-        .query_map(params![project_ident.as_str()], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, Option<String>>(7)?,
-                row.get::<_, Option<String>>(8)?,
-                parse_labels(row.get::<_, Option<String>>(9)?),
-                parse_content_json(row.get::<_, String>(10)?),
-                row.get::<_, String>(11)?,
-                row.get::<_, i64>(12)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(stmt);
-
-    for (
-        id,
-        project_ident,
-        app,
-        title,
-        summary,
-        kind,
-        source_format,
-        source_ref,
-        version,
-        labels,
-        content,
-        author,
-        created_at,
-    ) in rows
-    {
-        ensure_api_doc_artifact_version(
-            conn,
-            &ApiDocArtifactVersionInput {
-                id: &id,
-                project_ident: &project_ident,
-                app: &app,
-                title: &title,
-                summary: summary.as_deref(),
-                kind: &kind,
-                source_format: &source_format,
-                source_ref: source_ref.as_deref(),
-                version: version.as_deref(),
-                labels: &labels,
-                content: &content,
-                parent_id: None,
-                slug: &api_doc_slug(&title, &id),
-                sort_order: 0,
-                global_rank: None,
-                global_descendants: false,
-                author: &author,
-                created_at,
-            },
-        )?;
-    }
-    Ok(())
-}
-
-fn ensure_all_api_doc_artifacts(conn: &Connection) -> Result<()> {
-    let mut stmt = conn.prepare("SELECT DISTINCT project_ident FROM api_docs")?;
-    let projects = stmt
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(stmt);
-    for project_ident in projects {
-        ensure_existing_api_doc_artifacts(conn, &project_ident)?;
-    }
-    Ok(())
-}
-
-fn load_all_api_doc_summaries(conn: &Connection) -> Result<Vec<ApiDocSummary>> {
-    let sql = format!(
-        "{} ORDER BY d.updated_at DESC, d.id DESC",
-        api_doc_select_sql(false)
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt
-        .query_map([], row_to_api_doc_summary)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
-}
-
-fn visible_api_doc_summaries(
-    conn: &Connection,
-    project_ident: &str,
-    filters: &ApiDocFilters<'_>,
-) -> Result<Vec<ApiDocSummary>> {
-    let project_ident = normalize_project_ident(project_ident);
-    ensure_all_api_doc_artifacts(conn)?;
-    let all_docs = load_all_api_doc_summaries(conn)?;
-    let docs_by_id: HashMap<String, ApiDocSummary> = all_docs
-        .iter()
-        .map(|doc| (doc.id.clone(), doc.clone()))
-        .collect();
-    let mut latest_visible_by_key: HashMap<String, ApiDocSummary> = HashMap::new();
-    for doc in all_docs.iter().cloned() {
-        let Some(enriched) = enrich_api_doc_summary(doc, &project_ident, &docs_by_id) else {
-            continue;
-        };
-        let key = api_doc_summary_logical_key(&enriched);
-        let replace = latest_visible_by_key
-            .get(&key)
-            .is_none_or(|existing| enriched.updated_at > existing.updated_at);
-        if replace {
-            latest_visible_by_key.insert(key, enriched);
-        }
-    }
-
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for doc in all_docs {
-        let Some(enriched) = enrich_api_doc_summary(doc, &project_ident, &docs_by_id) else {
-            continue;
-        };
-        if !api_doc_matches_filters(&enriched, filters) {
-            continue;
-        }
-        let key = api_doc_summary_logical_key(&enriched);
-        if !seen.insert(key.clone()) {
-            continue;
-        }
-        out.push(latest_visible_by_key.get(&key).cloned().unwrap_or(enriched));
-    }
-
-    out.sort_by(|a, b| {
-        let a_global = a.scope == "global";
-        let b_global = b.scope == "global";
-        a_global
-            .cmp(&b_global)
-            .then_with(|| {
-                if a_global || b_global {
-                    a.global_rank
-                        .unwrap_or(i64::MAX)
-                        .cmp(&b.global_rank.unwrap_or(i64::MAX))
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            })
-            .then_with(|| {
-                api_doc_relevance_score(b, filters.query)
-                    .cmp(&api_doc_relevance_score(a, filters.query))
-            })
-            .then_with(|| b.updated_at.cmp(&a.updated_at))
-            .then_with(|| a.owner_project.cmp(&b.owner_project))
-            .then_with(|| a.sort_order.cmp(&b.sort_order))
-            .then_with(|| a.title.cmp(&b.title))
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    Ok(out)
-}
-
-fn get_api_doc_local(conn: &Connection, project_ident: &str, id: &str) -> Result<Option<ApiDoc>> {
-    let project_ident = normalize_project_ident(project_ident);
-    ensure_existing_api_doc_artifacts(conn, &project_ident)?;
-    let sql = format!(
-        "{} WHERE d.project_ident = ?1 AND d.id = ?2",
-        api_doc_select_sql(true)
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query_map(params![project_ident.as_str(), id], row_to_api_doc)?;
-    let mut doc = match rows.next().transpose()? {
-        Some(doc) => doc,
-        None => return Ok(None),
-    };
-    let summaries = load_all_api_doc_summaries(conn)?;
-    let docs_by_id: HashMap<String, ApiDocSummary> = summaries
-        .iter()
-        .map(|summary| (summary.id.clone(), summary.clone()))
-        .collect();
-    if let Some(summary) = summaries.into_iter().find(|summary| summary.id == doc.id) {
-        if let Some(enriched) = enrich_api_doc_summary(summary, &project_ident, &docs_by_id) {
-            doc.owner_project = enriched.owner_project;
-            doc.scope = enriched.scope;
-            doc.global_rank = enriched.global_rank;
-            doc.wiki_path = enriched.wiki_path;
-        }
-    }
-    Ok(Some(doc))
-}
-
-pub fn insert_api_doc(
-    conn: &Connection,
-    project_ident: &str,
-    doc: &ApiDocInsert<'_>,
-) -> Result<ApiDoc> {
-    let project_ident = normalize_project_ident(project_ident);
-    if let Some(existing_id) =
-        find_api_doc_by_logical_key(conn, &project_ident, doc.app, doc.title, doc.kind)?
-    {
-        let now = now_ms();
-        let labels_json = serialize_string_array(doc.labels);
-        let content_json = serde_json::to_string(doc.content)?;
-        let slug_value = doc
-            .slug
-            .map(|value| value.map(|slug| clean_api_doc_slug(Some(slug), doc.title, &existing_id)));
-        let mut assignments = vec![
-            crud_col("app", doc.app),
-            crud_col("title", doc.title),
-            crud_col("summary", doc.summary),
-            crud_col("kind", doc.kind),
-            crud_col("source_format", doc.source_format),
-            crud_col("source_ref", doc.source_ref),
-            crud_col("version", doc.version),
-            crud_col("labels", labels_json.as_deref()),
-            crud_col("content_json", content_json.as_str()),
-            crud_col("author", doc.author),
-            crud_col("updated_at", now),
-        ];
-        if let Some(parent_id) = doc.parent_id {
-            assignments.push(crud_col("parent_id", parent_id));
-        }
-        if let Some(slug) = slug_value.as_ref() {
-            assignments.push(crud_col("slug", slug.as_deref()));
-        }
-        if let Some(sort_order) = doc.sort_order {
-            assignments.push(crud_col("sort_order", sort_order));
-        }
-        if let Some(global_rank) = doc.global_rank {
-            assignments.push(crud_col("global_rank", global_rank));
-        }
-        if let Some(global_descendants) = doc.global_descendants {
-            assignments.push(crud_col("global_descendants", global_descendants));
-        }
-        crud(conn).update(
-            "api_docs",
-            &assignments,
-            &[
-                crud_eq("project_ident", project_ident.as_str()),
-                crud_eq("id", existing_id.as_str()),
-            ],
-        )?;
-        let updated = get_api_doc_local(conn, &project_ident, &existing_id)?
-            .ok_or_else(|| anyhow::anyhow!("updated api doc not found"))?;
-        ensure_api_doc_artifact_version(
-            conn,
-            &ApiDocArtifactVersionInput {
-                id: &existing_id,
-                project_ident: &project_ident,
-                app: &updated.app,
-                title: &updated.title,
-                summary: updated.summary.as_deref(),
-                kind: &updated.kind,
-                source_format: &updated.source_format,
-                source_ref: updated.source_ref.as_deref(),
-                version: updated.version.as_deref(),
-                labels: &updated.labels,
-                content: &updated.content,
-                parent_id: updated.parent_id.as_deref(),
-                slug: &updated.slug,
-                sort_order: updated.sort_order,
-                global_rank: updated.direct_global_rank,
-                global_descendants: updated.global_descendants,
-                author: doc.author,
-                created_at: now,
-            },
-        )?;
-        return get_api_doc_local(conn, &project_ident, &existing_id)?
-            .ok_or_else(|| anyhow::anyhow!("updated api doc not found"));
-    }
-
-    let id = new_uuid();
-    let now = now_ms();
-    let labels_json = serialize_string_array(doc.labels);
-    let content_json = serde_json::to_string(doc.content)?;
-    let slug_value = doc
-        .slug
-        .and_then(|value| value)
-        .map(|slug| clean_api_doc_slug(Some(slug), doc.title, &id))
-        .unwrap_or_else(|| clean_api_doc_slug(None, doc.title, &id));
-    let parent_id = doc.parent_id.and_then(|value| value);
-    let sort_order = doc.sort_order.unwrap_or(0);
-    let global_rank = doc.global_rank.and_then(|value| value);
-    let global_descendants = doc.global_descendants.unwrap_or(false);
-    crud(conn).insert(
-        "api_docs",
-        &[
-            crud_col("id", id.as_str()),
-            crud_col("project_ident", project_ident.as_str()),
-            crud_col("app", doc.app),
-            crud_col("title", doc.title),
-            crud_col("summary", doc.summary),
-            crud_col("kind", doc.kind),
-            crud_col("source_format", doc.source_format),
-            crud_col("source_ref", doc.source_ref),
-            crud_col("version", doc.version),
-            crud_col("labels", labels_json),
-            crud_col("content_json", content_json),
-            crud_col("author", doc.author),
-            crud_col("created_at", now),
-            crud_col("updated_at", now),
-            crud_col("parent_id", parent_id),
-            crud_col("slug", slug_value.as_str()),
-            crud_col("sort_order", sort_order),
-            crud_col("global_rank", global_rank),
-            crud_col("global_descendants", global_descendants),
-        ],
-    )?;
-    ensure_api_doc_artifact_version(
-        conn,
-        &ApiDocArtifactVersionInput {
-            id: &id,
-            project_ident: &project_ident,
-            app: doc.app,
-            title: doc.title,
-            summary: doc.summary,
-            kind: doc.kind,
-            source_format: doc.source_format,
-            source_ref: doc.source_ref,
-            version: doc.version,
-            labels: doc.labels,
-            content: doc.content,
-            parent_id,
-            slug: &slug_value,
-            sort_order,
-            global_rank,
-            global_descendants,
-            author: doc.author,
-            created_at: now,
-        },
-    )?;
-    get_api_doc_local(conn, &project_ident, &id)?
-        .ok_or_else(|| anyhow::anyhow!("inserted api doc not found"))
-}
-
-pub fn list_api_docs(
-    conn: &Connection,
-    project_ident: &str,
-    filters: &ApiDocFilters<'_>,
-) -> Result<Vec<ApiDocSummary>> {
-    let project_ident = normalize_project_ident(project_ident);
-    visible_api_doc_summaries(conn, &project_ident, filters)
-}
-
-pub fn get_api_doc(conn: &Connection, project_ident: &str, id: &str) -> Result<Option<ApiDoc>> {
-    let project_ident = normalize_project_ident(project_ident);
-    ensure_all_api_doc_artifacts(conn)?;
-    let sql = format!("{} WHERE d.id = ?1", api_doc_select_sql(true));
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query_map(params![id], row_to_api_doc)?;
-    let mut doc = match rows.next().transpose()? {
-        Some(doc) => doc,
-        None => return Ok(None),
-    };
-    let summaries = load_all_api_doc_summaries(conn)?;
-    let docs_by_id: HashMap<String, ApiDocSummary> = summaries
-        .iter()
-        .map(|summary| (summary.id.clone(), summary.clone()))
-        .collect();
-    let Some(summary) = summaries.into_iter().find(|summary| summary.id == doc.id) else {
-        return Ok(None);
-    };
-    let Some(enriched) = enrich_api_doc_summary(summary, &project_ident, &docs_by_id) else {
-        return Ok(None);
-    };
-    doc.owner_project = enriched.owner_project;
-    doc.scope = enriched.scope;
-    doc.global_rank = enriched.global_rank;
-    doc.wiki_path = enriched.wiki_path;
-    Ok(Some(doc))
-}
-
-pub fn list_api_doc_versions(
-    conn: &Connection,
-    project_ident: &str,
-    id: &str,
-) -> Result<Vec<ApiDocVersionSummary>> {
-    let project_ident = normalize_project_ident(project_ident);
-    ensure_existing_api_doc_artifacts(conn, &project_ident)?;
-    let base = match get_api_doc(conn, &project_ident, id)? {
-        Some(doc) => doc,
-        None => return Ok(Vec::new()),
-    };
-    let owner_project = base.owner_project.clone();
-    let logical_docs = api_doc_summaries_for_logical_key(
-        conn,
-        &owner_project,
-        &base.app,
-        &base.title,
-        &base.kind,
-    )?;
-    let latest_doc_id = logical_docs.first().map(|doc| doc.id.clone());
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    for doc in logical_docs {
-        for version in list_artifact_versions(conn, &owner_project, &doc.artifact_id)? {
-            if !seen.insert(version.artifact_version_id.clone()) {
-                continue;
-            }
-            let is_latest = latest_doc_id.as_deref() == Some(doc.id.as_str())
-                && doc.artifact_version_id.as_deref() == Some(version.artifact_version_id.as_str());
-            out.push(ApiDocVersionSummary {
-                doc_id: doc.id.clone(),
-                artifact_id: doc.artifact_id.clone(),
-                artifact_version_id: version.artifact_version_id,
-                version_label: version.version_label,
-                created_at: version.created_at,
-                is_latest,
-                body_available: version.body.is_some(),
-            });
-        }
-    }
-    out.sort_by(|a, b| {
-        b.is_latest
-            .cmp(&a.is_latest)
-            .then_with(|| b.created_at.cmp(&a.created_at))
-            .then_with(|| a.artifact_version_id.cmp(&b.artifact_version_id))
-    });
-    Ok(out)
-}
-
-pub fn update_api_doc(
-    conn: &Connection,
-    project_ident: &str,
-    id: &str,
-    upd: &ApiDocUpdate<'_>,
-) -> Result<Option<ApiDoc>> {
-    let project_ident = normalize_project_ident(project_ident);
-    let existing = match get_api_doc_local(conn, &project_ident, id)? {
-        Some(doc) => doc,
-        None => {
-            return Ok(None);
-        }
-    };
-
-    let now = now_ms();
-    let mut assignments: Vec<CrudColumn<'_>> = Vec::new();
-
-    if let Some(app) = upd.app {
-        assignments.push(crud_col("app", app));
-    }
-    if let Some(title) = upd.title {
-        assignments.push(crud_col("title", title));
-    }
-    if let Some(summary) = upd.summary {
-        assignments.push(crud_col("summary", summary));
-    }
-    if let Some(kind) = upd.kind {
-        assignments.push(crud_col("kind", kind));
-    }
-    if let Some(source_format) = upd.source_format {
-        assignments.push(crud_col("source_format", source_format));
-    }
-    if let Some(source_ref) = upd.source_ref {
-        assignments.push(crud_col("source_ref", source_ref));
-    }
-    if let Some(version) = upd.version {
-        assignments.push(crud_col("version", version));
-    }
-    if let Some(labels) = upd.labels {
-        assignments.push(crud_col("labels", serialize_string_array(labels)));
-    }
-    if let Some(parent_id) = upd.parent_id {
-        assignments.push(crud_col("parent_id", parent_id));
-    }
-    let slug_value = upd
-        .slug
-        .map(|value| value.map(|slug| clean_api_doc_slug(Some(slug), existing.title.as_str(), id)));
-    if let Some(slug) = slug_value.as_ref() {
-        assignments.push(crud_col("slug", slug.as_deref()));
-    }
-    if let Some(sort_order) = upd.sort_order {
-        assignments.push(crud_col("sort_order", sort_order));
-    }
-    if let Some(global_rank) = upd.global_rank {
-        assignments.push(crud_col("global_rank", global_rank));
-    }
-    if let Some(global_descendants) = upd.global_descendants {
-        assignments.push(crud_col("global_descendants", global_descendants));
-    }
-    if let Some(content) = upd.content {
-        assignments.push(crud_col("content_json", serde_json::to_string(content)?));
-    }
-
-    if assignments.is_empty() {
-        return get_api_doc_local(conn, &project_ident, id);
-    }
-    assignments.push(crud_col("updated_at", now));
-    crud(conn).update(
-        "api_docs",
-        &assignments,
-        &[
-            crud_eq("project_ident", project_ident.as_str()),
-            crud_eq("id", id),
-        ],
-    )?;
-    let updated = get_api_doc_local(conn, &project_ident, id)?
-        .ok_or_else(|| anyhow::anyhow!("updated api doc not found"))?;
-    ensure_api_doc_artifact_version(
-        conn,
-        &ApiDocArtifactVersionInput {
-            id,
-            project_ident: &project_ident,
-            app: &updated.app,
-            title: &updated.title,
-            summary: updated.summary.as_deref(),
-            kind: &updated.kind,
-            source_format: &updated.source_format,
-            source_ref: updated.source_ref.as_deref(),
-            version: updated.version.as_deref(),
-            labels: &updated.labels,
-            content: &updated.content,
-            parent_id: updated.parent_id.as_deref(),
-            slug: &updated.slug,
-            sort_order: updated.sort_order,
-            global_rank: updated.direct_global_rank,
-            global_descendants: updated.global_descendants,
-            author: &existing.author,
-            created_at: now,
-        },
-    )?;
-    get_api_doc_local(conn, &project_ident, id)
-}
-
-pub fn delete_api_doc(conn: &Connection, project_ident: &str, id: &str) -> Result<bool> {
-    let project_ident = normalize_project_ident(project_ident);
-    let n = crud(conn).delete(
-        "api_docs",
-        &[
-            crud_eq("project_ident", project_ident.as_str()),
-            crud_eq("id", id),
-        ],
-    )?;
-    if n > 0 {
-        crud(conn).update(
-            "artifacts",
-            &[
-                crud_col("lifecycle_state", "archived"),
-                crud_col("updated_at", now_ms()),
-            ],
-            &[
-                crud_eq("project_ident", project_ident.as_str()),
-                crud_eq("artifact_id", id),
-            ],
-        )?;
-    }
-    Ok(n > 0)
-}
-
-pub fn list_api_doc_chunks(
-    conn: &Connection,
-    project_ident: &str,
-    filters: &ApiDocFilters<'_>,
-    include_history: bool,
-) -> Result<ApiDocChunkList> {
-    let project_ident = normalize_project_ident(project_ident);
-    ensure_existing_api_doc_artifacts(conn, &project_ident)?;
-    let docs = list_api_docs(conn, &project_ident, filters)?;
-    let retrieval_scope = if include_history {
-        "history"
-    } else {
-        "current"
-    }
-    .to_string();
-    let mut chunks = Vec::new();
-    let mut status = ApiDocChunkingStatus {
-        status: "none".to_string(),
-        current_chunk_count: 0,
-        stale_chunk_count: 0,
-        superseded_chunk_count: 0,
-        failed_addresses: Vec::new(),
-    };
-
-    for doc in docs {
-        let mut query = ArtifactQueryBuilder::new(
-            "SELECT c.chunk_id, c.artifact_id, c.artifact_version_id, c.child_address,
-                    c.text, c.kind, c.metadata_json, c.superseded_by_chunk_id,
-                    c.created_at, a.accepted_version_id
-             FROM artifact_chunks c
-             JOIN artifacts a ON a.artifact_id = c.artifact_id
-             WHERE c.artifact_id = ?1"
-                .to_string(),
-        )
-        .with_bind(doc.artifact_id.clone());
-        if !include_history {
-            query.push_sql(" AND c.superseded_by_chunk_id IS NULL");
-        }
-        query.and_trimmed_like(
-            |ph| {
-                format!(
-                    " AND (c.child_address LIKE ?{ph}
-                           OR c.text LIKE ?{ph}
-                           OR COALESCE(c.metadata_json, '') LIKE ?{ph})"
-                )
-            },
-            filters.query,
-        );
-        query.push_sql(" ORDER BY c.created_at DESC, c.child_address ASC");
-        let mut stmt = conn.prepare(&query.sql)?;
-        let params_vec: Vec<&dyn rusqlite::ToSql> =
-            query.binds.iter().map(|b| b.as_ref()).collect();
-        let rows = stmt
-            .query_map(params_vec.as_slice(), |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, i64>(8)?,
-                    row.get::<_, Option<String>>(9)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt);
-
-        for (
-            chunk_id,
-            artifact_id,
-            artifact_version_id,
-            child_address,
-            text,
-            chunk_kind,
-            metadata_json,
-            superseded_by_chunk_id,
-            created_at,
-            accepted_version_id,
-        ) in rows
-        {
-            let metadata = metadata_json
-                .as_deref()
-                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
-            if let Some(label) = filters
-                .label
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                let matches_doc = doc.labels.iter().any(|value| value == label);
-                let matches_metadata = metadata
-                    .as_ref()
-                    .and_then(|value| value.get("labels"))
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|labels| labels.iter().any(|value| value.as_str() == Some(label)));
-                if !matches_doc && !matches_metadata {
-                    continue;
-                }
-            }
-            let freshness = if superseded_by_chunk_id.is_some() {
-                status.superseded_chunk_count += 1;
-                "superseded_history"
-            } else if accepted_version_id.as_deref() == Some(artifact_version_id.as_str()) {
-                status.current_chunk_count += 1;
-                "current"
-            } else {
-                status.stale_chunk_count += 1;
-                "stale"
-            };
-            let failed = metadata.as_ref().and_then(|value| {
-                value
-                    .get("status")
-                    .or_else(|| value.get("chunking_status"))
-                    .and_then(serde_json::Value::as_str)
-            }) == Some("failed");
-            if failed {
-                status.failed_addresses.push(child_address.clone());
-            }
-            chunks.push(ApiDocChunkRecord {
-                doc_id: doc.id.clone(),
-                project_ident: doc.project_ident.clone(),
-                owner_project: doc.owner_project.clone(),
-                scope: doc.scope.clone(),
-                global_rank: doc.global_rank,
-                wiki_path: doc.wiki_path.clone(),
-                app: doc.app.clone(),
-                title: doc.title.clone(),
-                chunk_type: chunk_kind.unwrap_or_else(|| child_address.clone()),
-                labels: doc.labels.clone(),
-                text,
-                updated_at: created_at,
-                chunk_id,
-                artifact_id,
-                artifact_version_id: artifact_version_id.clone(),
-                accepted_version_id: accepted_version_id.clone(),
-                child_address,
-                subkind: doc.subkind.clone(),
-                freshness: freshness.to_string(),
-                retrieval_scope: retrieval_scope.clone(),
-                chunking_status: doc.chunking_status.clone(),
-                linked_ids: doc.linked_ids.clone(),
-            });
-        }
-
-        if doc.chunking_status == "partial" {
-            status.status = "partial".to_string();
-        }
-    }
-
-    chunks.sort_by(|a, b| {
-        let a_global = a.scope == "global";
-        let b_global = b.scope == "global";
-        let chunk_score = |chunk: &ApiDocChunkRecord| -> i64 {
-            let Some(query) = filters
-                .query
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            else {
-                return 0;
-            };
-            api_doc_text_score(&chunk.title, query, 10)
-                + api_doc_text_score(&chunk.app, query, 6)
-                + api_doc_text_score(&chunk.chunk_type, query, 5)
-                + api_doc_text_score(&chunk.text, query, 1)
-                + api_doc_text_score(&chunk.labels.join("\n"), query, 3)
-        };
-        a_global
-            .cmp(&b_global)
-            .then_with(|| {
-                if a_global || b_global {
-                    a.global_rank
-                        .unwrap_or(i64::MAX)
-                        .cmp(&b.global_rank.unwrap_or(i64::MAX))
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            })
-            .then_with(|| chunk_score(b).cmp(&chunk_score(a)))
-            .then_with(|| b.updated_at.cmp(&a.updated_at))
-            .then_with(|| a.owner_project.cmp(&b.owner_project))
-            .then_with(|| a.wiki_path.cmp(&b.wiki_path))
-            .then_with(|| a.child_address.cmp(&b.child_address))
-            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
-    });
-
-    if status.status != "partial" {
-        status.status = if !status.failed_addresses.is_empty() {
-            "partial".to_string()
-        } else if status.stale_chunk_count > 0 {
-            "stale".to_string()
-        } else if status.current_chunk_count > 0 {
-            "current".to_string()
-        } else if status.superseded_chunk_count > 0 {
-            "history_only".to_string()
-        } else {
-            "none".to_string()
-        };
-    }
-
-    Ok(ApiDocChunkList {
-        chunks,
-        chunking_status: status,
-        retrieval_scope,
-        include_history,
-    })
-}
-
-fn sort_api_doc_hierarchy_nodes(nodes: &mut [ApiDocHierarchyNode]) {
-    nodes.sort_by(|a, b| {
-        let a_global = a.scope == "global";
-        let b_global = b.scope == "global";
-        a_global
-            .cmp(&b_global)
-            .then_with(|| {
-                if a_global || b_global {
-                    a.global_rank
-                        .unwrap_or(i64::MAX)
-                        .cmp(&b.global_rank.unwrap_or(i64::MAX))
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            })
-            .then_with(|| a.owner_project.cmp(&b.owner_project))
-            .then_with(|| a.sort_order.cmp(&b.sort_order))
-            .then_with(|| a.title.cmp(&b.title))
-            .then_with(|| a.id.cmp(&b.id))
-    });
-}
-
-fn attach_api_doc_hierarchy_children(
-    parent_id: Option<String>,
-    by_parent: &mut HashMap<Option<String>, Vec<ApiDocHierarchyNode>>,
-) -> Vec<ApiDocHierarchyNode> {
-    let mut nodes = by_parent.remove(&parent_id).unwrap_or_default();
-    sort_api_doc_hierarchy_nodes(&mut nodes);
-    for node in &mut nodes {
-        node.children = attach_api_doc_hierarchy_children(Some(node.id.clone()), by_parent);
-    }
-    nodes
-}
-
-pub fn api_doc_hierarchy(
-    conn: &Connection,
-    project_ident: &str,
-    filters: &ApiDocFilters<'_>,
-) -> Result<Vec<ApiDocHierarchyNode>> {
-    let project_ident = normalize_project_ident(project_ident);
-    let docs = visible_api_doc_summaries(conn, &project_ident, filters)?;
-    let visible_ids: HashSet<String> = docs.iter().map(|doc| doc.id.clone()).collect();
-    let mut by_parent: HashMap<Option<String>, Vec<ApiDocHierarchyNode>> = HashMap::new();
-    for doc in docs {
-        let parent_key = doc
-            .parent_id
-            .as_ref()
-            .filter(|parent_id| visible_ids.contains(parent_id.as_str()))
-            .cloned();
-        by_parent
-            .entry(parent_key)
-            .or_default()
-            .push(ApiDocHierarchyNode {
-                id: doc.id,
-                node_type: "page".to_string(),
-                owner_project: doc.owner_project,
-                scope: doc.scope,
-                app: doc.app,
-                title: doc.title,
-                summary: doc.summary,
-                kind: doc.kind,
-                labels: doc.labels,
-                parent_id: doc.parent_id,
-                slug: doc.slug,
-                sort_order: doc.sort_order,
-                breadcrumbs: api_doc_breadcrumbs(&doc.wiki_path),
-                wiki_path: doc.wiki_path,
-                global_rank: doc.global_rank,
-                direct_global_rank: doc.direct_global_rank,
-                global_descendants: doc.global_descendants,
-                artifact_id: doc.artifact_id,
-                artifact_version_id: doc.artifact_version_id,
-                children: Vec::new(),
-            });
-    }
-    Ok(attach_api_doc_hierarchy_children(None, &mut by_parent))
 }
 
 pub fn list_pattern_comments(
@@ -13158,447 +11287,6 @@ mod tests {
     }
 
     #[test]
-    fn api_docs_store_docs_first_context_and_search_content() {
-        let conn = test_conn();
-        insert_project(&conn, &test_project("billing")).unwrap();
-
-        let content = serde_json::json!({
-            "purpose": "Owns invoice state.",
-            "workflows": [{
-                "name": "Create invoice",
-                "steps": ["Create draft", "Finalize after confirmation"]
-            }],
-            "endpoints": [{
-                "method": "POST",
-                "path": "/v1/invoices",
-                "intent": "Create a draft invoice"
-            }]
-        });
-        let doc = insert_api_doc(
-            &conn,
-            "billing",
-            &ApiDocInsert {
-                app: "billing-api",
-                title: "Billing API agent context",
-                summary: Some("System of record for invoices."),
-                kind: "agent_context",
-                source_format: "agent_context",
-                source_ref: Some(".agent/api/billing.yaml"),
-                version: Some("2026-04-28"),
-                labels: &["billing".into(), "invoices".into()],
-                parent_id: None,
-                slug: None,
-                sort_order: None,
-                global_rank: None,
-                global_descendants: None,
-                content: &content,
-                author: "tester",
-            },
-        )
-        .unwrap();
-
-        let fetched = get_api_doc(&conn, "billing", &doc.id).unwrap().unwrap();
-        assert_eq!(fetched.app, "billing-api");
-        assert_eq!(fetched.content["purpose"], "Owns invoice state.");
-
-        let results = list_api_docs(
-            &conn,
-            "billing",
-            &ApiDocFilters {
-                query: Some("draft invoice"),
-                label: Some("invoices"),
-                ..ApiDocFilters::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id, doc.id);
-
-        let updated = update_api_doc(
-            &conn,
-            "billing",
-            &doc.id,
-            &ApiDocUpdate {
-                summary: Some(Some("Updated agent guidance.")),
-                version: Some(None),
-                ..ApiDocUpdate::default()
-            },
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(updated.summary.as_deref(), Some("Updated agent guidance."));
-        assert_eq!(updated.version, None);
-
-        let project_stats = list_project_stats(&conn).unwrap();
-        assert_eq!(project_stats[0].api_doc_count, 1);
-        let dashboard = get_dashboard_data(&conn).unwrap();
-        assert_eq!(dashboard.api_doc_count, 1);
-    }
-
-    #[test]
-    fn api_docs_publish_upserts_logical_doc_and_keeps_version_history() {
-        let conn = test_conn();
-        insert_project(&conn, &test_project("billing")).unwrap();
-
-        let content_v1 = serde_json::json!({
-            "purpose": "Owns invoice state.",
-            "workflows": "create draft invoices"
-        });
-        let doc_v1 = insert_api_doc(
-            &conn,
-            "billing",
-            &ApiDocInsert {
-                app: "billing-api",
-                title: "Billing API agent context",
-                summary: Some("System of record for invoices."),
-                kind: "agent_context",
-                source_format: "agent_context",
-                source_ref: Some(".agent/api/billing.yaml"),
-                version: Some("2026-04-28"),
-                labels: &["billing".into(), "invoices".into()],
-                parent_id: None,
-                slug: None,
-                sort_order: None,
-                global_rank: None,
-                global_descendants: None,
-                content: &content_v1,
-                author: "tester",
-            },
-        )
-        .unwrap();
-        let v1_id = doc_v1.artifact_version_id.clone().unwrap();
-
-        let content_v2 = serde_json::json!({
-            "purpose": "Owns invoice and credit memo state.",
-            "workflows": "create draft invoices and credit memos"
-        });
-        let doc_v2 = insert_api_doc(
-            &conn,
-            "billing",
-            &ApiDocInsert {
-                app: "billing-api",
-                title: "Billing API agent context",
-                summary: Some("Expanded billing context."),
-                kind: "agent_context",
-                source_format: "agent_context",
-                source_ref: Some(".agent/api/billing-renamed.yaml"),
-                version: Some("2026-05-01"),
-                labels: &["billing".into(), "credit-memos".into()],
-                parent_id: None,
-                slug: None,
-                sort_order: None,
-                global_rank: None,
-                global_descendants: None,
-                content: &content_v2,
-                author: "tester-2",
-            },
-        )
-        .unwrap();
-        let v2_id = doc_v2.artifact_version_id.clone().unwrap();
-
-        assert_eq!(doc_v2.id, doc_v1.id);
-        assert_ne!(v1_id, v2_id);
-        assert_eq!(
-            doc_v2.content["purpose"],
-            "Owns invoice and credit memo state."
-        );
-        assert_eq!(
-            doc_v2.source_ref.as_deref(),
-            Some(".agent/api/billing-renamed.yaml")
-        );
-
-        let docs = list_api_docs(&conn, "billing", &ApiDocFilters::default()).unwrap();
-        assert_eq!(docs.len(), 1);
-        assert_eq!(docs[0].id, doc_v1.id);
-        assert_eq!(docs[0].version.as_deref(), Some("2026-05-01"));
-
-        let versions = list_api_doc_versions(&conn, "billing", &doc_v1.id).unwrap();
-        assert_eq!(versions.len(), 2);
-        assert!(versions[0].is_latest);
-        let version_ids: std::collections::HashSet<_> = versions
-            .iter()
-            .map(|version| version.artifact_version_id.as_str())
-            .collect();
-        assert!(version_ids.contains(v1_id.as_str()));
-        assert!(version_ids.contains(v2_id.as_str()));
-
-        let current =
-            list_api_doc_chunks(&conn, "billing", &ApiDocFilters::default(), false).unwrap();
-        assert!(current
-            .chunks
-            .iter()
-            .all(|chunk| chunk.artifact_version_id == v2_id && chunk.freshness == "current"));
-        assert!(current
-            .chunks
-            .iter()
-            .any(|chunk| chunk.text.contains("credit memo")));
-
-        let history =
-            list_api_doc_chunks(&conn, "billing", &ApiDocFilters::default(), true).unwrap();
-        assert!(history
-            .chunks
-            .iter()
-            .any(|chunk| chunk.artifact_version_id == v1_id
-                && chunk.freshness == "superseded_history"));
-        assert!(history
-            .chunks
-            .iter()
-            .any(|chunk| chunk.artifact_version_id == v2_id && chunk.freshness == "current"));
-
-        assert_eq!(list_project_stats(&conn).unwrap()[0].api_doc_count, 1);
-        assert_eq!(get_dashboard_data(&conn).unwrap().api_doc_count, 1);
-    }
-
-    #[test]
-    fn api_docs_list_collapses_legacy_duplicate_rows_to_latest_logical_doc() {
-        let conn = test_conn();
-        insert_project(&conn, &test_project("traderx")).unwrap();
-        let first_at = now_ms();
-        let second_at = first_at + 1;
-        let content_v1 = serde_json::json!({"purpose": "legacy old-only traderx detail"});
-        let content_v2 = serde_json::json!({"purpose": "latest traderx detail"});
-
-        conn.execute(
-            "INSERT INTO api_docs (
-                 id, project_ident, app, title, summary, kind, source_format,
-                 source_ref, version, labels, content_json, author, created_at,
-                 updated_at
-             )
-             VALUES (?1, 'traderx', 'traderx', 'TraderX API agent context',
-                     'old duplicate', 'agent_context', 'agent_context',
-                     '.agent/api/traderx-old.yaml', '2026-05-01', ?2, ?3,
-                     'tester', ?4, ?4)",
-            params![
-                "legacy-doc-old",
-                serde_json::to_string(&vec!["traderx"]).unwrap(),
-                serde_json::to_string(&content_v1).unwrap(),
-                first_at,
-            ],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO api_docs (
-                 id, project_ident, app, title, summary, kind, source_format,
-                 source_ref, version, labels, content_json, author, created_at,
-                 updated_at
-             )
-             VALUES (?1, 'traderx', 'traderx', 'TraderX API agent context',
-                     'latest duplicate', 'agent_context', 'agent_context',
-                     '.agent/api/traderx.yaml', '2026-05-02', ?2, ?3,
-                     'tester', ?4, ?4)",
-            params![
-                "legacy-doc-new",
-                serde_json::to_string(&vec!["traderx"]).unwrap(),
-                serde_json::to_string(&content_v2).unwrap(),
-                second_at,
-            ],
-        )
-        .unwrap();
-
-        let docs = list_api_docs(&conn, "traderx", &ApiDocFilters::default()).unwrap();
-        assert_eq!(docs.len(), 1);
-        assert_eq!(docs[0].id, "legacy-doc-new");
-        assert_eq!(docs[0].summary.as_deref(), Some("latest duplicate"));
-
-        let old_content_search = list_api_docs(
-            &conn,
-            "traderx",
-            &ApiDocFilters {
-                query: Some("old-only"),
-                ..ApiDocFilters::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(old_content_search.len(), 1);
-        assert_eq!(old_content_search[0].id, "legacy-doc-new");
-
-        let versions = list_api_doc_versions(&conn, "traderx", "legacy-doc-new").unwrap();
-        assert_eq!(versions.len(), 2);
-        let doc_ids: std::collections::HashSet<_> = versions
-            .iter()
-            .map(|version| version.doc_id.as_str())
-            .collect();
-        assert!(doc_ids.contains("legacy-doc-old"));
-        assert!(doc_ids.contains("legacy-doc-new"));
-
-        assert_eq!(list_project_stats(&conn).unwrap()[0].api_doc_count, 1);
-        assert_eq!(get_dashboard_data(&conn).unwrap().api_doc_count, 1);
-    }
-
-    #[test]
-    fn api_docs_include_global_ranked_docs_and_inherited_hierarchy_visibility() {
-        let conn = test_conn();
-        for ident in ["app", "platform", "security"] {
-            insert_project(&conn, &test_project(ident)).unwrap();
-        }
-
-        let local = insert_api_doc(
-            &conn,
-            "app",
-            &ApiDocInsert {
-                app: "app-api",
-                title: "App API context",
-                summary: Some("shared ranking local context"),
-                kind: "agent_context",
-                source_format: "agent_context",
-                source_ref: None,
-                version: None,
-                labels: &["local".into()],
-                parent_id: None,
-                slug: Some(Some("app")),
-                sort_order: Some(10),
-                global_rank: None,
-                global_descendants: None,
-                content: &serde_json::json!({"purpose": "shared ranking local"}),
-                author: "tester",
-            },
-        )
-        .unwrap();
-
-        let platform_root = insert_api_doc(
-            &conn,
-            "platform",
-            &ApiDocInsert {
-                app: "platform-api",
-                title: "Platform",
-                summary: Some("shared ranking platform root"),
-                kind: "agent_context",
-                source_format: "agent_context",
-                source_ref: None,
-                version: None,
-                labels: &["platform".into()],
-                parent_id: None,
-                slug: Some(Some("platform")),
-                sort_order: Some(0),
-                global_rank: Some(Some(2)),
-                global_descendants: Some(true),
-                content: &serde_json::json!({"purpose": "shared ranking platform root"}),
-                author: "tester",
-            },
-        )
-        .unwrap();
-
-        let platform_child = insert_api_doc(
-            &conn,
-            "platform",
-            &ApiDocInsert {
-                app: "platform-api",
-                title: "Platform Child",
-                summary: Some("inherited child page"),
-                kind: "agent_context",
-                source_format: "agent_context",
-                source_ref: None,
-                version: None,
-                labels: &["platform-child".into()],
-                parent_id: Some(Some(platform_root.id.as_str())),
-                slug: Some(Some("child")),
-                sort_order: Some(1),
-                global_rank: None,
-                global_descendants: None,
-                content: &serde_json::json!({"purpose": "inherited child shared ranking"}),
-                author: "tester",
-            },
-        )
-        .unwrap();
-
-        let security = insert_api_doc(
-            &conn,
-            "security",
-            &ApiDocInsert {
-                app: "security-api",
-                title: "Security Guide",
-                summary: Some("shared ranking security"),
-                kind: "agent_context",
-                source_format: "agent_context",
-                source_ref: None,
-                version: None,
-                labels: &["security".into()],
-                parent_id: None,
-                slug: Some(Some("security-guide")),
-                sort_order: Some(0),
-                global_rank: Some(Some(1)),
-                global_descendants: Some(false),
-                content: &serde_json::json!({"purpose": "shared ranking security"}),
-                author: "tester",
-            },
-        )
-        .unwrap();
-
-        let docs = list_api_docs(
-            &conn,
-            "app",
-            &ApiDocFilters {
-                query: Some("shared ranking"),
-                ..ApiDocFilters::default()
-            },
-        )
-        .unwrap();
-        let ids = docs.iter().map(|doc| doc.id.as_str()).collect::<Vec<_>>();
-        assert_eq!(ids[0], local.id.as_str());
-        let security_pos = ids
-            .iter()
-            .position(|id| *id == security.id.as_str())
-            .unwrap();
-        let platform_root_pos = ids
-            .iter()
-            .position(|id| *id == platform_root.id.as_str())
-            .unwrap();
-        let platform_child_pos = ids
-            .iter()
-            .position(|id| *id == platform_child.id.as_str())
-            .unwrap();
-        assert!(security_pos < platform_root_pos);
-        assert!(security_pos < platform_child_pos);
-
-        let child_summary = docs.iter().find(|doc| doc.id == platform_child.id).unwrap();
-        assert_eq!(child_summary.scope, "global");
-        assert_eq!(child_summary.owner_project, "platform");
-        assert_eq!(child_summary.global_rank, Some(2));
-        assert_eq!(child_summary.direct_global_rank, None);
-        assert_eq!(child_summary.wiki_path, "/platform/child");
-
-        let fetched_global = get_api_doc(&conn, "app", &platform_child.id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(fetched_global.scope, "global");
-        assert_eq!(fetched_global.owner_project, "platform");
-        assert_eq!(fetched_global.global_rank, Some(2));
-        assert_eq!(fetched_global.wiki_path, "/platform/child");
-
-        let hierarchy = api_doc_hierarchy(&conn, "app", &ApiDocFilters::default()).unwrap();
-        let platform_node = hierarchy
-            .iter()
-            .find(|node| node.id == platform_root.id)
-            .unwrap();
-        assert_eq!(platform_node.scope, "global");
-        assert_eq!(platform_node.global_rank, Some(2));
-        assert_eq!(platform_node.children.len(), 1);
-        assert_eq!(platform_node.children[0].id, platform_child.id);
-        assert_eq!(platform_node.children[0].wiki_path, "/platform/child");
-
-        let chunks = list_api_doc_chunks(
-            &conn,
-            "app",
-            &ApiDocFilters {
-                query: Some("inherited child"),
-                ..ApiDocFilters::default()
-            },
-            false,
-        )
-        .unwrap();
-        assert!(!chunks.chunks.is_empty());
-        assert!(chunks
-            .chunks
-            .iter()
-            .all(|chunk| chunk.doc_id == platform_child.id));
-        let child_chunk = &chunks.chunks[0];
-        assert_eq!(child_chunk.scope, "global");
-        assert_eq!(child_chunk.owner_project, "platform");
-        assert_eq!(child_chunk.global_rank, Some(2));
-        assert_eq!(child_chunk.wiki_path, "/platform/child");
-    }
-
-    #[test]
     fn memory_gateway_push_pull_search_conflict_and_tombstone() {
         let conn = test_conn();
         insert_project(&conn, &test_project("proj")).unwrap();
@@ -14211,357 +11899,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn api_docs_lazy_artifact_materialization_splits_oversized_chunks() {
-        let conn = test_conn();
-        insert_project(&conn, &test_project("billing")).unwrap();
-
-        let workflows = format!("{}needle-tail", "x".repeat(9 * 1024));
-        let content = serde_json::json!({
-            "workflows": workflows,
-        });
-        conn.execute(
-            "INSERT INTO api_docs (
-                 id, project_ident, app, title, summary, kind, source_format,
-                 source_ref, version, labels, content_json, author, created_at,
-                 updated_at
-             )
-             VALUES (?1, 'billing', 'billing-api', 'Billing API agent context',
-                     NULL, 'agent_context', 'agent_context', '.agent/api/billing.yaml',
-                     '2026-05-14', ?2, ?3, 'tester', ?4, ?4)",
-            params![
-                "legacy-doc",
-                serde_json::to_string(&vec!["billing"]).unwrap(),
-                serde_json::to_string(&content).unwrap(),
-                now_ms(),
-            ],
-        )
-        .unwrap();
-
-        let chunks =
-            list_api_doc_chunks(&conn, "billing", &ApiDocFilters::default(), false).unwrap();
-        let max_bytes = ArtifactOperationsEnvelope::production_defaults()
-            .sizes
-            .limit_for(SizeLimitKind::ChunkText);
-        assert_eq!(chunks.chunking_status.status, "current");
-        assert_eq!(chunks.chunks.len(), 3);
-        assert!(chunks
-            .chunks
-            .iter()
-            .all(|chunk| chunk.text.len() <= max_bytes));
-        assert!(chunks
-            .chunks
-            .iter()
-            .any(|chunk| chunk.child_address == "workflows/part-001"));
-        assert!(chunks
-            .chunks
-            .iter()
-            .any(|chunk| chunk.child_address == "workflows/part-002"
-                && chunk.text.contains("needle-tail")));
-
-        let doc = get_api_doc(&conn, "billing", "legacy-doc")
-            .unwrap()
-            .unwrap();
-        assert_eq!(doc.manifest_chunk_count, Some(3));
-        assert_eq!(doc.chunking_status, "current");
-    }
-
-    #[test]
-    fn api_docs_preserve_legacy_kind_and_publish_artifact_backed_chunks() {
-        let conn = test_conn();
-        insert_project(&conn, &test_project("billing")).unwrap();
-
-        let content_v1 = serde_json::json!({
-            "purpose": "Owns invoice state.",
-            "endpoints": [{
-                "method": "POST",
-                "path": "/v1/invoices",
-                "intent": "Create a draft invoice"
-            }]
-        });
-        let doc = insert_api_doc(
-            &conn,
-            "billing",
-            &ApiDocInsert {
-                app: "billing-api",
-                title: "Billing API agent context",
-                summary: Some("System of record for invoices."),
-                kind: "agent_context",
-                source_format: "agent_context",
-                source_ref: Some(".agent/api/billing.yaml"),
-                version: Some("2026-04-28"),
-                labels: &["billing".into(), "invoices".into()],
-                parent_id: None,
-                slug: None,
-                sort_order: None,
-                global_rank: None,
-                global_descendants: None,
-                content: &content_v1,
-                author: "tester",
-            },
-        )
-        .unwrap();
-        let v1_id = doc.artifact_version_id.clone().unwrap();
-
-        assert_eq!(doc.kind, "agent_context");
-        assert_eq!(doc.subkind, API_DOC_SUBKIND);
-        assert_eq!(doc.artifact_id, doc.id);
-        assert_eq!(doc.manifest_chunk_count, Some(3));
-        assert_eq!(doc.chunking_status, "current");
-
-        let artifact = get_artifact_summary(&conn, "billing", &doc.artifact_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(artifact.kind, API_DOC_ARTIFACT_KIND);
-        assert_eq!(artifact.subkind.as_deref(), Some(API_DOC_SUBKIND));
-        assert!(artifact
-            .labels
-            .iter()
-            .any(|label| label == API_DOC_RETAIN_LABEL));
-
-        let legacy_kind = list_api_docs(
-            &conn,
-            "billing",
-            &ApiDocFilters {
-                kind: Some("agent_context"),
-                ..ApiDocFilters::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(legacy_kind.len(), 1);
-        let artifact_kind = list_api_docs(
-            &conn,
-            "billing",
-            &ApiDocFilters {
-                kind: Some(API_DOC_ARTIFACT_KIND),
-                ..ApiDocFilters::default()
-            },
-        )
-        .unwrap();
-        assert!(artifact_kind.is_empty());
-
-        let current = list_api_doc_chunks(
-            &conn,
-            "billing",
-            &ApiDocFilters {
-                query: Some("draft invoice"),
-                label: Some("invoices"),
-                ..ApiDocFilters::default()
-            },
-            false,
-        )
-        .unwrap();
-        assert_eq!(current.retrieval_scope, "current");
-        assert!(!current.include_history);
-        assert_eq!(current.chunking_status.status, "current");
-        assert_eq!(current.chunks.len(), 1);
-        assert_eq!(current.chunks[0].artifact_version_id, v1_id);
-        assert_eq!(current.chunks[0].freshness, "current");
-        assert_eq!(current.chunks[0].child_address, "endpoints");
-
-        let content_v2 = serde_json::json!({
-            "purpose": "Owns invoice and credit memo state.",
-            "endpoints": [{
-                "method": "POST",
-                "path": "/v1/credit-memos",
-                "intent": "Create a credit memo"
-            }]
-        });
-        let updated = update_api_doc(
-            &conn,
-            "billing",
-            &doc.id,
-            &ApiDocUpdate {
-                content: Some(&content_v2),
-                version: Some(Some("2026-05-01")),
-                ..ApiDocUpdate::default()
-            },
-        )
-        .unwrap()
-        .unwrap();
-        let v2_id = updated.artifact_version_id.clone().unwrap();
-        assert_ne!(v1_id, v2_id);
-
-        let current_after_update =
-            list_api_doc_chunks(&conn, "billing", &ApiDocFilters::default(), false).unwrap();
-        assert!(current_after_update
-            .chunks
-            .iter()
-            .all(|chunk| chunk.artifact_version_id == v2_id && chunk.freshness == "current"));
-        let history =
-            list_api_doc_chunks(&conn, "billing", &ApiDocFilters::default(), true).unwrap();
-        assert_eq!(history.retrieval_scope, "history");
-        assert!(history.chunks.iter().any(|chunk| {
-            chunk.artifact_version_id == v1_id && chunk.freshness == "superseded_history"
-        }));
-        assert!(history
-            .chunks
-            .iter()
-            .any(|chunk| chunk.artifact_version_id == v2_id && chunk.freshness == "current"));
-
-        let actor_id = api_doc_actor(&conn, "tester").unwrap();
-        let partial_payload = serde_json::json!({
-            "manifest": {
-                "chunk_count": 1,
-                "chunk_store": "artifact_chunks"
-            }
-        });
-        let partial_body = serde_json::json!({"purpose": "accepted but not chunked yet"});
-        let partial_body_json = serde_json::to_string(&partial_body).unwrap();
-        let v3_id = artifact_version_insert(
-            &conn,
-            &ArtifactVersionInsert {
-                artifact_id: &doc.artifact_id,
-                version_label: Some("2026-05-02"),
-                parent_version_id: Some(&v2_id),
-                body_format: API_DOC_BODY_FORMAT,
-                body: Some(&partial_body_json),
-                structured_payload: Some(&partial_payload),
-                source_format: Some("agent_context"),
-                created_by_actor_id: &actor_id,
-                created_via_workflow_run_id: None,
-                version_state: "accepted",
-                idempotency_key: None,
-            },
-        )
-        .unwrap();
-        artifact_set_pointers(&conn, &doc.artifact_id, Some(&v3_id), Some(&v3_id)).unwrap();
-        let partial =
-            list_api_doc_chunks(&conn, "billing", &ApiDocFilters::default(), false).unwrap();
-        assert_eq!(partial.chunking_status.status, "partial");
-        assert!(partial
-            .chunks
-            .iter()
-            .any(|chunk| chunk.freshness == "stale"));
-        let partial_doc = get_api_doc(&conn, "billing", &doc.id).unwrap().unwrap();
-        assert_eq!(
-            partial_doc.artifact_version_id.as_deref(),
-            Some(v3_id.as_str())
-        );
-        assert_eq!(partial_doc.manifest_chunk_count, Some(1));
-        assert_eq!(partial_doc.chunking_status, "partial");
-    }
-
-    #[test]
-    fn api_docs_search_linked_artifact_task_pattern_and_repo_refs() {
-        let conn = test_conn();
-        let envelope = ArtifactOperationsEnvelope::production_defaults();
-        insert_project(&conn, &test_project("docs")).unwrap();
-        let doc = insert_api_doc(
-            &conn,
-            "docs",
-            &ApiDocInsert {
-                app: "docs-api",
-                title: "Docs API context",
-                summary: None,
-                kind: "agent_context",
-                source_format: "agent_context",
-                source_ref: Some(".agent/api/docs.yaml"),
-                version: None,
-                labels: &["docs".into()],
-                parent_id: None,
-                slug: None,
-                sort_order: None,
-                global_rank: None,
-                global_descendants: None,
-                content: &serde_json::json!({"purpose": "links to project resources"}),
-                author: "tester",
-            },
-        )
-        .unwrap();
-        let actor_id = api_doc_actor(&conn, "tester").unwrap();
-        let spec = create_artifact(
-            &conn,
-            &envelope,
-            &ArtifactInsert {
-                project_ident: "docs",
-                kind: "spec",
-                subkind: Some("implementation"),
-                title: "Docs spec",
-                labels: &[],
-                created_by_actor_id: &actor_id,
-            },
-        )
-        .unwrap()
-        .record;
-        let task = insert_task(
-            &conn,
-            "docs",
-            "Implement docs",
-            None,
-            None,
-            &[],
-            None,
-            "tester",
-        )
-        .unwrap();
-        let pattern = insert_pattern(
-            &conn,
-            "Docs pattern",
-            Some("docs-pattern"),
-            None,
-            "pattern body",
-            &[],
-            "latest",
-            "active",
-            None,
-            "tester",
-        )
-        .unwrap();
-        let commit = "abcdef1234567890";
-        for (target_kind, target_id) in [
-            ("artifact", spec.artifact_id.as_str()),
-            ("task", task.id.as_str()),
-            ("pattern", pattern.id.as_str()),
-            ("commit", commit),
-        ] {
-            create_artifact_link(
-                &conn,
-                &envelope,
-                &ArtifactLinkInsert {
-                    link_type: "doc_referenced_by_spec",
-                    source_kind: "artifact",
-                    source_id: &doc.artifact_id,
-                    source_version_id: doc.artifact_version_id.as_deref(),
-                    source_child_address: None,
-                    target_kind,
-                    target_id,
-                    target_version_id: None,
-                    target_child_address: None,
-                    created_by_actor_id: &actor_id,
-                    created_via_workflow_run_id: None,
-                    idempotency_key: None,
-                    supersedes_link_id: None,
-                },
-            )
-            .unwrap();
-        }
-
-        let linked_doc = get_api_doc(&conn, "docs", &doc.id).unwrap().unwrap();
-        for linked_id in [
-            spec.artifact_id.as_str(),
-            task.id.as_str(),
-            pattern.id.as_str(),
-            commit,
-        ] {
-            assert!(
-                linked_doc.linked_ids.iter().any(|value| value == linked_id),
-                "missing linked id {linked_id}"
-            );
-            let results = list_api_docs(
-                &conn,
-                "docs",
-                &ApiDocFilters {
-                    query: Some(linked_id),
-                    ..ApiDocFilters::default()
-                },
-            )
-            .unwrap();
-            assert_eq!(results.len(), 1, "query {linked_id}");
-            assert_eq!(results[0].id, doc.id);
-        }
-    }
-
     // ── Artifact substrate tests (T005) ────────────────────────────────────────
 
     /// Build a default agent identity for substrate tests.
@@ -14595,6 +11932,203 @@ mod tests {
         (actor, artifact)
     }
 
+    // Simulate an older schema that still permits documentation containers.
+    fn seed_retired_documentation(conn: &Connection) -> (String, String, String) {
+        let (actor, artifact) = seed_substrate(conn, "doc-retirement");
+        conn.execute_batch(
+            "DROP TRIGGER reject_documentation_artifact_update;
+             PRAGMA ignore_check_constraints=ON;",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE artifacts SET kind='documentation' WHERE artifact_id=?1",
+            [&artifact],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA ignore_check_constraints=OFF;")
+            .unwrap();
+        let version = artifact_version_insert(
+            conn,
+            &ArtifactVersionInsert {
+                artifact_id: &artifact,
+                version_label: None,
+                parent_version_id: None,
+                body_format: "markdown",
+                body: Some("retired documentation body"),
+                structured_payload: None,
+                source_format: None,
+                created_by_actor_id: &actor,
+                created_via_workflow_run_id: None,
+                version_state: "accepted",
+                idempotency_key: None,
+            },
+        )
+        .unwrap();
+        artifact_set_pointers(conn, &artifact, Some(&version), Some(&version)).unwrap();
+        conn.execute_batch("CREATE TABLE api_docs(id TEXT PRIMARY KEY, content_json TEXT);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO api_docs VALUES (?1, 'retired legacy content')",
+            [&artifact],
+        )
+        .unwrap();
+        (actor, artifact, version)
+    }
+
+    #[test]
+    fn documentation_retirement_preserves_shared_data_and_is_idempotent() {
+        let conn = test_conn();
+        let (actor, doc, version) = seed_retired_documentation(&conn);
+        let (_, spec) = seed_substrate(&conn, "retained");
+        let task = insert_task(
+            &conn,
+            "retained",
+            "Keep task",
+            Some("Keep specification"),
+            None,
+            &[],
+            None,
+            "tester",
+        )
+        .unwrap();
+        let chunk = artifact_chunk_insert(
+            &conn,
+            &ArtifactChunkInsert {
+                artifact_id: &doc,
+                artifact_version_id: &version,
+                child_address: "section",
+                text: "retired chunk",
+                embedding_model: None,
+                embedding_vector: None,
+                app: None,
+                label: None,
+                kind: None,
+                metadata: None,
+            },
+        )
+        .unwrap();
+        artifact_link_insert(
+            &conn,
+            &ArtifactLinkInsert {
+                link_type: "references",
+                source_kind: "task",
+                source_id: &task.id,
+                source_version_id: None,
+                source_child_address: None,
+                target_kind: "chunk",
+                target_id: &chunk,
+                target_version_id: Some(&version),
+                target_child_address: None,
+                created_by_actor_id: &actor,
+                created_via_workflow_run_id: None,
+                idempotency_key: None,
+                supersedes_link_id: None,
+            },
+        )
+        .unwrap();
+        retire_documentation(&conn).unwrap();
+        retire_documentation(&conn).unwrap();
+        assert!(get_artifact_summary(&conn, "doc-retirement", &doc)
+            .unwrap()
+            .is_none());
+        let versions_left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM artifact_versions WHERE artifact_version_id=?1",
+                [&version],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(versions_left, 0);
+        assert!(get_artifact_chunk(&conn, &chunk).unwrap().is_none());
+        assert!(get_artifact_summary(&conn, "retained", &spec)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            get_task_detail(&conn, "retained", &task.id)
+                .unwrap()
+                .unwrap()
+                .task
+                .description
+                .as_deref(),
+            Some("Keep specification")
+        );
+        let actors: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM artifact_actors WHERE actor_id=?1",
+                [&actor],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(actors, 1);
+        let legacy: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='api_docs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy, 0);
+        assert!(conn
+            .execute(
+                "UPDATE artifacts SET kind='documentation' WHERE artifact_id=?1",
+                [&spec]
+            )
+            .is_err());
+        assert!(conn
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .query([])
+            .unwrap()
+            .next()
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn documentation_retirement_rolls_back_if_retained_content_depends_on_it() {
+        let conn = test_conn();
+        let (actor, doc, version) = seed_retired_documentation(&conn);
+        let (_, spec) = seed_substrate(&conn, "retained");
+        artifact_version_insert(
+            &conn,
+            &ArtifactVersionInsert {
+                artifact_id: &spec,
+                version_label: None,
+                parent_version_id: Some(&version),
+                body_format: "markdown",
+                body: Some("retained body"),
+                structured_payload: None,
+                source_format: None,
+                created_by_actor_id: &actor,
+                created_via_workflow_run_id: None,
+                version_state: "draft",
+                idempotency_key: None,
+            },
+        )
+        .unwrap();
+        assert!(retire_documentation(&conn).is_err());
+        assert!(get_artifact_summary(&conn, "doc-retirement", &doc)
+            .unwrap()
+            .is_some());
+        assert!(get_artifact_summary(&conn, "retained", &spec)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM api_docs", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE 'retired_%'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
     #[test]
     fn artifact_actor_upsert_is_idempotent() {
         let conn = test_conn();
@@ -14624,30 +12158,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(task.status, "todo");
-
-        let doc = insert_api_doc(
-            &conn,
-            "legacy",
-            &ApiDocInsert {
-                app: "legacy-app",
-                title: "Legacy",
-                summary: None,
-                kind: "agent_context",
-                source_format: "agent_context",
-                source_ref: None,
-                version: None,
-                labels: &[],
-                parent_id: None,
-                slug: None,
-                sort_order: None,
-                global_rank: None,
-                global_descendants: None,
-                content: &serde_json::json!({"purpose": "x"}),
-                author: "tester",
-            },
-        )
-        .unwrap();
-        assert_eq!(doc.app, "legacy-app");
 
         // Re-apply schema (simulates upgrade path); both legacy and new
         // artifact tables must coexist.
@@ -15058,7 +12568,7 @@ mod tests {
             &conn,
             &WorkflowRunInsert {
                 artifact_id: &artifact,
-                workflow_kind: "doc_publish",
+                workflow_kind: "spec_task_generation",
                 phase: None,
                 round_id: None,
                 coordinator_actor_id: &actor,
@@ -15074,7 +12584,7 @@ mod tests {
             &conn,
             &WorkflowRunInsert {
                 artifact_id: &artifact,
-                workflow_kind: "doc_publish",
+                workflow_kind: "spec_task_generation",
                 phase: None,
                 round_id: None,
                 coordinator_actor_id: &actor,
@@ -15098,7 +12608,7 @@ mod tests {
                 artifact_id: &artifact,
                 version_label: Some("v1"),
                 parent_version_id: None,
-                body_format: "application/agent-context+json",
+                body_format: "markdown",
                 body: Some("{}"),
                 structured_payload: None,
                 source_format: None,
@@ -15115,7 +12625,7 @@ mod tests {
                 artifact_id: &artifact,
                 version_label: Some("v2"),
                 parent_version_id: Some(&v1),
-                body_format: "application/agent-context+json",
+                body_format: "markdown",
                 body: Some("{}"),
                 structured_payload: None,
                 source_format: None,
@@ -15138,7 +12648,7 @@ mod tests {
                 embedding_vector: None,
                 app: Some("docs"),
                 label: Some("api"),
-                kind: Some("agent_context"),
+                kind: Some("spec"),
                 metadata: None,
             },
         )
@@ -15154,7 +12664,7 @@ mod tests {
                 embedding_vector: None,
                 app: Some("docs"),
                 label: Some("api"),
-                kind: Some("agent_context"),
+                kind: Some("spec"),
                 metadata: None,
             },
         )
@@ -15432,28 +12942,6 @@ mod tests {
             "repo-agent",
         )
         .unwrap();
-        let linked_doc = insert_api_doc(
-            &conn,
-            "repo",
-            &ApiDocInsert {
-                app: "linked-app",
-                title: "Linked API context",
-                summary: None,
-                kind: "agent_context",
-                source_format: "agent_context",
-                source_ref: None,
-                version: None,
-                labels: &[],
-                parent_id: None,
-                slug: None,
-                sort_order: None,
-                global_rank: None,
-                global_descendants: None,
-                content: &serde_json::json!({"purpose": "linked fixture"}),
-                author: "repo-agent",
-            },
-        )
-        .unwrap();
         let linked_pattern = insert_pattern(
             &conn,
             "Linked pattern",
@@ -15469,7 +12957,7 @@ mod tests {
         .unwrap();
         for (target_kind, target_id) in [
             ("task", linked_task.id.as_str()),
-            ("external_url", linked_doc.id.as_str()),
+            ("external_url", "https://example.test/linked-reference"),
             ("pattern", linked_pattern.id.as_str()),
         ] {
             create_artifact_link(
@@ -15527,23 +13015,6 @@ mod tests {
             assert_eq!(results.len(), 1, "query {query}");
             assert_eq!(results[0].artifact_id, artifact.artifact_id);
         }
-        let linked_doc_results = list_artifacts(
-            &conn,
-            "repo",
-            &ArtifactFilters {
-                query: Some(&linked_doc.id),
-                ..ArtifactFilters::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(linked_doc_results.len(), 2, "query {}", linked_doc.id);
-        assert!(linked_doc_results
-            .iter()
-            .any(|result| result.artifact_id == artifact.artifact_id));
-        assert!(linked_doc_results
-            .iter()
-            .any(|result| result.artifact_id == linked_doc.artifact_id));
-
         let detail = get_artifact(&conn, "repo", &artifact.artifact_id)
             .unwrap()
             .unwrap();
@@ -16030,10 +13501,6 @@ mod tests {
         let env = ArtifactOperationsEnvelope::default();
         // Sentinel checks — T004 §1 / §2 production values.
         assert_eq!(env.sizes.artifact_version_body_max_bytes, 1024 * 1024);
-        assert_eq!(
-            env.sizes.artifact_version_source_body_max_bytes,
-            4 * 1024 * 1024
-        );
         assert_eq!(env.sizes.contribution_body_max_bytes, 256 * 1024);
         assert_eq!(env.sizes.comment_body_max_bytes, 32 * 1024);
         assert_eq!(env.sizes.chunk_text_max_bytes, 8 * 1024);
@@ -16201,7 +13668,7 @@ mod tests {
             conn,
             &ArtifactInsert {
                 project_ident: project,
-                kind: "documentation",
+                kind: "spec",
                 subkind: None,
                 title: "purge fixture",
                 labels,
@@ -16255,7 +13722,7 @@ mod tests {
             &conn,
             &WorkflowRunInsert {
                 artifact_id: &_artifact,
-                workflow_kind: "doc_publish",
+                workflow_kind: "spec_task_generation",
                 phase: None,
                 round_id: None,
                 coordinator_actor_id: &actor,
@@ -16464,7 +13931,7 @@ mod tests {
             &conn,
             &WorkflowRunInsert {
                 artifact_id: &artifact,
-                workflow_kind: "doc_publish",
+                workflow_kind: "spec_task_generation",
                 phase: None,
                 round_id: None,
                 coordinator_actor_id: &actor,
@@ -16516,7 +13983,7 @@ mod tests {
             &conn,
             &WorkflowRunInsert {
                 artifact_id: &artifact,
-                workflow_kind: "doc_publish",
+                workflow_kind: "spec_task_generation",
                 phase: None,
                 round_id: None,
                 coordinator_actor_id: &actor,

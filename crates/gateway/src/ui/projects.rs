@@ -185,7 +185,6 @@ struct OverviewTemplate {
     agent_updates_open: i64,
     todo: i64,
     done: i64,
-    doc_count: i64,
     memory_count: i64,
     in_progress: Vec<TaskRow>,
     artifacts: Vec<ArtifactRow>,
@@ -242,7 +241,6 @@ pub async fn project_overview_page(
         agent_updates_open: ov.agent_updates_open,
         todo: ov.stats.todo_count,
         done: ov.stats.done_count,
-        doc_count: ov.stats.api_doc_count,
         memory_count: ov.stats.memory_count,
         in_progress: ov
             .in_progress

@@ -1,5 +1,9 @@
 # Artifact Substrate v1 Contract
 
+> Gateway-backed API and agent documentation are retired. Historical references
+> to documentation artifacts, publication, retrieval, export, or migration are
+> obsolete. The supported artifact workflows are specs and design reviews.
+
 **Status:** Draft contract (Phase 1, gateway-features_spec T002)
 **Audience:** gateway backend implementers (T003, T005, T006, T007, T009, T010, T011), CLI/skill implementers (downstream tasks), reviewers
 **Source:** `gateway-features.md` (Core Concepts, Actor Model, Relationship To Existing Primitives, Versioning And Diffs, Search And Retrieval, Rollout), `docs/artifacts-api-docs-integration.md` (T001 decision)

@@ -171,6 +171,15 @@ def main():
         for name in ['alpha','beta']:
             api("/v1/projects",{"ident":name})
             api("/v1/projects",{"ident":name,"repo_url":f"git@github.com:fixture/{name}.git"})
+        for suffix in ['', '/chunks', '/hierarchy', '/retired-id']:
+            rejected(404, '/v1/projects/alpha/api-docs'+suffix, None, 'GET')
+        rejected(404, '/v1/projects/alpha/api-docs', {}, 'POST')
+        for page in ['/documentation', '/api-docs', '/projects/alpha/documentation', '/projects/alpha/api-docs', '/projects/alpha/documentation/retired-id']:
+            assert browser_status(page, 'admin')[0] == 404, page
+        status, overview = browser_status('/projects/alpha', 'admin')
+        assert status == 200 and '/documentation' not in overview and '/api-docs' not in overview
+        rejected(400, '/v1/projects/alpha/artifacts', {'kind':'documentation','title':'Retired docs'}, 'POST',
+            headers={'X-Agent-System':'codex','Idempotency-Key':'retired-docs'})
         api("/v1/projects/alpha/tasks",{"title":"Preexisting task"})
         client,hello=subscribe("fixture-cmux")
         assert hello["cursor"]==api("/v1/task-events")[0]["id"]

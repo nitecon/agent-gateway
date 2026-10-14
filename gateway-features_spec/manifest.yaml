@@ -10,28 +10,10 @@ phases:
     name: "Phase 1 - Contracts and Production Boundaries"
     description: "Set the decisions that gate schema/API work: documentation integration, body model, permissions, provenance, idempotency, and operating envelope."
     tasks:
-      - id: T001
-        team: docs
-        title: "Resolve API docs integration strategy"
-        depends_on: []
-        spec_file: docs/T001-api-docs-integration-strategy.md
-        acceptance_criteria:
-          - "Decision document states whether current API docs become artifact-backed docs or remain a separate resource family with equivalent guarantees."
-          - "Decision explicitly maps current API doc IDs, chunks, comments, and versions to the chosen artifact/docs model."
-          - "Decision identifies the canonical agent retrieval path for docs during and after migration."
-          - "Decision lists compatibility requirements for existing `agent-tools docs` commands."
-          - "Open questions from `gateway-features.md` about docs export and source-adjacent repository docs are answered or deferred with owners."
-        touch_surface:
-          - docs/artifacts-api-docs-integration.md
-          - README.md
-        gateway_task_id: 019e1d6b-6f63-7b32-856d-24893cf89b56
-        status: done
-        notes: |
-          Prior review converged that this decision should happen before artifact schema or client work hardens.
       - id: T002
         team: backend
         title: "Define artifact substrate v1 contract"
-        depends_on: [T001]
+        depends_on: []
         spec_file: backend/T002-artifact-substrate-contract.md
         acceptance_criteria:
           - "Contract defines artifacts, immutable artifact versions, contributions, comments, links, actors, and workflow runs/activities."
@@ -462,30 +444,6 @@ phases:
         status: done
         notes: |
           Completed in serialized wave after T009. Implemented design-review artifact workflow primitives: create review artifact, start review rounds, record pass 1/pass 2 contributions, synthesis with optional new artifact version, state transitions, and analyst retrieval filters by round/phase/role/reviewed version/read set. Validation passed: cargo test -p gateway (72 passed; 0 failed) and cargo clippy -p gateway --all-targets -- -D warnings.
-      - id: T011
-        team: backend
-        title: "Integrate project documentation artifacts and chunks"
-        depends_on: [T001, T007, T008, T024, T030]
-        spec_file: backend/T011-project-documentation-artifacts.md
-        gateway_task_id: 019e2232-cc1f-7572-b69f-d18f8ce02198
-        acceptance_criteria:
-          - "Documentation publishing follows the T001 decision and writes artifact-backed docs with API-doc compatibility behavior."
-          - "Chunks reference immutable artifact or docs versions and expose whether retrieval searches current versions only or history."
-          - "Existing generated API-doc chunks migrate to artifact-backed chunks anchored by immutable artifact_version_id plus stable child_address, with tests for current-version-only and history-aware retrieval."
-          - "API context documentation artifacts carry the T004 `retain:permanent` behavior unless an explicit operator override is documented."
-          - "Documentation retrieval exposes exact `chunking_status=partial` behavior for stale or failed chunks and includes `manifest.chunk_count` in structured payloads for restore validation."
-          - "Docs workflow implements the T004 Phase 3 API-doc/read-source migration and rollback behavior without breaking legacy API-doc reads."
-          - "Existing API docs endpoints continue working during migration or return documented compatibility redirects/aliases."
-          - "Legacy api_docs.kind remains a response/filter field with current semantics; it is not collapsed into artifact kind=documentation or subkind=api_context."
-          - "Docs can link to specs, tasks, patterns, and source repository refs."
-          - "Tests cover chunk source immutability, docs search behavior, and compatibility for existing `api-docs` handlers."
-        touch_surface:
-          - crates/gateway/src/db.rs
-          - crates/gateway/src/routes.rs
-          - README.md
-        status: done
-        notes: |
-          Completed in serialized wave after T010. Implemented artifact-backed API-doc compatibility while preserving legacy api_docs.kind/filter semantics, reused artifact chunks for immutable documentation versions, added current/history retrieval and partial/stale chunking status, included manifest.chunk_count for restore validation, and documented docs workflow behavior in README. Validation passed: cargo test -p gateway (75 passed; 0 failed) and cargo clippy -p gateway --all-targets -- -D warnings.
   - id: phase-4
     name: "Phase 4 - Workspace UI, Agent Context, and Release Readiness"
     description: "Expose artifacts to humans and agents, publish agent-native docs, and validate rollout."
@@ -493,7 +451,7 @@ phases:
       - id: T012
         team: frontend
         title: "Add artifact workspace UI"
-        depends_on: [T007, T009, T010, T011]
+        depends_on: [T007, T009, T010]
         spec_file: frontend/T012-artifact-workspace-ui.md
         gateway_task_id: 019e2232-fcd5-7e82-ae0f-fca6ce7ad1f0
         acceptance_criteria:
@@ -510,31 +468,10 @@ phases:
         status: done
         notes: |
           Completed after T009/T010/T011. Added server-rendered artifact workspace UI: /artifacts index, /projects/{ident}/artifacts filtered workspace, /projects/{ident}/artifacts/{artifact_id} detail view, sidebar navigation, and route shape coverage. Detail pages show version history/diff, spec manifest rows, design review contribution/read-set rows, documentation chunk search/history controls, comments, contributions, and links. Validation passed: cargo test -p gateway control_panel_nav_exposes_artifacts, cargo test -p gateway artifact_workspace_pages_show_operational_sections, cargo test -p gateway (77 tests), cargo clippy -p gateway --all-targets -- -D warnings, and browser smoke on http://127.0.0.1:7914/artifacts with a seeded artifact.
-      - id: T013
-        team: docs
-        title: "Publish agent-native API context for artifact workflows"
-        depends_on: [T007, T009, T010, T011]
-        spec_file: docs/T013-artifact-api-agent-context.md
-        gateway_task_id: 019e2232-fccc-7483-b3d4-cfc363d1988e
-        acceptance_criteria:
-          - "Existing agent-gateway API context is updated or intentionally replaced without creating a duplicate app/context entry."
-          - "`.agent/api/gateway.yaml` or equivalent agent API context document describes artifact, review, spec, and docs workflows."
-          - "Docs export behavior is specified, including `agent-tools docs export`, manifest/source path format, accepted-version selection, and overwrite-vs-propose conflict policy."
-          - "`agent-tools docs validate --file .agent/api/gateway.yaml` or the chosen existing-context file passes."
-          - "`agent-tools docs publish --file .agent/api/gateway.yaml` or the chosen existing-context file has been run or is captured as a release-blocking manual step."
-          - "Published context includes auth expectations, idempotency examples, provenance fields, safety constraints, schemas, and copyable curl examples."
-          - "`agent-tools docs search` and `agent-tools docs chunks` can retrieve artifact workflow context after publish."
-          - "README points agents to gateway API docs before code search for artifact behavior."
-        touch_surface:
-          - README.md
-          - .agent/api/agent-gateway.yaml
-        status: done
-        notes: |
-          Completed after T009/T010/T011. Updated existing .agent/api/agent-gateway.yaml with generic artifact, spec, design-review, and artifact-backed docs workflows; auth/idempotency/provenance contract; route families; copyable examples; schemas; safety guidance; and docs export policy. Updated README to direct agents to the API context before code search. Republished the context as 019e23b8-712a-7130-816b-6cab947c1544 and deleted stale duplicate context rows. Validation passed: agent-tools docs validate --file .agent/api/agent-gateway.yaml, agent-tools docs publish --file .agent/api/agent-gateway.yaml, agent-tools docs search "artifact workflow", agent-tools docs chunks --query "artifact" --app agent-gateway, cargo test -p gateway (79 tests), and cargo clippy -p gateway --all-targets -- -D warnings.
       - id: T015
         team: docs
         title: "Coordinate client and skill migration to artifact IDs"
-        depends_on: [T009, T010, T011, T013]
+        depends_on: [T009, T010]
         spec_file: docs/T015-client-skill-migration.md
         gateway_task_id: 019e2232-fcd0-7b41-8dd9-787a9c9c0d08
         acceptance_criteria:
@@ -553,7 +490,7 @@ phases:
       - id: T014
         team: qa
         title: "Validate rollout, migration, and rollback readiness"
-        depends_on: [T009, T010, T011, T012, T013, T015]
+        depends_on: [T009, T010, T012, T015]
         spec_file: qa/T014-rollout-migration-rollback-validation.md
         gateway_task_id: 019e2232-fcd3-76f1-b0fa-f9066490014d
         acceptance_criteria:

@@ -118,11 +118,6 @@ impl ProjectNav<'_> {
                 format!("/projects/{ident}/artifacts"),
             ),
             (
-                "documentation",
-                "Documentation",
-                format!("/projects/{ident}/documentation"),
-            ),
-            (
                 "memories",
                 "Memories",
                 format!("/projects/{ident}/memories"),
@@ -159,7 +154,7 @@ fn nav_key(active: &str) -> &'static str {
     match active {
         "home" | "dashboard" => "home",
         "activity" => "activity",
-        "projects" | "documentation" | "api-docs" | "memories" | "artifacts" => "projects",
+        "projects" | "memories" | "artifacts" => "projects",
         "tasks" => "tasks",
         "patterns" => "patterns",
         "skills" => "skills",
@@ -204,7 +199,7 @@ pub fn control_panel_head(title: &str, theme: &str, extra: &str) -> String {
 
 /// Open the control-panel body up to the start of `<main class="app-content">`
 /// for a global (non-project) page. `active` selects the highlighted sidebar
-/// entry; legacy keys such as `"dashboard"` and `"documentation"` still work.
+/// entry; legacy keys such as `"dashboard"` and `"memories"` still work.
 pub fn control_panel_open(page_title: &str, active: &str) -> String {
     ShellOpen {
         page_title,
@@ -267,7 +262,7 @@ mod tests {
 
     #[test]
     fn global_shell_highlights_mapped_nav_entry() {
-        let html = control_panel_open("Documentation", "documentation");
+        let html = control_panel_open("Memories", "memories");
         assert!(html.contains(r#"<a href="/projects" class="nd-active">Projects</a>"#));
         assert!(!html.contains("gw-tabs"));
         let home = control_panel_open("Home", "dashboard");

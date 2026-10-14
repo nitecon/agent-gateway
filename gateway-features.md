@@ -1,5 +1,9 @@
 # Gateway Features Vision
 
+> Gateway-backed API and agent documentation are retired. Historical references
+> to documentation artifacts, publication, retrieval, export, or migration are
+> obsolete. The supported artifact workflows are specs and design reviews.
+
 ## Summary
 
 agent-gateway is evolving from a communication hub into the shared workspace

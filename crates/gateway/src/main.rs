@@ -648,24 +648,6 @@ async fn main() -> Result<()> {
             post(routes::restore_project),
         )
         .route(
-            "/v1/projects/{ident}/api-docs",
-            get(routes::list_api_docs_handler).post(routes::create_api_doc_handler),
-        )
-        .route(
-            "/v1/projects/{ident}/api-docs/chunks",
-            get(routes::list_api_doc_chunks_handler),
-        )
-        .route(
-            "/v1/projects/{ident}/api-docs/hierarchy",
-            get(routes::api_doc_hierarchy_handler),
-        )
-        .route(
-            "/v1/projects/{ident}/api-docs/{id}",
-            get(routes::get_api_doc_handler)
-                .patch(routes::update_api_doc_handler)
-                .delete(routes::delete_api_doc_handler),
-        )
-        .route(
             "/v1/projects/{ident}/memories",
             get(routes::list_memories_handler).post(routes::push_memories_handler),
         )
@@ -824,8 +806,6 @@ async fn main() -> Result<()> {
             "/projects/{ident}/settings",
             get(ui::projects::project_settings_page),
         )
-        .route("/documentation", get(routes::api_docs_index_page))
-        .route("/api-docs", get(routes::api_docs_index_page))
         .route("/artifacts", get(routes::artifacts_index_page))
         .route("/memories", get(routes::memories_index_page))
         .route("/projects/{ident}/memories", get(routes::memories_page))
@@ -836,19 +816,6 @@ async fn main() -> Result<()> {
         .route(
             "/projects/{ident}/artifacts/{artifact_id}",
             get(routes::artifact_detail_page),
-        )
-        .route(
-            "/projects/{ident}/documentation",
-            get(routes::api_docs_page),
-        )
-        .route("/projects/{ident}/api-docs", get(routes::api_docs_page))
-        .route(
-            "/projects/{ident}/documentation/{id}",
-            get(routes::api_doc_detail_page),
-        )
-        .route(
-            "/projects/{ident}/api-docs/{id}",
-            get(routes::api_doc_detail_page),
         )
         .route("/tasks", get(ui::tasks::tasks_index_page))
         .route("/activity", get(ui::activity::activity_page))

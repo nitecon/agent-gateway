@@ -39,7 +39,7 @@
       <a class="nd-text-xs" href="/projects/{{ ident }}/artifacts">All →</a></div>
     <div class="nd-card-body">
       {% if artifacts.is_empty() %}
-      <div class="gw-empty">No specs, reviews, or documentation artifacts yet.</div>
+      <div class="gw-empty">No specs or reviews yet.</div>
       {% else %}
       <ul class="gw-list">
         {% for a in artifacts %}
@@ -63,7 +63,6 @@
         <dt>Repository</dt><dd>{% if let Some(url) = repo_url %}<a href="{{ url }}" rel="noopener" target="_blank">{{ repo_full_name }}</a>{% else %}<span class="gw-muted">none</span>{% endif %}</dd>
         <dt>Kind</dt><dd>{{ kind }}</dd>
         <dt>Channel</dt><dd>{{ channel }}</dd>
-        <dt>Documentation</dt><dd><a href="/projects/{{ ident }}/documentation">{{ doc_count }} pages</a></dd>
         <dt>Memories</dt><dd><a href="/projects/{{ ident }}/memories">{{ memory_count }}</a></dd>
       </dl>
       {% if !links.is_empty() %}

@@ -1,5 +1,9 @@
 # Gateway UI Redesign Plan
 
+> Gateway-backed API and agent documentation are retired. Historical references
+> to documentation artifacts, publication, retrieval, export, or migration are
+> obsolete. The supported artifact workflows are specs and design reviews.
+
 Status: implemented on branch `ui-redesign` (2026-09-07). Companion to
 `gateway-features.md`, which owns the artifact substrate. This document owns
 the human-facing control panel.

@@ -295,120 +295,18 @@ The task detail response includes a server-derived `actions[]` array alongside
 
 To perform a transition, `PATCH` the task with the chosen `target_status`.
 
-### Agent API docs
-
-Project-scoped registry for agent-native API context. This is designed for
-apps that often do not have OpenAPI/Swagger yet: publish docs-first structured
-context directly, or import generated specs later as one source format.
-
-> **Compatibility note.** API docs are moving onto the shared artifact
-> substrate as a documentation artifact kind (`subkind = "api_context"`).
-> The routes and `agent-tools docs *` commands documented below remain the
-> canonical agent retrieval path and keep their current request/response
-> shape; the underlying storage is becoming artifact + immutable
-> artifact_version with version-anchored chunks, comments, and links.
-> Existing API doc IDs are preserved. See
-> [`docs/artifacts-api-docs-integration.md`](docs/artifacts-api-docs-integration.md)
-> for the full mapping, and
-> [`docs/artifact-operations-rollout.md`](docs/artifact-operations-rollout.md)
-> for the production size limits, quotas, retention, backup/restore,
-> metrics, migration phases, and rollback path that govern this
-> transition.
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/v1/projects/:ident/api-docs` | List API context summaries. Supports `q`, `app`, `label`, and `kind` query filters. |
-| `POST` | `/v1/projects/:ident/api-docs` | Publish a new API context document. Body includes `app`, `title`, `content`, optional `summary`, `kind`, `source_format`, `source_ref`, `version`, `labels`, and `author`. |
-| `GET` | `/v1/projects/:ident/api-docs/chunks` | Return RAG-ready chunks generated from stored context. Supports the same filters as list. |
-| `GET` | `/v1/projects/:ident/api-docs/:id` | Fetch one API context document with full JSON content. |
-| `PATCH` | `/v1/projects/:ident/api-docs/:id` | Update API context metadata or content. Nullable fields such as `summary`, `source_ref`, and `version` can be set to `null`. |
-| `DELETE` | `/v1/projects/:ident/api-docs/:id` | Delete one API context document. |
-
-API doc list/get responses keep the legacy `kind` field and `kind` filter
-semantics (`agent_context`, etc.). They also include additive artifact
-compatibility fields: `artifact_id`, `artifact_version_id`, `subkind`,
-`manifest_chunk_count`, `chunking_status`, and `linked_ids`.
-
-`GET /v1/projects/:ident/api-docs/chunks` still returns the legacy JSON array
-by default. Each chunk now also identifies its immutable source with
-`artifact_id`, `artifact_version_id`, `accepted_version_id`, `child_address`,
-`freshness` (`current`, `stale`, or `superseded_history`), and
-`retrieval_scope`. Default retrieval is current-version-only and excludes
-soft-superseded history. Pass `include_history=true` to include historical
-chunks, and pass `envelope=true` to receive `{chunks, chunking_status,
-retrieval_scope, include_history}` for restore/readiness checks. A partial or
-stale chunking state is surfaced explicitly instead of silently succeeding.
-
-Published API context versions store `structured_payload.manifest.chunk_count`
-so restore validation can compare regenerated `artifact_chunks` against the
-accepted immutable version. API context documentation artifacts carry
-`retain:permanent` by default.
-
-Docs can link through the artifact link model to specs (`target_kind:
-"artifact"` for spec artifacts), tasks (`"task"`), patterns (`"pattern"`), and
-repository refs. Source repository refs use `target_kind: "commit"` for commit
-SHAs or `target_kind: "external_url"` for repository paths/URLs until a
-first-class repository-path target kind exists.
-
-The canonical payload is agent context, not OpenAPI. OpenAPI/Swagger should be
-stored as `source_format: "openapi"` or `source_format: "swagger"` when it is
-available, but agents should prefer enriched fields that capture intent,
-workflows, auth expectations, safety constraints, cross-app relationships, and
-copyable examples.
-
-Example docs-first publish body:
-
-```json
-{
-  "app": "billing-api",
-  "title": "Billing API agent context",
-  "summary": "System of record for invoices and customer billing state.",
-  "kind": "agent_context",
-  "source_format": "agent_context",
-  "source_ref": ".agent/api/billing.yaml",
-  "version": "2026-04-28",
-  "labels": ["billing", "invoices"],
-  "content": {
-    "purpose": "Owns invoice state, invoice line items, and billing status.",
-    "workflows": [
-      {
-        "name": "Create invoice",
-        "steps": [
-          "Look up the customer by external_id",
-          "Create a draft invoice",
-          "Add line items",
-          "Finalize only after explicit user confirmation"
-        ]
-      }
-    ],
-    "auth": {
-      "type": "bearer",
-      "token_source": "project secret store"
-    },
-    "safety": {
-      "destructive_operations": ["void invoice", "finalize invoice"]
-    },
-    "relationships": [
-      {
-        "app": "crm",
-        "relationship": "CRM owns customer profile; billing owns invoice state."
-      }
-    ],
-    "endpoints": [
-      {
-        "method": "POST",
-        "path": "/v1/invoices",
-        "intent": "Create a draft invoice for an existing customer."
-      }
-    ]
-  }
-}
-```
-
 ### Generic artifacts
 
+Gateway-backed API and agent documentation are retired. The upgrade deletes
+legacy documentation and its artifact versions, chunks, links, and publication
+runs in one transaction, preserving specs, reviews, tasks, patterns, actors, and
+memory. Documentation routes are removed. Deploy the new binary before applying
+the startup migration; older binaries depend on the legacy table. The migration
+is idempotent and rejects references from retained records instead of deleting
+them. Historical feature plans below do not reinstate documentation support.
+
 The artifact substrate exposes immutable-version resources under
-`/v1/projects/:ident/artifacts`. The artifact API is always enabled.
+`/v1/projects/:ident/artifacts`. The artifact API supports `spec` and `design_review` containers with markdown bodies. The artifact API is always enabled.
 `GATEWAY_ARTIFACT_BODY_SCHEMA_ENABLED=false` can additionally disable
 structured-payload/body-format writes while preserving markdown writes and
 legacy fallbacks.
@@ -511,7 +409,7 @@ hosts. Pages never embed the API key.
 | `/projects/:ident` | Project overview: inbox counts, in-progress tasks, recent artifacts, links, agents, activity. |
 | `/projects/:ident/inbox` | Threaded conversation view: filter by author kind (conversation, humans, agents, alerts, system) and state; read a thread; reply from the browser (posted to the channel and to every agent's unread queue); resolve one or many threads. |
 | `/projects/:ident/tasks` | Kanban board (todo / in progress / done, drag-and-drop). `/tasks` shows the same board with a project switcher, and `/projects/:ident/tasks/:id` is the task detail. `/task-link/:prefix` redirects to the detail page. |
-| `/projects/:ident/artifacts`, `/documentation`, `/memories` | Existing artifact, documentation, and memory views inside the project tab strip. |
+| `/projects/:ident/artifacts`, `/projects/:ident/memories` | Artifact and memory views inside the project tab strip. |
 | `/projects/:ident/settings` | Identity, repository mapping, channel room, external links (CI, runbooks), archive. |
 | `/patterns`, `/skills`, `/commands`, `/agents` | Library pages (unchanged). |
 | `/settings` | Gateway-level: your account and password, user management (admins), version, channel plugins, retention windows, theme. |
@@ -531,7 +429,7 @@ are preserved; unfinished legacy executions become `retired` without resuming
 work. cmux clients must implement the new stream subscription protocol; the old
 `/v1/execution/connect` assignment protocol is removed.
 
-See [task-stream.yaml](.agent/api/task-stream.yaml) for the wire contract and
+See [task_events.rs](crates/gateway/src/task_events.rs) for the wire contract and
 `cargo build -p gateway && python3 crates/gateway/tests/task_stream_smoke.py` for an
 isolated real-WebSocket lifecycle, replay, authentication and migration smoke.
 The smoke runs in CI and launches no real agents.
