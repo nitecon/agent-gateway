@@ -48,6 +48,26 @@ enum Command {
         #[command(subcommand)]
         action: UserCommand,
     },
+    /// Local operator recovery for orphaned task claims (requires database access)
+    Task {
+        #[command(subcommand)]
+        action: TaskCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum TaskCommand {
+    /// Inspect a claim and obtain its optimistic concurrency token.
+    ClaimInfo { project: String, task_id: String },
+    /// Return an inspected orphaned claim to TODO and record the reason.
+    Recover {
+        project: String,
+        task_id: String,
+        #[arg(long)]
+        expected_claim: String,
+        #[arg(long)]
+        reason: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -268,6 +288,9 @@ async fn main() -> Result<()> {
 
     if let Some(Command::User { action }) = &cli.command {
         return run_user_command(action);
+    }
+    if let Some(Command::Task { action }) = &cli.command {
+        return run_task_command(action);
     }
 
     if let Some(Command::Update) = cli.command {
@@ -866,6 +889,38 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
 
+    Ok(())
+}
+
+/// `gateway task …`: explicit operator recovery against the configured database.
+fn run_task_command(action: &TaskCommand) -> Result<()> {
+    let config = db::DatabaseConfig::from_env().context("load database config")?;
+    let database = db::open_config(&config)?;
+    let conn = database.lock().unwrap();
+    let task = match action {
+        TaskCommand::ClaimInfo { project, task_id } => {
+            db::get_task_detail(&conn, project, task_id)?
+                .ok_or_else(|| anyhow::anyhow!("task not found in project"))?
+                .task
+        }
+        TaskCommand::Recover {
+            project,
+            task_id,
+            expected_claim,
+            reason,
+        } => db::recover_task_claim(&conn, project, task_id, expected_claim, reason)?,
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "id": task.id,
+            "project_ident": task.project_ident,
+            "status": task.status,
+            "owner_agent_id": task.owner_agent_id,
+            "updated_at": task.updated_at,
+            "claim_token": db::task_claim_token(&task)?,
+        }))?
+    );
     Ok(())
 }
 

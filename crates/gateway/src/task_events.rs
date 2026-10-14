@@ -992,6 +992,199 @@ mod tests {
     }
 
     #[test]
+    fn operator_recovery_unblocks_orphan_without_impersonation_or_content_loss() {
+        let database = database();
+        let conn = database.lock().unwrap();
+        let original = task(&conn);
+        let unrelated = task(&conn);
+        let old_session = actor();
+        mutation(&conn, Some(&old_session), |conn| {
+            db::update_task(
+                conn,
+                "example",
+                &original.id,
+                &status_update("in_progress"),
+                Some("shared-machine"),
+            )
+        })
+        .unwrap();
+        db::insert_comment(&conn, &original.id, "worker", "agent", "Prior work remains").unwrap();
+        let before = db::get_task_detail(&conn, "example", &original.id)
+            .unwrap()
+            .unwrap();
+        let token = db::task_claim_token(&before.task).unwrap();
+        let recovered = db::recover_task_claim(
+            &conn,
+            "example",
+            &original.id,
+            &token,
+            "Owner confirmed crashed session",
+        )
+        .unwrap();
+        assert_eq!(recovered.status, "todo");
+        assert_eq!(recovered.owner_agent_id, None);
+        assert_eq!(recovered.owner_origin, None);
+        assert_eq!(recovered.started_at, None);
+        assert_eq!(recovered.done_at, None);
+        assert_eq!(recovered.title, before.task.title);
+        assert_eq!(recovered.description, before.task.description);
+        assert_eq!(recovered.details, before.task.details);
+        assert_eq!(recovered.labels, before.task.labels);
+        assert_eq!(recovered.rank, before.task.rank);
+        let detail = db::get_task_detail(&conn, "example", &original.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.comments.len(), before.comments.len() + 1);
+        assert!(detail
+            .comments
+            .iter()
+            .any(|c| c.id == before.comments[0].id && c.content == "Prior work remains"));
+        let audit = detail
+            .comments
+            .iter()
+            .find(|c| c.author == "gateway-admin")
+            .unwrap();
+        assert_eq!(audit.author_type, "system");
+        assert_eq!(audit.origin, None);
+        assert!(audit.content.contains("Owner confirmed crashed session"));
+        assert!(audit.content.contains(&old_session.session_id));
+        assert_eq!(
+            db::get_task_detail(&conn, "example", &unrelated.id)
+                .unwrap()
+                .unwrap()
+                .task
+                .status,
+            "todo"
+        );
+        let mut current_session = actor();
+        current_session.session_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc".into();
+        let claimed = mutation(&conn, Some(&current_session), |conn| {
+            db::update_task(
+                conn,
+                "example",
+                &original.id,
+                &status_update("in_progress"),
+                Some("shared-machine"),
+            )
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(claimed.owner_origin, Some(current_session));
+        assert_eq!(current_origin(&conn).unwrap(), None);
+    }
+
+    #[test]
+    fn operator_recovery_rejects_changed_claim_and_preserves_live_owner_checks() {
+        let database = database();
+        let conn = database.lock().unwrap();
+        let original = task(&conn);
+        let old_session = actor();
+        let before = mutation(&conn, Some(&old_session), |conn| {
+            db::update_task(
+                conn,
+                "example",
+                &original.id,
+                &status_update("in_progress"),
+                Some("shared-machine"),
+            )
+        })
+        .unwrap()
+        .unwrap();
+        let token = db::task_claim_token(&before).unwrap();
+        mutation(&conn, Some(&old_session), |conn| {
+            db::update_task(
+                conn,
+                "example",
+                &original.id,
+                &status_update("todo"),
+                Some("shared-machine"),
+            )
+        })
+        .unwrap();
+        let mut live_session = actor();
+        live_session.session_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc".into();
+        mutation(&conn, Some(&live_session), |conn| {
+            db::update_task(
+                conn,
+                "example",
+                &original.id,
+                &status_update("in_progress"),
+                Some("shared-machine"),
+            )
+        })
+        .unwrap();
+        // A changed owner is protected even when updates share a millisecond.
+        conn.execute(
+            "UPDATE tasks SET updated_at=?1 WHERE id=?2",
+            params![before.updated_at, original.id],
+        )
+        .unwrap();
+        let err =
+            db::recover_task_claim(&conn, "example", &original.id, &token, "Stale inspection")
+                .unwrap_err();
+        assert!(err.to_string().contains("task claim changed"));
+        assert!(db::recover_task_claim(
+            &conn,
+            "wrong-project",
+            &original.id,
+            &token,
+            "Wrong project"
+        )
+        .is_err());
+        assert!(db::recover_task_claim(&conn, "example", &original.id, &token, " ").is_err());
+        for status in ["todo", "in_progress", "done"] {
+            let err = mutation(&conn, Some(&old_session), |conn| {
+                db::update_task(
+                    conn,
+                    "example",
+                    &original.id,
+                    &status_update(status),
+                    Some("shared-machine"),
+                )
+            })
+            .unwrap_err();
+            assert!(err.downcast_ref::<OwnershipConflict>().is_some());
+        }
+        let detail = db::get_task_detail(&conn, "example", &original.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.task.owner_origin, Some(live_session.clone()));
+        assert_eq!(detail.task.status, "in_progress");
+        assert!(detail.comments.is_empty());
+        mutation(&conn, Some(&live_session), |conn| {
+            db::update_task(
+                conn,
+                "example",
+                &original.id,
+                &status_update("done"),
+                Some("shared-machine"),
+            )
+        })
+        .unwrap();
+        let done = db::get_task_detail(&conn, "example", &original.id)
+            .unwrap()
+            .unwrap()
+            .task;
+        assert!(db::recover_task_claim(
+            &conn,
+            "example",
+            &original.id,
+            &db::task_claim_token(&done).unwrap(),
+            "Cannot recover done task"
+        )
+        .is_err());
+        assert_eq!(
+            db::get_task_detail(&conn, "example", &original.id)
+                .unwrap()
+                .unwrap()
+                .task
+                .status,
+            "done"
+        );
+        assert_eq!(current_origin(&conn).unwrap(), None);
+    }
+
+    #[test]
     fn lifecycle_snapshots_are_atomic_and_survive_task_deletion() {
         let database = database();
         let conn = database.lock().unwrap();

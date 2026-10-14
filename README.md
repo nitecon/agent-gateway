@@ -262,8 +262,8 @@ Lifecycle events and comments expose optional `origin` with `session_id`,
 actor independently of the latest comment author. Automatic delegated source
 result comments and completion retain the target worker's origin and commit
 atomically with target completion. The protocol-v1 broadcast and receipt
-contract is unchanged; see `.agent/api/task-stream.yaml` for the authoritative
-extension and availability notes.
+contract is unchanged; see [task_events.rs](crates/gateway/src/task_events.rs)
+for the wire contract.
 
 Two background reconciliations run on every list and detail read:
 
@@ -294,6 +294,35 @@ The task detail response includes a server-derived `actions[]` array alongside
 | `done` | `Reopen` (secondary) → `todo` |
 
 To perform a transition, `PATCH` the task with the chosen `target_status`.
+
+#### Operator recovery of an orphaned claim
+
+A crashed session or a change from legacy to native actor registration can
+leave a claim whose exact owner can no longer release it. Comments from a
+replacement session count as activity, so they delay automatic stale reclaim.
+The gateway does not infer that an owner died from missing CMUX membership or
+a disconnected client, and an ordinary agent cannot override another session.
+
+An authorized local operator with access to the gateway database can inspect
+and recover a confirmed orphan. This uses the same local administration
+boundary as `gateway user`; the shared bearer API does not expose recovery.
+
+```bash
+gateway task claim-info starxapi <task-id>
+gateway task recover starxapi <task-id> \
+  --expected-claim <claim_token-from-inspection> \
+  --reason "Owner confirmed that the previous session is no longer available"
+```
+
+Use the server's `DATABASE_PATH`/database configuration when running these
+commands. The token is an opaque snapshot guard, not an identity or permission.
+If the claim or task activity changed since inspection, recovery refuses to
+proceed; inspect and assess the current owner again. Recovery requires a reason
+and an `in_progress` task, atomically clears its owner/session/start time,
+returns it to `todo`, and adds a system audit comment with the previous claim.
+It preserves specifications, previous comments, and delegation links. The
+replacement session then uses ordinary `agent-tools tasks claim`. No old UUIDs
+or launch/configuration identity overrides are needed.
 
 ### Generic artifacts
 

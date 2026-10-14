@@ -8572,6 +8572,71 @@ pub fn find_task_by_spec_source(
     Ok(rows.next().transpose()?)
 }
 
+/// An opaque snapshot guard, not an actor identity or authorization token.
+pub fn task_claim_token(task: &Task) -> Result<String> {
+    let snapshot = serde_json::to_vec(&(
+        &task.id,
+        &task.project_ident,
+        &task.status,
+        &task.owner_agent_id,
+        &task.owner_origin,
+        task.started_at,
+        task.updated_at,
+    ))?;
+    Ok(hex::encode(Sha256::digest(snapshot)))
+}
+
+/// Local operator recovery only. Deliberately not exposed to bearer-authenticated
+/// agent requests: ordinary updates retain exact session ownership checks.
+pub fn recover_task_claim(
+    conn: &Connection,
+    project_ident: &str,
+    task_id: &str,
+    expected_claim: &str,
+    reason: &str,
+) -> Result<Task> {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        bail!("claim recovery requires a reason");
+    }
+    crate::task_events::mutation(conn, None, |conn| {
+        let before = get_task_detail(conn, project_ident, task_id)?
+            .ok_or_else(|| anyhow::anyhow!("task not found in project"))?
+            .task;
+        if before.status != "in_progress" {
+            bail!("only in-progress task claims can be recovered");
+        }
+        if task_claim_token(&before)? != expected_claim {
+            bail!("task claim changed; inspect it again before recovering");
+        }
+        let update = TaskUpdate {
+            status: Some("todo"),
+            owner_agent_id: Some(None),
+            rank: None,
+            title: None,
+            description: None,
+            details: None,
+            labels: None,
+            hostname: None,
+        };
+        update_task_inner(conn, project_ident, task_id, &update, None, false)?;
+        insert_comment(
+            conn,
+            task_id,
+            "gateway-admin",
+            "system",
+            &format!(
+                "Claim recovered by local gateway operator. Reason: {reason}\nPrevious owner: {}\nPrevious session origin: {}\nTask returned to TODO; verify prior progress before claiming.",
+                before.owner_agent_id.as_deref().unwrap_or("(none)"),
+                serde_json::to_string(&before.owner_origin)?,
+            ),
+        )?;
+        Ok(get_task_detail(conn, project_ident, task_id)?
+            .ok_or_else(|| anyhow::anyhow!("task not found in project"))?
+            .task)
+    })
+}
+
 /// Apply a partial update to a task, enforcing status-transition side effects
 /// (auto-set `started_at`/`owner_agent_id` on todo→in_progress, `done_at` on
 /// `* → done`, clearing of timestamps on reverse transitions, etc.). Returns

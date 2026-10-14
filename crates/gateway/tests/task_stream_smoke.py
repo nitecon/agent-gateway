@@ -180,6 +180,30 @@ def main():
         assert status == 200 and '/documentation' not in overview and '/api-docs' not in overview
         rejected(400, '/v1/projects/alpha/artifacts', {'kind':'documentation','title':'Retired docs'}, 'POST',
             headers={'X-Agent-System':'codex','Idempotency-Key':'retired-docs'})
+        # Explicit local operator recovery preserves normal API session fencing.
+        orphan = api('/v1/projects/alpha/tasks', {'title':'Orphan recovery fixture','specification':'Preserved work'})
+        path = '/v1/projects/alpha/tasks/'+orphan['id']
+        api(path, {'status':'in_progress'}, 'PATCH', origin=WORKER)
+        for status in ['todo','in_progress','done']:
+            rejected(409, path, {'status':status}, origin=REQUESTER)
+        def claim_info():
+            result = subprocess.run([binary,'task','claim-info','alpha',orphan['id']], env=env, check=True, capture_output=True, text=True)
+            return json.loads(result.stdout)
+        def recover_claim(token):
+            return subprocess.run([binary,'task','recover','alpha',orphan['id'],'--expected-claim',token,'--reason','Fixture owner confirmed crashed session'], env=env, capture_output=True, text=True)
+        stale = claim_info()['claim_token']
+        api(path, {'title':'Owner activity after inspection'}, 'PATCH', origin=WORKER)
+        refused = recover_claim(stale)
+        assert refused.returncode != 0 and 'task claim changed' in refused.stderr
+        recovered = recover_claim(claim_info()['claim_token'])
+        assert recovered.returncode == 0, recovered.stderr
+        detail = api(path)
+        assert detail['status']=='todo' and detail['owner_origin'] is None and detail['owner_agent_id'] is None
+        assert detail['specification']=='Preserved work'
+        assert any(c['author']=='gateway-admin' and c['author_type']=='system' and c['origin'] is None for c in detail['comments'])
+        api(path, {'status':'in_progress'}, 'PATCH', origin=REQUESTER)
+        rejected(409, path, {'status':'todo'}, origin=WORKER)
+        api(path, {'status':'done'}, 'PATCH', origin=REQUESTER)
         api("/v1/projects/alpha/tasks",{"title":"Preexisting task"})
         client,hello=subscribe("fixture-cmux")
         assert hello["cursor"]==api("/v1/task-events")[0]["id"]
