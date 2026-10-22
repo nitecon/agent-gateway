@@ -1,0 +1,1577 @@
+//! Opt-in, credential-bound task dispatch. Legacy task headers remain provenance.
+use crate::{
+    db,
+    routes::AppError,
+    task_events::{self, AgentOrigin},
+    AppState,
+};
+use anyhow::Result;
+use axum::{
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode},
+    Json,
+};
+use rand_core::{OsRng, RngCore};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+
+const SESSION_TTL_MS: i64 = 120_000;
+
+#[derive(Debug)]
+pub struct Conflict(pub &'static str);
+impl std::fmt::Display for Conflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for Conflict {}
+
+pub fn initialize(conn: &Connection) -> Result<()> {
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS task_machines (
+        project_ident TEXT NOT NULL REFERENCES projects(ident), instance_id TEXT NOT NULL,
+        os TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, revoked INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(project_ident,instance_id)
+    );
+    CREATE TABLE IF NOT EXISTS task_sessions (
+        project_ident TEXT NOT NULL, instance_id TEXT NOT NULL, session_id TEXT NOT NULL,
+        origin_json TEXT NOT NULL, generation TEXT NOT NULL, session_key_hash TEXT NOT NULL, seen_at INTEGER NOT NULL,
+        PRIMARY KEY(project_ident,instance_id,session_id,generation),
+        FOREIGN KEY(project_ident,instance_id) REFERENCES task_machines(project_ident,instance_id)
+    );
+    CREATE TABLE IF NOT EXISTS task_dispatches (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(id), project_ident TEXT NOT NULL,
+        document_json TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS task_dispatch_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
+        project_ident TEXT NOT NULL, instance_id TEXT NOT NULL, session_id TEXT NOT NULL,
+        operation TEXT NOT NULL, authentication_json TEXT NOT NULL, document_json TEXT NOT NULL, created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS dispatch_recovery ON task_dispatch_events(project_ident,instance_id,id);
+    CREATE TABLE IF NOT EXISTS task_dispatch_requests (
+        project_ident TEXT NOT NULL, instance_id TEXT NOT NULL, session_id TEXT NOT NULL,
+        request_id TEXT NOT NULL, fingerprint TEXT NOT NULL, response_json TEXT NOT NULL,
+        PRIMARY KEY(project_ident,instance_id,session_id,request_id)
+    );")?;
+    Ok(())
+}
+
+fn uuid(value: &str) -> Result<String> {
+    Ok(uuid::Uuid::parse_str(value)?.to_string())
+}
+fn hash(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+/// Local operator provisioning only; never called by an HTTP registration.
+/// Reissuing revokes the previous key and expires leases, preserving session-secret fencing.
+pub fn provision(conn: &Connection, project: &str, instance: &str, os: &str) -> Result<String> {
+    let project = crate::projects::normalize_project_ident(project);
+    let instance = uuid(instance)?;
+    anyhow::ensure!(matches!(os, "linux" | "windows" | "macos"), "invalid OS");
+    anyhow::ensure!(
+        db::get_project(conn, &project)?.is_some(),
+        "project not found"
+    );
+    let mut secret = [0u8; 32];
+    OsRng.fill_bytes(&mut secret);
+    let key = hex::encode(secret);
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("INSERT INTO task_machines(project_ident,instance_id,os,key_hash) VALUES (?1,?2,?3,?4)
+        ON CONFLICT(project_ident,instance_id) DO UPDATE SET os=excluded.os,key_hash=excluded.key_hash,revoked=0",
+        params![project,instance,os,hash(&key)])?;
+    tx.execute(
+        "UPDATE task_sessions SET seen_at=0 WHERE project_ident=?1 AND instance_id=?2",
+        params![project, instance],
+    )?;
+    tx.commit()?;
+    Ok(key)
+}
+
+pub fn revoke(conn: &Connection, project: &str, instance: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE task_machines SET revoked=1 WHERE project_ident=?1 AND instance_id=?2",
+        params![
+            crate::projects::normalize_project_ident(project),
+            uuid(instance)?
+        ],
+    )?;
+    Ok(())
+}
+
+fn authenticate(
+    conn: &Connection,
+    project: &str,
+    headers: &HeaderMap,
+) -> Result<AgentOrigin, AppError> {
+    let origin = task_events::origin(headers)?.ok_or_else(|| {
+        AppError(
+            StatusCode::BAD_REQUEST,
+            "exact agent origin required".into(),
+        )
+    })?;
+    let keys = headers.get_all("x-gateway-machine-key");
+    let key = if keys.iter().count() == 1 {
+        keys.iter().next().and_then(|v| v.to_str().ok())
+    } else {
+        None
+    };
+    let Some(key) = key.filter(|key| key.len() == 64) else {
+        return Err(AppError(
+            StatusCode::UNAUTHORIZED,
+            "machine credential required".into(),
+        ));
+    };
+    let authenticated: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_machines
+        WHERE project_ident=?1 AND instance_id=?2 AND os=?3 AND key_hash=?4 AND revoked=0)",
+            params![project, origin.instance_id, origin.os, hash(key)],
+            |r| r.get(0),
+        )
+        .map_err(AppError::from)?;
+    if !authenticated {
+        return Err(AppError(
+            StatusCode::FORBIDDEN,
+            "machine credential does not authorize this project, instance and OS".into(),
+        ));
+    }
+    Ok(origin)
+}
+
+fn session_key(headers: &HeaderMap) -> Result<String, AppError> {
+    let values = headers.get_all("x-gateway-session-key");
+    if values.iter().count() != 1 {
+        return Err(AppError(
+            StatusCode::UNAUTHORIZED,
+            "one session credential required".into(),
+        ));
+    }
+    let key = values
+        .iter()
+        .next()
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| v.len() == 64 && hex::decode(v).is_ok())
+        .ok_or_else(|| {
+            AppError(
+                StatusCode::UNAUTHORIZED,
+                "session credential must be 32 random bytes encoded as hex".into(),
+            )
+        })?;
+    Ok(hash(key))
+}
+
+fn authenticate_session(
+    conn: &Connection,
+    project: &str,
+    actor: &AgentOrigin,
+    generation: &str,
+    headers: &HeaderMap,
+) -> Result<(), AppError> {
+    let key = session_key(headers)?;
+    let valid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM task_sessions WHERE project_ident=?1 AND instance_id=?2 AND session_id=?3 AND generation=?4 AND session_key_hash=?5)",
+        params![project,actor.instance_id,actor.session_id,generation,key],|r|r.get(0))?;
+    if !valid {
+        return Err(AppError(
+            StatusCode::FORBIDDEN,
+            "session credential/generation mismatch".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Target {
+    pub origin: AgentOrigin,
+    /// Immutable executor generation, distinct from the stable native conversation.
+    pub generation: String,
+}
+
+fn registered(conn: &Connection, project: &str, target: &Target, live: bool) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_sessions s JOIN task_machines m
+        ON m.project_ident=s.project_ident AND m.instance_id=s.instance_id
+        WHERE s.project_ident=?1 AND s.instance_id=?2 AND s.session_id=?3
+        AND s.origin_json=?4 AND s.generation=?5 AND m.revoked=0 AND m.os=?6
+        AND (?7=0 OR s.seen_at>=?8))",
+        params![
+            project,
+            target.origin.instance_id,
+            target.origin.session_id,
+            serde_json::to_string(&target.origin)?,
+            target.generation,
+            target.origin.os,
+            live,
+            db::now_ms() - SESSION_TTL_MS
+        ],
+        |r| r.get(0),
+    )?)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Register {
+    pub generation: String,
+}
+
+pub async fn register(
+    State(state): State<AppState>,
+    Path(project): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<Register>,
+) -> Result<Json<Value>, AppError> {
+    let project = crate::projects::normalize_project_ident(&project);
+    let generation = uuid(&req.generation)
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "generation must be a UUID".into()))?;
+    let conn = state.db.lock().unwrap();
+    let origin = authenticate(&conn, &project, &headers)?;
+    let key = session_key(&headers)?;
+    let existing: Option<(String,String,String)> = conn.query_row("SELECT origin_json,generation,session_key_hash FROM task_sessions WHERE project_ident=?1 AND instance_id=?2 AND session_id=?3 AND generation=?4",
+        params![project,origin.instance_id,origin.session_id,generation], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    let raw = serde_json::to_string(&origin)?;
+    if existing
+        .as_ref()
+        .is_some_and(|(o, g, k)| o != &raw || g != &generation || k != &key)
+    {
+        return Err(Conflict(
+            "session registration and credential are immutable within a generation",
+        )
+        .into());
+    }
+    let now = db::now_ms();
+    conn.execute("INSERT INTO task_sessions(project_ident,instance_id,session_id,origin_json,generation,session_key_hash,seen_at) VALUES (?1,?2,?3,?4,?5,?6,?7)
+        ON CONFLICT(project_ident,instance_id,session_id,generation) DO UPDATE SET seen_at=excluded.seen_at",
+        params![project,origin.instance_id,origin.session_id,raw,generation,key,now])?;
+    Ok(Json(
+        json!({"target":Target{origin,generation},"seen_at":now,"expires_at":now+SESSION_TTL_MS}),
+    ))
+}
+
+pub async fn sessions(
+    State(state): State<AppState>,
+    Path(project): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let project = crate::projects::normalize_project_ident(&project);
+    let conn = state.db.lock().unwrap();
+    authenticate(&conn, &project, &headers)?;
+    let mut stmt = conn.prepare("SELECT s.origin_json,s.generation,s.seen_at FROM task_sessions s JOIN task_machines m
+        ON m.project_ident=s.project_ident AND m.instance_id=s.instance_id
+        WHERE s.project_ident=?1 AND m.revoked=0 AND s.seen_at>=?2 ORDER BY s.instance_id,s.session_id")?;
+    let records = stmt
+        .query_map(params![project, db::now_ms() - SESSION_TTL_MS], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let records = records.into_iter().map(|(origin,generation,seen)| -> Result<Value> {
+        Ok(json!({"target":Target{origin:serde_json::from_str(&origin)?,generation},"seen_at":seen,"expires_at":seen+SESSION_TTL_MS}))
+    }).collect::<Result<Vec<_>>>()?;
+    Ok(Json(json!({"sessions":records})))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Dispatch {
+    pub task_id: String,
+    pub project_ident: String,
+    pub source_project_ident: String,
+    pub requester: Target,
+    pub target: Target,
+    pub required_os: Option<String>,
+    pub required_provider: Option<String>,
+    pub state: String,
+    pub claim_id: Option<String>,
+    pub received_at: Option<i64>,
+    pub claimed_at: Option<i64>,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    pub execution_id: Option<String>,
+    pub cancel_requested_at: Option<i64>,
+    pub cancel_reason: Option<String>,
+    pub result: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Delegate {
+    pub request_id: String,
+    pub generation: String,
+    pub target_project_ident: String,
+    pub target: Target,
+    pub title: String,
+    pub specification: String,
+    pub required_os: Option<String>,
+    pub required_provider: Option<String>,
+}
+
+fn eligible(
+    conn: &Connection,
+    project: &str,
+    target: &Target,
+    os: Option<&str>,
+    provider: Option<&str>,
+) -> Result<()> {
+    if !registered(conn, project, target, true)?
+        || os.is_some_and(|os| os != target.origin.os)
+        || provider.is_some_and(|p| p != target.origin.provider)
+    {
+        return Err(
+            Conflict("target is unavailable or ineligible for the required OS/provider").into(),
+        );
+    }
+    Ok(())
+}
+
+pub fn managed(conn: &Connection, task_id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_dispatches WHERE task_id=?1)",
+        [task_id],
+        |r| r.get(0),
+    )?)
+}
+
+fn load(conn: &Connection, project: &str, id: &str) -> Result<Dispatch> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT document_json FROM task_dispatches WHERE task_id=?2 AND (project_ident=?1 OR json_extract(document_json,'$.source_project_ident')=?1)",
+            params![project, id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(serde_json::from_str(
+        &raw.ok_or(Conflict("dispatch not found in project"))?,
+    )?)
+}
+
+fn save(
+    conn: &Connection,
+    dispatch: &Dispatch,
+    actor: &AgentOrigin,
+    auth_project: &str,
+    generation: &str,
+    operation: &str,
+) -> Result<Value> {
+    // These fields come from the provisioned server row, after credential validation.
+    let machine:Value=conn.query_row("SELECT project_ident,instance_id,os,key_hash FROM task_machines WHERE project_ident=?1 AND instance_id=?2 AND revoked=0",
+        params![auth_project,actor.instance_id],|r|Ok(json!({"project_ident":r.get::<_,String>(0)?,"instance_id":r.get::<_,String>(1)?,"os":r.get::<_,String>(2)?,"credential_id":r.get::<_,String>(3)?})))?;
+    let authentication = json!({"machine":machine,"session":actor,"generation":generation});
+    let raw = serde_json::to_string(dispatch)?;
+    conn.execute(
+        "INSERT INTO task_dispatches(task_id,project_ident,document_json) VALUES (?1,?2,?3)
+        ON CONFLICT(task_id) DO UPDATE SET document_json=excluded.document_json",
+        params![dispatch.task_id, dispatch.project_ident, raw],
+    )?;
+    conn.execute("INSERT INTO task_dispatch_events(task_id,project_ident,instance_id,session_id,operation,authentication_json,document_json,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![dispatch.task_id,dispatch.project_ident,actor.instance_id,actor.session_id,operation,serde_json::to_string(&authentication)?,raw,db::now_ms()])?;
+    let task = db::get_task_detail(conn, &dispatch.project_ident, &dispatch.task_id)?
+        .ok_or(Conflict("dispatch task missing"))?
+        .task;
+    Ok(json!({"dispatch":dispatch,"task":task,"authentication":authentication}))
+}
+
+/// Request uniqueness covers every operation for this exact authenticated actor.
+/// Persisted successful responses replay even when the session lease has expired.
+fn dedup(
+    conn: &Connection,
+    project: &str,
+    actor: &AgentOrigin,
+    request: &str,
+    fingerprint: &str,
+    apply: impl FnOnce(&Connection) -> Result<Value>,
+) -> Result<Value> {
+    let request = uuid(request).map_err(|_| Conflict("request_id must be a UUID"))?;
+    let prior: Option<(String, String)> = conn
+        .query_row(
+            "SELECT fingerprint,response_json FROM task_dispatch_requests
+        WHERE project_ident=?1 AND instance_id=?2 AND session_id=?3 AND request_id=?4",
+            params![project, actor.instance_id, actor.session_id, request],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if let Some((prior, response)) = prior {
+        if prior != fingerprint {
+            return Err(Conflict("request_id already used with different input").into());
+        }
+        return Ok(serde_json::from_str(&response)?);
+    }
+    let response = apply(conn)?;
+    conn.execute("INSERT INTO task_dispatch_requests(project_ident,instance_id,session_id,request_id,fingerprint,response_json) VALUES (?1,?2,?3,?4,?5,?6)",
+        params![project,actor.instance_id,actor.session_id,request,fingerprint,serde_json::to_string(&response)?])?;
+    Ok(response)
+}
+
+fn delegate(conn: &Connection, source: &str, actor: &AgentOrigin, req: &Delegate) -> Result<Value> {
+    let fingerprint = serde_json::to_string(&("delegate", actor, req))?;
+    task_events::mutation(conn, Some(actor), |conn| {
+        dedup(conn, source, actor, &req.request_id, &fingerprint, |conn| {
+            let requester = Target {
+                origin: actor.clone(),
+                generation: req.generation.clone(),
+            };
+            if !registered(conn, source, &requester, true)? {
+                return Err(Conflict("requester session is not registered/live").into());
+            }
+            let target_project =
+                crate::projects::normalize_project_ident(&req.target_project_ident);
+            eligible(
+                conn,
+                &target_project,
+                &req.target,
+                req.required_os.as_deref(),
+                req.required_provider.as_deref(),
+            )?;
+            if req.title.trim().is_empty()
+                || req.title.len() > 512
+                || req.specification.len() > 65536
+            {
+                return Err(Conflict("title/specification invalid or too large").into());
+            }
+            let task = db::insert_task(
+                conn,
+                &target_project,
+                req.title.trim(),
+                None,
+                Some(&req.specification),
+                &[],
+                None,
+                &actor.session_id,
+            )?;
+            let dispatch = Dispatch {
+                task_id: task.id,
+                project_ident: target_project,
+                source_project_ident: source.into(),
+                requester,
+                target: req.target.clone(),
+                required_os: req.required_os.clone(),
+                required_provider: req.required_provider.clone(),
+                state: "pending".into(),
+                claim_id: None,
+                received_at: None,
+                claimed_at: None,
+                started_at: None,
+                finished_at: None,
+                execution_id: None,
+                cancel_requested_at: None,
+                cancel_reason: None,
+                result: None,
+            };
+            save(conn, &dispatch, actor, source, &req.generation, "delegate")
+        })
+    })
+}
+
+pub async fn delegate_handler(
+    State(state): State<AppState>,
+    Path(project): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<Delegate>,
+) -> Result<Json<Value>, AppError> {
+    let project = crate::projects::normalize_project_ident(&project);
+    let database = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = database.lock().unwrap();
+        let actor = authenticate(&conn, &project, &headers)?;
+        authenticate_session(&conn, &project, &actor, &req.generation, &headers)?;
+        Ok(Json(delegate(&conn, &project, &actor, &req)?))
+    })
+    .await?
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Action {
+    pub request_id: String,
+    pub generation: String,
+    pub operation: String,
+    pub claim_id: Option<String>,
+    pub execution_id: Option<String>,
+    pub result: Option<String>,
+    pub target: Option<Target>,
+}
+
+fn terminal(state: &str) -> bool {
+    matches!(state, "succeeded" | "failed" | "cancelled")
+}
+
+fn action(
+    conn: &Connection,
+    project: &str,
+    id: &str,
+    actor: &AgentOrigin,
+    req: &Action,
+) -> Result<Value> {
+    let fingerprint = serde_json::to_string(&("action", id, actor, req))?;
+    task_events::mutation(conn, Some(actor), |conn| {
+        dedup(
+            conn,
+            project,
+            actor,
+            &req.request_id,
+            &fingerprint,
+            |conn| {
+                let mut dispatch = load(conn, project, id)?;
+                let caller = Target {
+                    origin: actor.clone(),
+                    generation: req.generation.clone(),
+                };
+                if !registered(conn, project, &caller, true)? {
+                    return Err(Conflict("caller session is not registered/live").into());
+                }
+                let is_target = dispatch.project_ident == project && dispatch.target == caller;
+                let is_requester =
+                    dispatch.source_project_ident == project && dispatch.requester == caller;
+                let active = matches!(dispatch.state.as_str(), "claimed" | "running");
+                if terminal(&dispatch.state) {
+                    return Err(Conflict("dispatch is terminal").into());
+                }
+                if !(is_target
+                    || is_requester
+                        && matches!(req.operation.as_str(), "cancel" | "request_cancel"))
+                {
+                    return Err(task_events::OwnershipConflict.into());
+                }
+                if active && req.claim_id.as_ref() != dispatch.claim_id.as_ref() {
+                    return Err(Conflict("exact current claim_id required").into());
+                }
+                if req.result.as_ref().is_some_and(|s| s.len() > 16384) {
+                    return Err(Conflict("result exceeds 16384 bytes").into());
+                }
+                let now = db::now_ms();
+                match req.operation.as_str() {
+                    "receive" if dispatch.state == "pending" => {
+                        dispatch.state = "received".into();
+                        dispatch.received_at = Some(now);
+                    }
+                    "claim" if dispatch.state == "received" => {
+                        eligible(
+                            conn,
+                            project,
+                            &caller,
+                            dispatch.required_os.as_deref(),
+                            dispatch.required_provider.as_deref(),
+                        )?;
+                        dispatch.state = "claimed".into();
+                        dispatch.claim_id = Some(uuid::Uuid::now_v7().to_string());
+                        dispatch.claimed_at = Some(now);
+                        conn.execute("UPDATE tasks SET status='in_progress',owner_agent_id=?1,owner_origin_json=?2,started_at=NULL,done_at=NULL,updated_at=?3 WHERE id=?4",
+                    params![actor.session_id,serde_json::to_string(actor)?,now,id])?;
+                    }
+                    "start"
+                        if dispatch.state == "claimed"
+                            && dispatch.cancel_requested_at.is_none() =>
+                    {
+                        let execution = req.execution_id.as_deref().ok_or(Conflict(
+                            "execution_id required for explicit executor start",
+                        ))?;
+                        dispatch.execution_id = Some(
+                            uuid(execution).map_err(|_| Conflict("execution_id must be a UUID"))?,
+                        );
+                        dispatch.state = "running".into();
+                        dispatch.started_at = Some(now);
+                        conn.execute(
+                            "UPDATE tasks SET started_at=?1,updated_at=?1 WHERE id=?2",
+                            params![now, id],
+                        )?;
+                    }
+                    "succeeded" | "failed" if dispatch.state == "running" => {
+                        if req.execution_id.as_ref() != dispatch.execution_id.as_ref() {
+                            return Err(Conflict("exact execution_id required").into());
+                        }
+                        if req.result.as_deref().is_none_or(|r| r.trim().is_empty()) {
+                            return Err(Conflict("explicit outcome result required").into());
+                        }
+                        dispatch.state = req.operation.clone();
+                        dispatch.result = req.result.clone();
+                        dispatch.finished_at = Some(now);
+                        conn.execute(
+                            "UPDATE tasks SET status='done',done_at=?1,updated_at=?1 WHERE id=?2",
+                            params![now, id],
+                        )?;
+                    }
+                    "request_cancel" if active => {
+                        if req.result.as_deref().is_none_or(|r| r.trim().is_empty()) {
+                            return Err(
+                                Conflict("explicit cancellation request reason required").into()
+                            );
+                        }
+                        dispatch.cancel_requested_at = Some(now);
+                        dispatch.cancel_reason = req.result.clone();
+                    }
+                    "cancel" if !active || is_target => {
+                        if dispatch.state == "running"
+                            && req.execution_id.as_ref() != dispatch.execution_id.as_ref()
+                        {
+                            return Err(Conflict(
+                                "exact execution_id required to confirm executor cancellation",
+                            )
+                            .into());
+                        }
+                        if req.result.as_deref().is_none_or(|r| r.trim().is_empty()) {
+                            return Err(Conflict("explicit cancellation reason required").into());
+                        }
+                        dispatch.state = "cancelled".into();
+                        dispatch.result = req.result.clone();
+                        dispatch.finished_at = Some(now);
+                        conn.execute(
+                            "UPDATE tasks SET status='done',done_at=?1,updated_at=?1 WHERE id=?2",
+                            params![now, id],
+                        )?;
+                    }
+                    "handoff" if is_target && dispatch.cancel_requested_at.is_none() => {
+                        let target = req
+                            .target
+                            .as_ref()
+                            .ok_or(Conflict("explicit handoff target required"))?;
+                        if target == &caller {
+                            return Err(Conflict(
+                                "handoff requires a different session/generation",
+                            )
+                            .into());
+                        }
+                        eligible(
+                            conn,
+                            project,
+                            target,
+                            dispatch.required_os.as_deref(),
+                            dispatch.required_provider.as_deref(),
+                        )?;
+                        if req.result.as_deref().is_none_or(|r| r.trim().is_empty()) {
+                            return Err(Conflict("handoff reason required").into());
+                        }
+                        // The event before reassignment preserves the previous claim and execution.
+                        save(
+                            conn,
+                            &dispatch,
+                            actor,
+                            project,
+                            &req.generation,
+                            "handoff_prior_claim",
+                        )?;
+                        dispatch.target = target.clone();
+                        dispatch.state = "pending".into();
+                        dispatch.claim_id = None;
+                        dispatch.received_at = None;
+                        dispatch.claimed_at = None;
+                        dispatch.started_at = None;
+                        dispatch.execution_id = None;
+                        dispatch.result = req.result.clone();
+                        conn.execute("UPDATE tasks SET status='todo',owner_agent_id=NULL,owner_origin_json=NULL,started_at=NULL,done_at=NULL,updated_at=?1 WHERE id=?2",params![now,id])?;
+                    }
+                    _ => {
+                        return Err(Conflict("invalid operation for current dispatch state").into())
+                    }
+                }
+                save(
+                    conn,
+                    &dispatch,
+                    actor,
+                    project,
+                    &req.generation,
+                    &req.operation,
+                )
+            },
+        )
+    })
+}
+
+pub async fn action_handler(
+    State(state): State<AppState>,
+    Path((project, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(req): Json<Action>,
+) -> Result<Json<Value>, AppError> {
+    let project = crate::projects::normalize_project_ident(&project);
+    let database = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = database.lock().unwrap();
+        let actor = authenticate(&conn, &project, &headers)?;
+        authenticate_session(&conn, &project, &actor, &req.generation, &headers)?;
+        Ok(Json(action(&conn, &project, &id, &actor, &req)?))
+    })
+    .await?
+}
+
+/// Recovery is read-only. It never transfers an old session's claim to a new one.
+pub async fn recovery(
+    State(state): State<AppState>,
+    Path(project): Path<String>,
+    Query(query): Query<Register>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let project = crate::projects::normalize_project_ident(&project);
+    let database = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn=database.lock().unwrap();
+        let actor=authenticate(&conn,&project,&headers)?;
+        authenticate_session(&conn,&project,&actor,&query.generation,&headers)?;
+        let caller=Target{origin:actor.clone(),generation:query.generation};
+        let mut stmt=conn.prepare("SELECT document_json FROM task_dispatches WHERE project_ident=?1 AND json_extract(document_json,'$.target.origin.instance_id')=?2 ORDER BY task_id")?;
+        let docs=stmt.query_map(params![project,actor.instance_id],|r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let docs=docs.iter().map(|s| serde_json::from_str::<Dispatch>(s)).collect::<serde_json::Result<Vec<_>>>()?;
+        let pending:Vec<_>=docs.iter().filter(|d|d.target==caller && matches!(d.state.as_str(),"pending"|"received")).collect();
+        let mut stmt=conn.prepare("SELECT id,operation,document_json,created_at,authentication_json FROM task_dispatch_events WHERE project_ident=?1 AND instance_id=?2 AND operation IN ('claim','start','handoff_prior_claim','succeeded','failed','cancel') ORDER BY id")?;
+        let history=stmt.query_map(params![project,actor.instance_id],|r| Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,String>(4)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let history=history.into_iter().map(|(id,op,doc,at,auth)| -> Result<Value> {Ok(json!({"id":id,"operation":op,"dispatch":serde_json::from_str::<Value>(&doc)?,"created_at":at,"authentication":serde_json::from_str::<Value>(&auth)?}))}).collect::<Result<Vec<_>>>()?;
+        let mut stmt=conn.prepare("SELECT document_json FROM task_dispatches WHERE json_extract(document_json,'$.source_project_ident')=?1 AND json_extract(document_json,'$.requester.origin.instance_id')=?2 AND json_extract(document_json,'$.requester.origin.session_id')=?3 AND json_extract(document_json,'$.requester.generation')=?4 ORDER BY task_id")?;
+        let requested=stmt.query_map(params![project,actor.instance_id,actor.session_id,caller.generation],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let requested=requested.iter().map(|s|serde_json::from_str::<Value>(s)).collect::<serde_json::Result<Vec<_>>>()?;
+        Ok(Json(json!({"pending":pending,"machine_dispatches":docs,"prior_claims":history,"requested":requested})))
+    }).await?
+}
+
+/// Kept separate so fixture HTTP tests exercise the production route wiring.
+pub fn router() -> axum::Router<AppState> {
+    use axum::routing::{get, post};
+    axum::Router::new()
+        .route(
+            "/v1/projects/{ident}/task-sessions",
+            get(sessions).post(register),
+        )
+        .route(
+            "/v1/projects/{ident}/task-dispatches",
+            post(delegate_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/task-dispatches/recovery",
+            get(recovery),
+        )
+        .route(
+            "/v1/projects/{ident}/task-dispatches/{id}/actions",
+            post(action_handler),
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+        middleware,
+        routing::{get, post},
+        Router,
+    };
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
+    use tower::ServiceExt;
+
+    fn id() -> String {
+        uuid::Uuid::now_v7().to_string()
+    }
+    fn fixture(database: db::Db) -> AppState {
+        {
+            let conn = database.lock().unwrap();
+            for ident in ["example", "destination"] {
+                if db::get_project(&conn, ident).unwrap().is_some() {
+                    continue;
+                }
+                db::insert_project(
+                    &conn,
+                    &db::Project {
+                        ident: ident.into(),
+                        channel_name: "discord".into(),
+                        room_id: ident.into(),
+                        last_msg_id: None,
+                        created_at: db::now_ms(),
+                        repo_provider: None,
+                        repo_namespace: None,
+                        repo_name: None,
+                        repo_full_name: None,
+                        kind: db::PROJECT_KIND_REPO.into(),
+                        archived_at: None,
+                        canonical_remote: None,
+                    },
+                )
+                .unwrap();
+            }
+        }
+        AppState {
+            db: database,
+            plugins: Arc::new(HashMap::new()),
+            #[cfg(feature = "whatsapp")]
+            whatsapp: None,
+            default_channel: "discord".into(),
+            api_key: "fixture-bearer".into(),
+            ui_auth_enabled: true,
+            retention_days: 30,
+            bot_retention_days: 7,
+            artifact_operations: db::ArtifactOperationsEnvelope::production_defaults(),
+            artifact_body_schema_enabled: true,
+            artifact_auth_enforced: false,
+            update_available: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[derive(Clone)]
+    struct Agent {
+        target: Target,
+        machine_key: String,
+        secret: String,
+    }
+    impl Agent {
+        fn new(instance: &str, key: &str) -> Self {
+            let mut secret = [0u8; 32];
+            OsRng.fill_bytes(&mut secret);
+            Self {
+                target: Target {
+                    origin: AgentOrigin {
+                        session_id: id(),
+                        instance_id: instance.into(),
+                        provider: "codex".into(),
+                        os: "linux".into(),
+                    },
+                    generation: id(),
+                },
+                machine_key: key.into(),
+                secret: hex::encode(secret),
+            }
+        }
+        fn headers(&self) -> HeaderMap {
+            let mut h = HeaderMap::new();
+            for (name, value) in [
+                ("authorization", "Bearer fixture-bearer"),
+                ("x-agent-session-id", &self.target.origin.session_id),
+                ("x-agent-instance-id", &self.target.origin.instance_id),
+                ("x-agent-provider", &self.target.origin.provider),
+                ("x-agent-os", &self.target.origin.os),
+                ("x-gateway-machine-key", &self.machine_key),
+                ("x-gateway-session-key", &self.secret),
+            ] {
+                h.insert(name, value.parse().unwrap());
+            }
+            h
+        }
+        fn action(&self, operation: &str, claim: Option<&str>) -> Value {
+            json!({"request_id":id(),"generation":self.target.generation,"operation":operation,"claim_id":claim})
+        }
+        fn delegation(&self, target: &Agent, project: &str) -> Value {
+            json!({"request_id":id(),"generation":self.target.generation,"target_project_ident":project,"target":target.target,"title":"fixture task","specification":"No executors or notifications run in this fixture.","required_os":target.target.origin.os,"required_provider":target.target.origin.provider})
+        }
+    }
+    fn app(state: &AppState) -> Router {
+        router()
+            .route(
+                "/v1/projects/{ident}/tasks/{id}",
+                get(crate::routes::get_task_handler)
+                    .patch(crate::routes::update_task_handler)
+                    .delete(crate::routes::delete_task_handler),
+            )
+            .route(
+                "/v1/projects/{ident}/tasks/reorder",
+                post(crate::routes::reorder_tasks_handler),
+            )
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::bearer_auth,
+            ))
+            .with_state(state.clone())
+    }
+    async fn http(
+        state: &AppState,
+        agent: &Agent,
+        method: &str,
+        path: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        *request.headers_mut() = agent.headers();
+        request
+            .headers_mut()
+            .insert("content-type", "application/json".parse().unwrap());
+        let response = app(state).oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 2_000_000).await.unwrap();
+        let value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| json!({"raw":String::from_utf8_lossy(&bytes)}));
+        (status, value)
+    }
+    async fn ok(state: &AppState, agent: &Agent, method: &str, path: &str, body: Value) -> Value {
+        let (status, value) = http(state, agent, method, path, body).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        value
+    }
+    async fn register_agent(state: &AppState, agent: &Agent, project: &str) {
+        let response = ok(
+            state,
+            agent,
+            "POST",
+            &format!("/v1/projects/{project}/task-sessions"),
+            json!({"generation":agent.target.generation}),
+        )
+        .await;
+        assert_eq!(response["target"], json!(agent.target));
+    }
+    async fn agents(state: &AppState) -> Vec<Agent> {
+        let instance = id();
+        let key = provision(&state.db.lock().unwrap(), "example", &instance, "linux").unwrap();
+        let agents: Vec<_> = (0..3).map(|_| Agent::new(&instance, &key)).collect();
+        for agent in &agents {
+            register_agent(state, agent, "example").await;
+        }
+        agents
+    }
+    fn actions(task: &str) -> String {
+        format!("/v1/projects/example/task-dispatches/{task}/actions")
+    }
+    async fn recovery_for(state: &AppState, agent: &Agent) -> Value {
+        ok(
+            state,
+            agent,
+            "GET",
+            &format!(
+                "/v1/projects/example/task-dispatches/recovery?generation={}",
+                agent.target.generation
+            ),
+            Value::Null,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn three_same_machine_codex_sessions_delegate_and_claim_independently() {
+        let state = fixture(db::open(":memory:").unwrap());
+        let agents = agents(&state).await;
+        let directory = ok(
+            &state,
+            &agents[0],
+            "GET",
+            "/v1/projects/example/task-sessions",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(directory["sessions"].as_array().unwrap().len(), 3);
+        let mut claimed = Vec::new();
+        for n in 0..3 {
+            let sender = &agents[n];
+            let target = &agents[(n + 1) % 3];
+            let other = &agents[(n + 2) % 3];
+            let body = sender.delegation(target, "example");
+            let accepted = ok(
+                &state,
+                sender,
+                "POST",
+                "/v1/projects/example/task-dispatches",
+                body.clone(),
+            )
+            .await;
+            assert_eq!(accepted["dispatch"]["state"], "pending");
+            assert!(accepted["task"]["owner_origin"].is_null());
+            assert!(accepted["task"]["started_at"].is_null());
+            assert_eq!(
+                ok(
+                    &state,
+                    sender,
+                    "POST",
+                    "/v1/projects/example/task-dispatches",
+                    body.clone()
+                )
+                .await,
+                accepted
+            );
+            let mut changed = body;
+            changed["title"] = json!("changed");
+            assert_eq!(
+                http(
+                    &state,
+                    sender,
+                    "POST",
+                    "/v1/projects/example/task-dispatches",
+                    changed
+                )
+                .await
+                .0,
+                StatusCode::CONFLICT
+            );
+            let task = accepted["task"]["id"].as_str().unwrap();
+            let path = actions(task);
+            assert_eq!(
+                http(&state, other, "POST", &path, other.action("receive", None))
+                    .await
+                    .0,
+                StatusCode::CONFLICT
+            );
+            assert_eq!(
+                http(&state, target, "POST", &path, target.action("claim", None))
+                    .await
+                    .0,
+                StatusCode::CONFLICT
+            );
+            assert!(recovery_for(&state, target).await["pending"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["task_id"] == task));
+            let receipt = target.action("receive", None);
+            let received = ok(&state, target, "POST", &path, receipt.clone()).await;
+            assert_eq!(received["dispatch"]["state"], "received");
+            assert!(received["task"]["owner_origin"].is_null());
+            let claim = target.action("claim", None);
+            let (a, b) = tokio::join!(
+                http(&state, target, "POST", &path, claim.clone()),
+                http(&state, target, "POST", &path, claim.clone())
+            );
+            assert_eq!(a.0, StatusCode::OK);
+            assert_eq!(a, b);
+            assert_eq!(a.1["task"]["owner_origin"], json!(target.target.origin));
+            assert!(a.1["task"]["started_at"].is_null());
+            assert_eq!(a.1["dispatch"]["state"], "claimed");
+            // A second registration on the same machine cannot copy peer headers to act as that peer.
+            let mut impersonator = other.clone();
+            impersonator.target = target.target.clone();
+            assert_eq!(
+                http(
+                    &state,
+                    &impersonator,
+                    "POST",
+                    &path,
+                    target.action("start", a.1["dispatch"]["claim_id"].as_str())
+                )
+                .await
+                .0,
+                StatusCode::FORBIDDEN
+            );
+            for status in ["todo", "in_progress", "done"] {
+                assert_eq!(
+                    http(
+                        &state,
+                        target,
+                        "PATCH",
+                        &format!("/v1/projects/example/tasks/{task}"),
+                        json!({"status":status})
+                    )
+                    .await
+                    .0,
+                    StatusCode::CONFLICT
+                );
+            }
+            assert_eq!(
+                http(
+                    &state,
+                    target,
+                    "DELETE",
+                    &format!("/v1/projects/example/tasks/{task}"),
+                    Value::Null
+                )
+                .await
+                .0,
+                StatusCode::CONFLICT
+            );
+            let claim_id = a.1["dispatch"]["claim_id"].as_str().unwrap().to_string();
+            assert_eq!(
+                http(
+                    &state,
+                    target,
+                    "POST",
+                    &path,
+                    target.action("succeeded", Some(&claim_id))
+                )
+                .await
+                .0,
+                StatusCode::CONFLICT
+            );
+            let execution = id();
+            let mut start = target.action("start", Some(&claim_id));
+            start["execution_id"] = json!(execution);
+            let started = ok(&state, target, "POST", &path, start.clone()).await;
+            assert_eq!(started["dispatch"]["state"], "running");
+            assert!(started["task"]["started_at"].is_i64());
+            let mut finish = target.action("succeeded", Some(&claim_id));
+            finish["execution_id"] = json!(execution);
+            finish["result"] = json!("fixture outcome");
+            let finished = ok(&state, target, "POST", &path, finish.clone()).await;
+            assert_eq!(finished["task"]["status"], "done");
+            assert_eq!(ok(&state, target, "POST", &path, finish).await, finished);
+            // Lost acknowledgement retries return the original accepted result, never a new execution.
+            assert_eq!(ok(&state, target, "POST", &path, start).await, started);
+            assert_eq!(ok(&state, target, "POST", &path, receipt).await, received);
+            claimed.push(claim_id);
+        }
+        claimed.sort();
+        claimed.dedup();
+        assert_eq!(claimed.len(), 3);
+        let conn = state.db.lock().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_is_read_only_recovery_handoff_is_explicit_and_fenced() {
+        let state = fixture(db::open(":memory:").unwrap());
+        let agents = agents(&state).await;
+        let (sender, target, next) = (&agents[0], &agents[1], &agents[2]);
+        let accepted = ok(
+            &state,
+            sender,
+            "POST",
+            "/v1/projects/example/task-dispatches",
+            sender.delegation(target, "example"),
+        )
+        .await;
+        let task = accepted["task"]["id"].as_str().unwrap();
+        let path = actions(task);
+        ok(
+            &state,
+            target,
+            "POST",
+            &path,
+            target.action("receive", None),
+        )
+        .await;
+        let claim = ok(&state, target, "POST", &path, target.action("claim", None)).await;
+        let claim_id = claim["dispatch"]["claim_id"].as_str().unwrap();
+        let mut restarted = Agent::new(&target.target.origin.instance_id, &target.machine_key);
+        restarted.target.origin = target.target.origin.clone(); // Same native conversation, new process generation and secret.
+        register_agent(&state, &restarted, "example").await;
+        let recovery = recovery_for(&state, &restarted).await;
+        assert!(recovery["pending"].as_array().unwrap().is_empty());
+        assert!(recovery["prior_claims"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["dispatch"]["claim_id"] == claim_id));
+        let mut start = restarted.action("start", Some(claim_id));
+        start["execution_id"] = json!(id());
+        assert_eq!(
+            http(&state, &restarted, "POST", &path, start).await.0,
+            StatusCode::CONFLICT
+        );
+        // No time-based reclaim or legacy operator release may erase managed claims.
+        {
+            let conn = state.db.lock().unwrap();
+            conn.execute(
+                "UPDATE tasks SET started_at=0,updated_at=0 WHERE id=?1",
+                [task],
+            )
+            .unwrap();
+            assert_eq!(db::reclaim_stale_tasks(&conn, "example").unwrap(), 0);
+            let t = db::get_task_detail(&conn, "example", task)
+                .unwrap()
+                .unwrap()
+                .task;
+            assert!(db::recover_task_claim(
+                &conn,
+                "example",
+                task,
+                &db::task_claim_token(&t).unwrap(),
+                "fixture"
+            )
+            .is_err());
+            assert!(
+                db::reorder_tasks_in_column(&conn, "example", "todo", &[task.into()], None)
+                    .is_err()
+            );
+        }
+        let mut handoff = target.action("handoff", Some(claim_id));
+        handoff["target"] = json!(next.target);
+        handoff["result"] = json!("explicit owner handoff");
+        let handed = ok(&state, target, "POST", &path, handoff.clone()).await;
+        assert_eq!(handed["dispatch"]["target"], json!(next.target));
+        assert!(handed["task"]["owner_origin"].is_null());
+        assert_eq!(ok(&state, target, "POST", &path, handoff).await, handed);
+        assert_eq!(
+            http(
+                &state,
+                target,
+                "POST",
+                &path,
+                target.action("receive", None)
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        ok(&state, next, "POST", &path, next.action("receive", None)).await;
+        let new_claim = ok(&state, next, "POST", &path, next.action("claim", None)).await;
+        assert_ne!(new_claim["dispatch"]["claim_id"], claim_id);
+        let mut cancel = next.action("cancel", Some(claim_id));
+        cancel["result"] = json!("stale claim");
+        assert_eq!(
+            http(&state, next, "POST", &path, cancel).await.0,
+            StatusCode::CONFLICT
+        );
+        let mut cancel = next.action("cancel", new_claim["dispatch"]["claim_id"].as_str());
+        cancel["result"] = json!("explicit cancellation");
+        let cancelled = ok(&state, next, "POST", &path, cancel).await;
+        assert_eq!(cancelled["dispatch"]["state"], "cancelled");
+        assert!(cancelled["dispatch"]["started_at"].is_null());
+    }
+
+    #[tokio::test]
+    async fn credentials_platform_eligibility_revocation_and_expiry_are_enforced() {
+        let state = fixture(db::open(":memory:").unwrap());
+        let agents = agents(&state).await;
+        let (sender, target) = (&agents[0], &agents[1]);
+        let mut fake = target.clone();
+        fake.machine_key = "0".repeat(64);
+        assert_eq!(
+            http(
+                &state,
+                &fake,
+                "GET",
+                "/v1/projects/example/task-sessions",
+                Value::Null
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        fake = target.clone();
+        fake.target.origin.instance_id = id();
+        assert_eq!(
+            http(
+                &state,
+                &fake,
+                "POST",
+                "/v1/projects/example/task-sessions",
+                json!({"generation":fake.target.generation})
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        fake = target.clone();
+        fake.target.origin.os = "windows".into();
+        assert_eq!(
+            http(
+                &state,
+                &fake,
+                "POST",
+                "/v1/projects/example/task-sessions",
+                json!({"generation":fake.target.generation})
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        fake = target.clone();
+        fake.secret = "0".repeat(64);
+        assert_eq!(
+            http(
+                &state,
+                &fake,
+                "POST",
+                "/v1/projects/example/task-sessions",
+                json!({"generation":fake.target.generation})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        let mut body = sender.delegation(target, "example");
+        body["required_os"] = json!("windows");
+        assert_eq!(
+            http(
+                &state,
+                sender,
+                "POST",
+                "/v1/projects/example/task-dispatches",
+                body
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        let instance = id();
+        let key = provision(
+            &state.db.lock().unwrap(),
+            "destination",
+            &instance,
+            "windows",
+        )
+        .unwrap();
+        let mut remote = Agent::new(&instance, &key);
+        remote.target.origin.os = "windows".into();
+        remote.target.origin.provider = "claude".into();
+        register_agent(&state, &remote, "destination").await;
+        let accepted = ok(
+            &state,
+            sender,
+            "POST",
+            "/v1/projects/example/task-dispatches",
+            sender.delegation(&remote, "destination"),
+        )
+        .await;
+        assert_eq!(accepted["dispatch"]["target"], json!(remote.target));
+        assert_eq!(accepted["task"]["project_ident"], "destination");
+        let task = accepted["task"]["id"].as_str().unwrap();
+        // Requester cancels through its authorized source project, without impersonating destination.
+        let mut cancel = sender.action("cancel", None);
+        cancel["result"] = json!("withdraw delegated request");
+        assert_eq!(
+            ok(&state, sender, "POST", &actions(task), cancel).await["dispatch"]["state"],
+            "cancelled"
+        );
+        let before: i64 = state
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))
+            .unwrap();
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE task_sessions SET seen_at=0 WHERE session_id=?1",
+                [&target.target.origin.session_id],
+            )
+            .unwrap();
+        assert_eq!(
+            http(
+                &state,
+                sender,
+                "POST",
+                "/v1/projects/example/task-dispatches",
+                sender.delegation(target, "example")
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            state
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            before
+        );
+        revoke(
+            &state.db.lock().unwrap(),
+            "example",
+            &sender.target.origin.instance_id,
+        )
+        .unwrap();
+        assert_eq!(
+            http(
+                &state,
+                sender,
+                "GET",
+                "/v1/projects/example/task-sessions",
+                Value::Null
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_request_and_claim_history_survive_database_restart() {
+        let directory = std::env::current_dir()
+            .unwrap()
+            .join("target/m2-fixtures")
+            .join(id());
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("gateway.db");
+        let state = fixture(db::open(file.to_str().unwrap()).unwrap());
+        let agents = agents(&state).await;
+        let body = agents[0].delegation(&agents[1], "example");
+        let accepted = ok(
+            &state,
+            &agents[0],
+            "POST",
+            "/v1/projects/example/task-dispatches",
+            body.clone(),
+        )
+        .await;
+        let task = accepted["task"]["id"].as_str().unwrap();
+        ok(
+            &state,
+            &agents[1],
+            "POST",
+            &actions(task),
+            agents[1].action("receive", None),
+        )
+        .await;
+        let claimed = ok(
+            &state,
+            &agents[1],
+            "POST",
+            &actions(task),
+            agents[1].action("claim", None),
+        )
+        .await;
+        drop(state);
+        let state = fixture(db::open(file.to_str().unwrap()).unwrap());
+        assert_eq!(
+            ok(
+                &state,
+                &agents[0],
+                "POST",
+                "/v1/projects/example/task-dispatches",
+                body
+            )
+            .await,
+            accepted
+        );
+        let recovered = recovery_for(&state, &agents[1]).await;
+        assert_eq!(
+            recovered["machine_dispatches"][0]["claim_id"],
+            claimed["dispatch"]["claim_id"]
+        );
+        assert_eq!(recovered["prior_claims"][0]["operation"], "claim");
+        drop(state);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_transactions_rollback_and_distinct_claim_requests_race_atomically() {
+        let state = fixture(db::open(":memory:").unwrap());
+        let agents = agents(&state).await;
+        let (sender, target) = (&agents[0], &agents[1]);
+        let body = sender.delegation(target, "example");
+        state.db.lock().unwrap().execute_batch("CREATE TRIGGER fixture_failure BEFORE INSERT ON task_dispatch_events BEGIN SELECT RAISE(ABORT,'fixture rollback'); END;").unwrap();
+        assert_eq!(
+            http(
+                &state,
+                sender,
+                "POST",
+                "/v1/projects/example/task-dispatches",
+                body.clone()
+            )
+            .await
+            .0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        {
+            let conn = state.db.lock().unwrap();
+            for table in [
+                "tasks",
+                "task_events",
+                "task_dispatches",
+                "task_dispatch_events",
+                "task_dispatch_requests",
+            ] {
+                assert_eq!(
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+            }
+            assert_eq!(task_events::current_origin(&conn).unwrap(), None);
+            conn.execute_batch("DROP TRIGGER fixture_failure").unwrap();
+        }
+        let accepted = ok(
+            &state,
+            sender,
+            "POST",
+            "/v1/projects/example/task-dispatches",
+            body,
+        )
+        .await;
+        let task = accepted["task"]["id"].as_str().unwrap();
+        let path = actions(task);
+        ok(
+            &state,
+            target,
+            "POST",
+            &path,
+            target.action("receive", None),
+        )
+        .await;
+        let (a, b) = tokio::join!(
+            http(&state, target, "POST", &path, target.action("claim", None)),
+            http(&state, target, "POST", &path, target.action("claim", None))
+        );
+        let mut statuses = [a.0, b.0];
+        statuses.sort();
+        assert_eq!(statuses, [StatusCode::OK, StatusCode::CONFLICT]);
+        let conn = state.db.lock().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM task_dispatch_events WHERE operation='claim'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_request_is_not_executor_cancellation_or_an_outcome() {
+        let state = fixture(db::open(":memory:").unwrap());
+        let agents = agents(&state).await;
+        let (sender, target) = (&agents[0], &agents[1]);
+        let accepted = ok(
+            &state,
+            sender,
+            "POST",
+            "/v1/projects/example/task-dispatches",
+            sender.delegation(target, "example"),
+        )
+        .await;
+        let task = accepted["task"]["id"].as_str().unwrap();
+        let path = actions(task);
+        ok(
+            &state,
+            target,
+            "POST",
+            &path,
+            target.action("receive", None),
+        )
+        .await;
+        let claimed = ok(&state, target, "POST", &path, target.action("claim", None)).await;
+        let claim = claimed["dispatch"]["claim_id"].as_str().unwrap();
+        let execution = id();
+        let mut start = target.action("start", Some(claim));
+        start["execution_id"] = json!(execution);
+        ok(&state, target, "POST", &path, start).await;
+        let mut cancel = sender.action("cancel", Some(claim));
+        cancel["result"] = json!("stop requested");
+        assert_eq!(
+            http(&state, sender, "POST", &path, cancel.clone()).await.0,
+            StatusCode::CONFLICT
+        );
+        cancel["operation"] = json!("request_cancel");
+        let requested = ok(&state, sender, "POST", &path, cancel).await;
+        assert_eq!(requested["dispatch"]["state"], "running");
+        assert!(requested["dispatch"]["finished_at"].is_null());
+        assert_eq!(requested["task"]["status"], "in_progress");
+        let mut confirmation = target.action("cancel", Some(claim));
+        confirmation["result"] = json!("executor explicitly confirmed stopped");
+        assert_eq!(
+            http(&state, target, "POST", &path, confirmation.clone())
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        confirmation["execution_id"] = json!(execution);
+        let confirmed = ok(&state, target, "POST", &path, confirmation).await;
+        assert_eq!(confirmed["dispatch"]["state"], "cancelled");
+        assert!(confirmed["dispatch"]["finished_at"].is_i64());
+        let auth = &confirmed["authentication"];
+        let expected_hash = hash(&target.machine_key);
+        assert_eq!(auth["machine"]["credential_id"], expected_hash);
+        assert_eq!(
+            auth["machine"]["instance_id"],
+            target.target.origin.instance_id
+        );
+        assert_eq!(auth["session"], json!(target.target.origin));
+        assert_eq!(auth["generation"], target.target.generation);
+    }
+}

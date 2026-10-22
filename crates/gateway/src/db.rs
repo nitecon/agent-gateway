@@ -1292,6 +1292,7 @@ fn apply_schema(conn: &Connection) -> Result<()> {
     )?;
 
     crate::task_events::initialize(conn)?;
+    crate::task_dispatch::initialize(conn)?;
     apply_artifact_substrate_schema(conn)?;
     retire_documentation(conn)?;
     validate_project_casing(conn)?;
@@ -8205,7 +8206,8 @@ pub fn reclaim_stale_tasks(conn: &Connection, project_ident: &str) -> Result<usi
                AND status = 'in_progress'
                AND started_at IS NOT NULL
                AND started_at < ?2
-               AND updated_at < ?2",
+               AND updated_at < ?2
+               AND NOT EXISTS(SELECT 1 FROM task_dispatches d WHERE d.task_id=tasks.id)",
         )?;
         let rows = stmt
             .query_map(params![project_ident.as_str(), cutoff], |r| {
@@ -8600,6 +8602,9 @@ pub fn recover_task_claim(
         bail!("claim recovery requires a reason");
     }
     crate::task_events::mutation(conn, None, |conn| {
+        if crate::task_dispatch::managed(conn, task_id)? {
+            return Err(crate::task_dispatch::Conflict("use explicit dispatch handoff/cancel; legacy operator recovery cannot transfer dispatch claims").into());
+        }
         let before = get_task_detail(conn, project_ident, task_id)?
             .ok_or_else(|| anyhow::anyhow!("task not found in project"))?
             .task;
@@ -8692,7 +8697,18 @@ fn update_task_inner(
     };
 
     let origin = crate::task_events::current_origin(conn)?;
+    if enforce_owner && crate::task_dispatch::managed(conn, task_id)? {
+        return Err(crate::task_dispatch::Conflict(
+            "dispatch tasks require the credential-bound dispatch API",
+        )
+        .into());
+    }
     if enforce_owner && (upd.status.is_some() || upd.owner_agent_id.is_some()) {
+        if current.owner_origin.is_none()
+            && (current.owner_agent_id.is_some() || current.status == "in_progress")
+        {
+            return Err(crate::task_events::OwnershipConflict.into());
+        }
         if let Some(owner) = &current.owner_origin {
             if !origin.as_ref().is_some_and(|actor| {
                 actor.session_id == owner.session_id && actor.instance_id == owner.instance_id
@@ -9008,6 +9024,12 @@ pub fn mark_delegation_complete(
 /// Returns true if a row was removed.
 pub fn delete_task(conn: &Connection, project_ident: &str, task_id: &str) -> Result<bool> {
     let project_ident = normalize_project_ident(project_ident);
+    if crate::task_dispatch::managed(conn, task_id)? {
+        return Err(crate::task_dispatch::Conflict(
+            "dispatch tasks cannot be deleted through the legacy API",
+        )
+        .into());
+    }
     let n = crud(conn).delete(
         "tasks",
         &[
@@ -9068,6 +9090,12 @@ pub fn reorder_tasks_in_column(
     let origin = crate::task_events::current_origin(conn)?;
 
     for (idx, task_id) in order.iter().enumerate() {
+        if crate::task_dispatch::managed(conn, task_id)? {
+            return Err(crate::task_dispatch::Conflict(
+                "dispatch tasks cannot be reordered through the legacy API",
+            )
+            .into());
+        }
         // Fetch current status + owner for this row, scoped to the project.
         let current: Option<TaskStateSnapshot> = {
             let mut stmt = conn.prepare(
@@ -9100,6 +9128,9 @@ pub fn reorder_tasks_in_column(
         let mut new_origin = old_origin.clone();
 
         if old_status != target_status {
+            if old_origin.is_none() && (old_owner.is_some() || old_status == "in_progress") {
+                return Err(crate::task_events::OwnershipConflict.into());
+            }
             if let Some(owner) = old_origin {
                 if !origin.as_ref().is_some_and(|actor| {
                     actor.session_id == owner.session_id && actor.instance_id == owner.instance_id

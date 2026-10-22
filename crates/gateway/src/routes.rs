@@ -39,6 +39,9 @@ impl<E: Into<anyhow::Error>> From<E> for AppError {
         let status = if err
             .downcast_ref::<crate::task_events::OwnershipConflict>()
             .is_some()
+            || err
+                .downcast_ref::<crate::task_dispatch::Conflict>()
+                .is_some()
         {
             StatusCode::CONFLICT
         } else {

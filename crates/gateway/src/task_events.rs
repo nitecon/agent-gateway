@@ -989,6 +989,39 @@ mod tests {
                 .owner_origin,
             None
         );
+        // A legacy machine label does not prove ownership of an unbound claim.
+        for actor in [None, Some(&worker), Some(&other_session)] {
+            for status in ["in_progress", "todo", "done"] {
+                let err = mutation(&conn, actor, |conn| {
+                    db::update_task(
+                        conn,
+                        "example",
+                        &task.id,
+                        &status_update(status),
+                        Some("legacy"),
+                    )
+                })
+                .unwrap_err();
+                assert!(err.downcast_ref::<OwnershipConflict>().is_some());
+            }
+            let mut update = status_update("in_progress");
+            update.status = None;
+            update.owner_agent_id = Some(None);
+            assert!(mutation(&conn, actor, |conn| {
+                db::update_task(conn, "example", &task.id, &update, Some("legacy"))
+            })
+            .is_err());
+            assert!(mutation(&conn, actor, |conn| {
+                db::reorder_tasks_in_column(
+                    conn,
+                    "example",
+                    "done",
+                    std::slice::from_ref(&task.id),
+                    Some("legacy"),
+                )
+            })
+            .is_err());
+        }
     }
 
     #[test]

@@ -5,6 +5,7 @@ mod execution_history;
 mod projects;
 mod routes;
 mod subtasks;
+mod task_dispatch;
 mod task_events;
 mod ui;
 mod ui_auth;
@@ -48,10 +49,29 @@ enum Command {
         #[command(subcommand)]
         action: UserCommand,
     },
+    /// Provision or revoke project-scoped task machine credentials (local operator only).
+    TaskMachine {
+        #[command(subcommand)]
+        action: TaskMachineCommand,
+    },
     /// Local operator recovery for orphaned task claims (requires database access)
     Task {
         #[command(subcommand)]
         action: TaskCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum TaskMachineCommand {
+    /// Issue a new secret, invalidating the previous key and expiring session leases.
+    Issue {
+        project: String,
+        instance_id: String,
+        os: String,
+    },
+    Revoke {
+        project: String,
+        instance_id: String,
     },
 }
 
@@ -286,6 +306,27 @@ async fn main() -> Result<()> {
     // ── CLI parsing ──────────────────────────────────────────────────────────
     let cli = Cli::parse();
 
+    if let Some(Command::TaskMachine { action }) = &cli.command {
+        let database = db::open_config(&db::DatabaseConfig::from_env()?)?;
+        let conn = database.lock().unwrap();
+        match action {
+            TaskMachineCommand::Issue {
+                project,
+                instance_id,
+                os,
+            } => {
+                println!(
+                    "{}",
+                    task_dispatch::provision(&conn, project, instance_id, os)?
+                );
+            }
+            TaskMachineCommand::Revoke {
+                project,
+                instance_id,
+            } => task_dispatch::revoke(&conn, project, instance_id)?,
+        }
+        return Ok(());
+    }
     if let Some(Command::User { action }) = &cli.command {
         return run_user_command(action);
     }
@@ -636,6 +677,7 @@ async fn main() -> Result<()> {
             "/v1/projects/{ident}/tasks",
             get(routes::list_tasks_handler).post(routes::create_task_handler),
         )
+        .merge(task_dispatch::router())
         .route(
             "/v1/projects/{ident}/tasks/delegate",
             post(routes::delegate_task_handler),
