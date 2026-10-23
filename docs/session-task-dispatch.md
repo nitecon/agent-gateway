@@ -237,9 +237,14 @@ Recovery is read-only:
   authenticated machine across its sessions and generations, including unbound
   machine-addressed items.
 - `prior_claims` contains durable claim/start/outcome/cancel and prior-handoff
-  snapshots from this destination project and authenticated machine. Each entry
-  includes monotonic `id`, `operation`, `dispatch`, `created_at`, and the stored
-  `authentication` snapshot.
+  snapshots from this destination project for this authenticated machine's own
+  history, plus earlier machines' lineage for canonical tasks currently queued
+  or assigned to this machine and provisioned OS. It does not expose other
+  machines' unrelated tasks or other projects. Each entry includes monotonic
+  `id`, `operation`, `dispatch`, `created_at`, and the original stored
+  `authentication` snapshot. A new receiver can inspect the old claimant,
+  machine, claim ID, execution ID and unknown outcome before receiving or
+  claiming. Reading lineage does not bind work or transfer prior ownership.
 - `requested` contains current dispatches created by this exact requester and
   generation through the source project, including cross-project work. It lets
   the requester inspect the current claim before requesting cancellation.

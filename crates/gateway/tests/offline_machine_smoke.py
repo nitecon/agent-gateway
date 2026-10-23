@@ -191,6 +191,16 @@ try:
                and event["dispatch"]["execution_id"] == execution for event in recovery(restarted)["prior_claims"])
     next_owner = actor(offline_next)
     register("destination", next_owner)
+    before = api(f"/v1/projects/destination/tasks/{task}", actor=next_owner)
+    lineage = recovery(next_owner)
+    assert lineage["machine_pending"][0]["task_id"] == task
+    prior = next(event for event in lineage["prior_claims"] if event["operation"] == "handoff_prior_claim")
+    assert prior["dispatch"]["claim_id"] == claim and prior["dispatch"]["execution_id"] == execution
+    assert prior["authentication"]["session"] == owner["origin"]
+    assert prior["authentication"]["machine"]["instance_id"] == destination["instance_id"]
+    assert prior["dispatch"]["finished_at"] is None and prior["dispatch"]["result"] is None
+    assert api(f"/v1/projects/destination/tasks/{task}", actor=next_owner) == before
+    assert before["status"] == "todo" and before["owner_origin"] is None and before["started_at"] is None
     action(task, next_owner, "receive")
     next_claim = action(task, next_owner, "claim")["dispatch"]["claim_id"]
     assert next_claim != claim
@@ -198,7 +208,7 @@ try:
     outcome = {"status": "passed", "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
                "checks": ["offline acceptance", "SQLite/process restart", "durable dedup replay",
                           "three-session receipt race", "no implicit claim/start", "exact owner conflicts",
-                          "read-only prior-generation recovery", "explicit offline handoff preserves prior claim"],
+                          "read-only prior-generation recovery", "explicit offline handoff preserves prior claim", "new destination reads old authenticated lineage before claim"],
                "fixture_path": str(fixture)}
     (fixture / "result.json").write_text(json.dumps(outcome, indent=2) + "\n")
     print(json.dumps(outcome))

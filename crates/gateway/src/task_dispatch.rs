@@ -830,8 +830,21 @@ pub async fn recovery(
         let docs=docs.iter().map(|s| serde_json::from_str::<Dispatch>(s)).collect::<serde_json::Result<Vec<_>>>()?;
         let machine_pending:Vec<_>=docs.iter().filter(|d|d.state=="pending_machine" && d.target.is_none() && d.machine_target.as_ref().is_some_and(|m|m.instance_id==actor.instance_id && m.os==actor.os)).collect();
         let pending:Vec<_>=docs.iter().filter(|d|d.target.as_ref()==Some(&caller) && matches!(d.state.as_str(),"pending"|"received")).collect();
-        let mut stmt=conn.prepare("SELECT id,operation,document_json,created_at,authentication_json FROM task_dispatch_events WHERE project_ident=?1 AND instance_id=?2 AND operation IN ('claim','start','handoff_prior_claim','succeeded','failed','cancel') ORDER BY id")?;
-        let history=stmt.query_map(params![project,actor.instance_id],|r| Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,String>(4)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        // Preserve own history and expose lineage only for tasks currently assigned
+        // to this authenticated machine/OS in this project. This does not adopt a claim.
+        let mut stmt=conn.prepare("SELECT e.id,e.operation,e.document_json,e.created_at,e.authentication_json
+            FROM task_dispatch_events e WHERE e.project_ident=?1
+            AND e.operation IN ('claim','start','handoff_prior_claim','succeeded','failed','cancel')
+            AND (e.instance_id=?2 OR EXISTS (
+                SELECT 1 FROM task_dispatches d WHERE d.project_ident=?1 AND d.task_id=e.task_id
+                AND ((json_extract(d.document_json,'$.target.origin.instance_id')=?2
+                      AND json_extract(d.document_json,'$.target.origin.os')=?3)
+                  OR (json_extract(d.document_json,'$.state')='pending_machine'
+                      AND json_extract(d.document_json,'$.target') IS NULL
+                      AND json_extract(d.document_json,'$.machine_target.instance_id')=?2
+                      AND json_extract(d.document_json,'$.machine_target.os')=?3))))
+            ORDER BY e.id")?;
+        let history=stmt.query_map(params![project,actor.instance_id,actor.os],|r| Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,String>(4)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let history=history.into_iter().map(|(id,op,doc,at,auth)| -> Result<Value> {Ok(json!({"id":id,"operation":op,"dispatch":serde_json::from_str::<Value>(&doc)?,"created_at":at,"authentication":serde_json::from_str::<Value>(&auth)?}))}).collect::<Result<Vec<_>>>()?;
         let mut stmt=conn.prepare("SELECT document_json FROM task_dispatches WHERE json_extract(document_json,'$.source_project_ident')=?1 AND json_extract(document_json,'$.requester.origin.instance_id')=?2 AND json_extract(document_json,'$.requester.origin.session_id')=?3 AND json_extract(document_json,'$.requester.generation')=?4 ORDER BY task_id")?;
         let requested=stmt.query_map(params![project,actor.instance_id,actor.session_id,caller.generation],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1298,6 +1311,162 @@ mod tests {
         );
         drop(state);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn new_machine_recovers_only_assigned_task_lineage_without_mutation() {
+        let state = fixture(db::open(":memory:").unwrap());
+        let senders = agents(&state).await;
+        let sender = &senders[0];
+        let old_instance = id();
+        let old_key =
+            provision(&state.db.lock().unwrap(), "example", &old_instance, "linux").unwrap();
+        let old_owner = Agent::new(&old_instance, &old_key);
+        register_agent(&state, &old_owner, "example").await;
+        async fn started_task(
+            state: &AppState,
+            sender: &Agent,
+            owner: &Agent,
+        ) -> (String, String, String) {
+            let accepted = ok(
+                state,
+                sender,
+                "POST",
+                "/v1/projects/example/task-dispatches",
+                sender.delegation(owner, "example"),
+            )
+            .await;
+            let task = accepted["task"]["id"].as_str().unwrap().to_string();
+            ok(
+                state,
+                owner,
+                "POST",
+                &actions(&task),
+                owner.action("receive", None),
+            )
+            .await;
+            let claimed = ok(
+                state,
+                owner,
+                "POST",
+                &actions(&task),
+                owner.action("claim", None),
+            )
+            .await;
+            let claim = claimed["dispatch"]["claim_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let execution = id();
+            let mut start = owner.action("start", Some(&claim));
+            start["execution_id"] = json!(execution);
+            ok(state, owner, "POST", &actions(&task), start).await;
+            (task, claim, execution)
+        }
+        let (task, claim, execution) = started_task(&state, sender, &old_owner).await;
+        let (unrelated, _, _) = started_task(&state, sender, &old_owner).await;
+        let new_instance = id();
+        let new_key =
+            provision(&state.db.lock().unwrap(), "example", &new_instance, "linux").unwrap();
+        let mut handoff = old_owner.action("handoff", Some(&claim));
+        handoff["machine_target"] = json!({"instance_id":new_instance});
+        handoff["result"] = json!("Synthetic executor stopped; deliberate machine handoff");
+        ok(&state, &old_owner, "POST", &actions(&task), handoff).await;
+        let receiver = Agent::new(&new_instance, &new_key);
+        register_agent(&state, &receiver, "example").await;
+        let snapshot = || {
+            let conn = state.db.lock().unwrap();
+            let document: String = conn
+                .query_row(
+                    "SELECT document_json FROM task_dispatches WHERE task_id=?1",
+                    [&task],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let task = serde_json::to_value(
+                db::get_task_detail(&conn, "example", &task)
+                    .unwrap()
+                    .unwrap()
+                    .task,
+            )
+            .unwrap();
+            let counts: (i64,i64) = conn.query_row("SELECT (SELECT count(*) FROM task_dispatch_events),(SELECT count(*) FROM task_dispatch_requests)", [], |r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+            (document, task, counts)
+        };
+        let before = snapshot();
+        let recovery = recovery_for(&state, &receiver).await;
+        assert_eq!(
+            before,
+            snapshot(),
+            "recovery must not bind, claim, start, or add history/replay records"
+        );
+        assert_eq!(recovery["machine_pending"][0]["task_id"], task);
+        assert!(recovery["pending"].as_array().unwrap().is_empty());
+        let history = recovery["prior_claims"].as_array().unwrap();
+        assert_eq!(
+            history.len(),
+            3,
+            "new destination needs the prior claim, start, and pre-handoff snapshot"
+        );
+        for event in history {
+            assert_eq!(event["dispatch"]["task_id"], task);
+            assert_ne!(event["dispatch"]["task_id"], unrelated);
+            assert_eq!(event["dispatch"]["claim_id"], claim);
+            assert_eq!(
+                event["authentication"]["machine"]["instance_id"],
+                old_instance
+            );
+            assert_eq!(
+                event["authentication"]["session"],
+                json!(old_owner.target.origin)
+            );
+        }
+        let prior = history
+            .iter()
+            .find(|e| e["operation"] == "handoff_prior_claim")
+            .unwrap();
+        assert_eq!(prior["dispatch"]["execution_id"], execution);
+        assert_eq!(prior["dispatch"]["state"], "running");
+        assert!(prior["dispatch"]["finished_at"].is_null());
+        assert!(
+            prior["dispatch"]["result"].is_null(),
+            "historical unknown outcome is not rewritten as success"
+        );
+        // The requester machine has no prior claims or assigned tasks here.
+        assert!(recovery_for(&state, sender).await["prior_claims"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        // The old machine retains its own history, including the unrelated task.
+        assert!(recovery_for(&state, &old_owner).await["prior_claims"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["dispatch"]["task_id"] == unrelated));
+        // Reusing the same machine UUID in another authorized project grants no cross-project history.
+        let other_key = provision(
+            &state.db.lock().unwrap(),
+            "destination",
+            &new_instance,
+            "linux",
+        )
+        .unwrap();
+        let other_project = Agent::new(&new_instance, &other_key);
+        register_agent(&state, &other_project, "destination").await;
+        let other = ok(
+            &state,
+            &other_project,
+            "GET",
+            &format!(
+                "/v1/projects/destination/task-dispatches/recovery?generation={}",
+                other_project.target.generation
+            ),
+            Value::Null,
+        )
+        .await;
+        assert!(other["prior_claims"].as_array().unwrap().is_empty());
+        assert!(other["machine_pending"].as_array().unwrap().is_empty());
+        assert_eq!(before, snapshot());
     }
 
     #[tokio::test]
