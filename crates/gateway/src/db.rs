@@ -1125,7 +1125,7 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         );",
     )?;
 
-    // ── Tasks: per-project kanban (todo/in_progress/done) ────────────────────
+    // ── Tasks: per-project kanban (todo/in_progress/done; cancelled is terminal) ─
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS tasks (
             id              TEXT PRIMARY KEY,
@@ -1134,7 +1134,7 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             description     TEXT,
             details         TEXT,
             status          TEXT NOT NULL DEFAULT 'todo'
-                            CHECK(status IN ('todo','in_progress','done')),
+                            CHECK(status IN ('todo','in_progress','done','cancelled')),
             rank            INTEGER NOT NULL DEFAULT 0,
             labels          TEXT,
             hostname        TEXT,
@@ -1291,6 +1291,7 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             ON gateway_memory_client_links(project_ident, gateway_memory_id);",
     )?;
 
+    crate::task_cancel::initialize(conn)?;
     crate::task_events::initialize(conn)?;
     crate::task_dispatch::initialize(conn)?;
     apply_artifact_substrate_schema(conn)?;
@@ -8696,6 +8697,9 @@ fn update_task_inner(
         }
     };
 
+    if current.status == "cancelled" && upd.status.is_some() {
+        return Err(crate::task_dispatch::Conflict("cancelled tasks are terminal").into());
+    }
     let origin = crate::task_events::current_origin(conn)?;
     if enforce_owner && crate::task_dispatch::managed(conn, task_id)? {
         return Err(crate::task_dispatch::Conflict(
@@ -9118,6 +9122,9 @@ pub fn reorder_tasks_in_column(
             Some(v) => v,
             None => anyhow::bail!("task '{task_id}' not found in project '{project_ident}'"),
         };
+        if old_status == "cancelled" {
+            return Err(crate::task_dispatch::Conflict("cancelled tasks are terminal").into());
+        }
 
         // Compute new timestamps + owner by mirroring the transition logic
         // in `update_task`. Fields we do not change are preserved explicitly

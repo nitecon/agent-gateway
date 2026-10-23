@@ -7086,10 +7086,10 @@ pub async fn list_tasks_handler(
             .collect(),
     };
     for s in &statuses {
-        if s != "todo" && s != "in_progress" && s != "done" {
+        if s != "todo" && s != "in_progress" && s != "done" && s != "cancelled" {
             return Err(AppError(
                 StatusCode::BAD_REQUEST,
-                format!("invalid status '{s}': must be todo|in_progress|done"),
+                format!("invalid status '{s}': must be todo|in_progress|done|cancelled"),
             ));
         }
     }

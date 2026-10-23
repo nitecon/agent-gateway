@@ -175,7 +175,8 @@ pub fn initialize(conn: &Connection) -> Result<()> {
         INSERT OR IGNORE INTO task_mutation_context(id) VALUES (1);
         DROP TRIGGER IF EXISTS task_event_created;
         DROP TRIGGER IF EXISTS task_event_commented;
-        DROP TRIGGER IF EXISTS task_event_completed;")?;
+        DROP TRIGGER IF EXISTS task_event_completed;
+        DROP TRIGGER IF EXISTS task_event_cancelled;")?;
     let actor = "(SELECT origin_json FROM task_mutation_context WHERE id=1)";
     let task = task_json("NEW");
     let commented_task = task_json("t");
@@ -195,6 +196,11 @@ pub fn initialize(conn: &Connection) -> Result<()> {
         INSERT INTO task_events(kind,project_ident,canonical_remote,task_json,comment_json,created_at,origin_json)
         VALUES ('task_completed',NEW.project_ident,(SELECT canonical_remote FROM projects WHERE ident=NEW.project_ident),{task},
         (SELECT {latest_comment} FROM task_comments c WHERE c.task_id=NEW.id AND c.author_type!='system' ORDER BY c.created_at DESC,c.id DESC LIMIT 1),NEW.updated_at,{actor});
+    END;
+    CREATE TRIGGER IF NOT EXISTS task_event_cancelled AFTER UPDATE OF status ON tasks
+    WHEN NEW.status='cancelled' AND OLD.status!='cancelled' BEGIN
+        INSERT INTO task_events(kind,project_ident,canonical_remote,task_json,created_at,origin_json)
+        VALUES ('task_cancelled',NEW.project_ident,(SELECT canonical_remote FROM projects WHERE ident=NEW.project_ident),{task},NEW.updated_at,{actor});
     END;"))?;
     tx.commit()?;
     Ok(())

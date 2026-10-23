@@ -5,6 +5,7 @@ mod execution_history;
 mod projects;
 mod routes;
 mod subtasks;
+mod task_cancel;
 mod task_dispatch;
 mod task_events;
 mod ui;
@@ -691,6 +692,10 @@ async fn main() -> Result<()> {
             get(routes::get_task_handler)
                 .patch(routes::update_task_handler)
                 .delete(routes::delete_task_handler),
+        )
+        .route(
+            "/v1/projects/{ident}/tasks/{id}/cancellation",
+            get(task_cancel::get_handler).post(task_cancel::create_handler),
         )
         .route(
             "/v1/projects/{ident}/tasks/{id}/comments",
