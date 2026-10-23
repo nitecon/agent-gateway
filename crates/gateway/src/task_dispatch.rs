@@ -618,8 +618,9 @@ fn action(
                         dispatch.state = "cancelled".into();
                         dispatch.result = req.result.clone();
                         dispatch.finished_at = Some(now);
+                        // Distinct terminal status; owner and claim provenance stay intact.
                         conn.execute(
-                            "UPDATE tasks SET status='done',done_at=?1,updated_at=?1 WHERE id=?2",
+                            "UPDATE tasks SET status='cancelled',updated_at=?1 WHERE id=?2",
                             params![now, id],
                         )?;
                     }
@@ -1215,6 +1216,9 @@ mod tests {
         let cancelled = ok(&state, next, "POST", &path, cancel).await;
         assert_eq!(cancelled["dispatch"]["state"], "cancelled");
         assert!(cancelled["dispatch"]["started_at"].is_null());
+        assert_eq!(cancelled["task"]["status"], "cancelled");
+        assert!(cancelled["task"]["done_at"].is_null());
+        assert_eq!(cancelled["task"]["owner_origin"], json!(next.target.origin));
     }
 
     #[tokio::test]
@@ -1318,10 +1322,9 @@ mod tests {
         // Requester cancels through its authorized source project, without impersonating destination.
         let mut cancel = sender.action("cancel", None);
         cancel["result"] = json!("withdraw delegated request");
-        assert_eq!(
-            ok(&state, sender, "POST", &actions(task), cancel).await["dispatch"]["state"],
-            "cancelled"
-        );
+        let withdrawn = ok(&state, sender, "POST", &actions(task), cancel).await;
+        assert_eq!(withdrawn["dispatch"]["state"], "cancelled");
+        assert_eq!(withdrawn["task"]["status"], "cancelled");
         let before: i64 = state
             .db
             .lock()
@@ -1564,6 +1567,30 @@ mod tests {
         let confirmed = ok(&state, target, "POST", &path, confirmation).await;
         assert_eq!(confirmed["dispatch"]["state"], "cancelled");
         assert!(confirmed["dispatch"]["finished_at"].is_i64());
+        assert_eq!(confirmed["dispatch"]["cancel_reason"], "stop requested");
+        assert_eq!(confirmed["task"]["status"], "cancelled");
+        assert!(confirmed["task"]["done_at"].is_null());
+        assert_eq!(
+            confirmed["task"]["owner_origin"],
+            json!(target.target.origin)
+        );
+        assert_eq!(
+            confirmed["task"]["started_at"],
+            requested["task"]["started_at"]
+        );
+        {
+            let conn = state.db.lock().unwrap();
+            let kinds = |kind: &str| -> i64 {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM task_events WHERE kind=?1 AND task_json->>'id'=?2",
+                    params![kind, task],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            };
+            assert_eq!(kinds("task_cancelled"), 1);
+            assert_eq!(kinds("task_completed"), 0);
+        }
         let auth = &confirmed["authentication"];
         let expected_hash = hash(&target.machine_key);
         assert_eq!(auth["machine"]["credential_id"], expected_hash);

@@ -124,7 +124,8 @@ started_at?, finished_at?, execution_id?, cancel_requested_at?, cancel_reason?, 
 ```
 
 Timestamps are server Unix milliseconds. `task` uses the existing flat Task DTO;
-use `dispatch.state` to distinguish failure and cancellation from success.
+use `dispatch.state` to distinguish failure from success. A confirmed `cancel`
+sets task status `cancelled` (never `done`); see `docs/task-cancellation.md`.
 For example, after receipt, claim with
 `{"request_id":"<new uuid>","generation":"<target generation>","operation":"claim"}`.
 Persist the returned `dispatch.claim_id` before taking further action.
@@ -138,7 +139,7 @@ Persist the returned `dispatch.claim_id` before taking further action.
 | `start` | Claimed, exact destination and claim; no cancellation requested | Requires executor's `execution_id` UUID. Records running and `started_at`. |
 | `succeeded` / `failed` | Running, exact destination, claim, and execution | Requires a nonempty result. Records the explicit terminal outcome and marks the task done. |
 | `request_cancel` | Claimed/running, exact requester or destination, current claim | Requires a reason in `result`; records the request without finishing the task or asserting that the executor stopped. |
-| `cancel` | Pending/received: requester or destination. Claimed/running: exact destination and current claim. | Requires a reason. Running cancellation also requires the exact execution ID as the executor's explicit confirmation. Records cancelled and marks the task done. |
+| `cancel` | Pending/received: requester or destination. Claimed/running: exact destination and current claim. | Requires a reason. Running cancellation also requires the exact execution ID as the executor's explicit confirmation. Records dispatch `cancelled` and task status `cancelled` with `done_at` null; owner, `owner_origin`, `started_at`, any `cancel_requested_at`/`cancel_reason` and prior event history are kept. Emits `task_cancelled`, not `task_completed`. |
 | `handoff` | Exact destination, nonterminal, no cancellation requested; current claim if claimed/running | Requires a different live eligible `target` and reason. Preserves the prior claim/execution event, returns the task to TODO and the new destination to pending. |
 
 Every mutation, task transition, authentication snapshot, history event, and
