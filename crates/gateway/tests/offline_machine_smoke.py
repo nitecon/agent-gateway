@@ -193,6 +193,7 @@ try:
     register("destination", next_owner)
     before = api(f"/v1/projects/destination/tasks/{task}", actor=next_owner)
     lineage = recovery(next_owner)
+    assert lineage["history_complete"] is True
     assert lineage["machine_pending"][0]["task_id"] == task
     prior = next(event for event in lineage["prior_claims"] if event["operation"] == "handoff_prior_claim")
     assert prior["dispatch"]["claim_id"] == claim and prior["dispatch"]["execution_id"] == execution

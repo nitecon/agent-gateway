@@ -81,7 +81,7 @@ return 409. Internal database failures return 500 and roll back the mutation.
 | `GET /task-sessions` | Machine credential required. Returns `{sessions:[{target,seen_at,expires_at}]}` for eligible sessions in this project. |
 | `POST /task-dispatches` | Delegate body below; returns `{dispatch, task, authentication}`. |
 | `POST /task-dispatches/{task_id}/actions` | Action body below; returns `{dispatch, task, authentication}`. |
-| `GET /task-dispatches/recovery?generation=<uuid>` | Authenticated session required. Returns `{pending, machine_pending, machine_dispatches, prior_claims, requested}`. |
+| `GET /task-dispatches/recovery?generation=<uuid>` | Authenticated session required. Returns `{history_complete, pending, machine_pending, machine_dispatches, prior_claims, requested}`. |
 
 Registrations have a 120-second availability lease. Heartbeat the same
 registration before expiry. Delegation, receipt, new claims, start, handoff,
@@ -226,7 +226,19 @@ retrying `claim` after completion returns its original claim response, not the
 current task state and not a new claim. No external execution is rerun by replay.
 Rejected transactions leave no task, event, or accepted-request record.
 
-Recovery is read-only:
+Recovery is read-only. A fully successful response includes
+`"history_complete": true`: its `prior_claims` includes all durable matching
+claim/start/outcome/cancel and prior-handoff rows for this authenticated
+machine's own history plus the relevant currently queued/assigned canonical
+tasks in the same project and provisioned OS, as scoped below. Original
+claimant/authentication/execution and unknown outcomes remain unchanged. The
+marker is emitted only after all response queries and decoding succeed;
+authentication, query, and other errors provide no completeness proof. An older
+response with an absent marker, or a response with `false`, must not be treated
+as complete, even if its history array is empty. This is a server history scope
+guarantee, not proof of native execution, permission to transfer ownership, or
+consent to input, claim, or start work.
+
 
 - `pending` contains pending/received dispatches for the exact caller and
   generation, including work accepted while it was disconnected.

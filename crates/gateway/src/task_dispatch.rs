@@ -849,7 +849,7 @@ pub async fn recovery(
         let mut stmt=conn.prepare("SELECT document_json FROM task_dispatches WHERE json_extract(document_json,'$.source_project_ident')=?1 AND json_extract(document_json,'$.requester.origin.instance_id')=?2 AND json_extract(document_json,'$.requester.origin.session_id')=?3 AND json_extract(document_json,'$.requester.generation')=?4 ORDER BY task_id")?;
         let requested=stmt.query_map(params![project,actor.instance_id,actor.session_id,caller.generation],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let requested=requested.iter().map(|s|serde_json::from_str::<Value>(s)).collect::<serde_json::Result<Vec<_>>>()?;
-        Ok(Json(json!({"pending":pending,"machine_pending":machine_pending,"machine_dispatches":docs,"prior_claims":history,"requested":requested})))
+        Ok(Json(json!({"history_complete":true,"pending":pending,"machine_pending":machine_pending,"machine_dispatches":docs,"prior_claims":history,"requested":requested})))
     }).await?
 }
 
@@ -1395,6 +1395,25 @@ mod tests {
         };
         let before = snapshot();
         let recovery = recovery_for(&state, &receiver).await;
+        assert_eq!(recovery["history_complete"], true);
+        let mut bad_credentials = receiver.clone();
+        bad_credentials.secret = "00".repeat(32);
+        let (status, error) = http(
+            &state,
+            &bad_credentials,
+            "GET",
+            &format!(
+                "/v1/projects/example/task-dispatches/recovery?generation={}",
+                receiver.target.generation
+            ),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            error.get("history_complete").is_none(),
+            "an error response is no completeness proof"
+        );
         assert_eq!(
             before,
             snapshot(),
