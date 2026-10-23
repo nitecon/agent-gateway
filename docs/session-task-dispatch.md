@@ -81,12 +81,14 @@ return 409. Internal database failures return 500 and roll back the mutation.
 | `GET /task-sessions` | Machine credential required. Returns `{sessions:[{target,seen_at,expires_at}]}` for eligible sessions in this project. |
 | `POST /task-dispatches` | Delegate body below; returns `{dispatch, task, authentication}`. |
 | `POST /task-dispatches/{task_id}/actions` | Action body below; returns `{dispatch, task, authentication}`. |
-| `GET /task-dispatches/recovery?generation=<uuid>` | Authenticated session required. Returns `{pending, machine_dispatches, prior_claims, requested}`. |
+| `GET /task-dispatches/recovery?generation=<uuid>` | Authenticated session required. Returns `{pending, machine_pending, machine_dispatches, prior_claims, requested}`. |
 
 Registrations have a 120-second availability lease. Heartbeat the same
 registration before expiry. Delegation, receipt, new claims, start, handoff,
-outcome, and cancellation require a live caller. Delegation and handoff also
-require a live eligible destination. Expiring a lease never releases a task or
+outcome, and cancellation require a live caller. Exact-session delegation and
+handoff require a live eligible destination. Machine-addressed delegation and
+handoff require a provisioned eligible machine but no destination session or
+availability lease. Expiring a lease never releases a task or
 proves that an executor has stopped. A successful request can be replayed after
 lease expiry, provided its credentials and immutable registration remain valid.
 
@@ -114,12 +116,13 @@ executor, or send a project notification. Titles are limited to 512 UTF-8 bytes;
 specifications to 65,536 bytes.
 
 The action body has required `request_id`, `generation`, and `operation`, plus
-optional nullable `claim_id`, `execution_id`, `result`, and `target`. The returned
+optional nullable `claim_id`, `execution_id`, `result`, `target`, and
+`machine_target` (the latter two are alternatives for handoff). The returned
 dispatch contains:
 
 ```text
-task_id, project_ident, source_project_ident, requester: Target, target: Target,
-required_os?, required_provider?, state, claim_id?, received_at?, claimed_at?,
+task_id, project_ident, source_project_ident, requester: Target, target: Target|null,
+machine_target?: {instance_id, os}, required_os?, required_provider?, state, claim_id?, received_at?, claimed_at?,
 started_at?, finished_at?, execution_id?, cancel_requested_at?, cancel_reason?, result?
 ```
 
@@ -130,17 +133,73 @@ For example, after receipt, claim with
 `{"request_id":"<new uuid>","generation":"<target generation>","operation":"claim"}`.
 Persist the returned `dispatch.claim_id` before taking further action.
 
+## Offline machine delivery
+
+A sender can queue work while the destination machine is off. In the delegate
+body, replace `target` with:
+
+```json
+{
+  "machine_target": {"instance_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"},
+  "required_os": "windows",
+  "required_provider": "codex"
+}
+```
+
+Supply exactly one non-null `target` or `machine_target`. Machine eligibility
+comes from the destination project's non-revoked provisioned machine row;
+the server returns its OS in `dispatch.machine_target`. Unknown machines,
+revoked credentials, OS mismatches, and unknown provider constraints return 409.
+Neither client headers nor a prior session registration grant eligibility to
+a different destination machine. No new provisioning is exposed through HTTP.
+
+Acceptance durably stores the canonical TODO task and a dispatch with
+`state: "pending_machine"`, `target: null`, and null receipt/claim/start fields.
+It creates no session, owner, execution, reminder, or project notification.
+No destination process UUID or generation is needed. The same request-ID and
+SQLite transaction guarantees as exact-session dispatch apply across restarts.
+
+On reconnect, an authenticated registered session reads `machine_pending` from
+the existing recovery endpoint. This read changes no state. To select an item,
+it explicitly sends `operation: "receive"` to the existing action endpoint.
+Only a live session authenticated for that destination machine and provisioned
+OS, matching any provider constraint, can receive it. Receipt atomically binds
+`dispatch.target` to that exact session/generation and changes state to
+`received`. Competing sessions receive 409; the successful receiver's identical
+request-ID retry replays its original response. Receipt still leaves the task
+TODO and unowned. Claim and start require their separate existing operations.
+Once bound, all exact-session/generation/claim fences apply. `machine_target`
+remains as delivery-address metadata, not permission for another session to
+adopt the bound work.
+
+The exact current owner may also use `operation: "handoff"` with
+`machine_target` instead of `target`, its current claim ID when active, and an
+explicit reason in `result`. As with existing handoff, the executor must already
+be stopped. The old claim/execution snapshot is recorded before returning the
+same task to `pending_machine`/TODO and clearing current ownership. A future
+receiver receives a fresh claim ID only after explicitly claiming. A restarted
+generation can inspect prior claims but cannot silently transfer or restart
+them. A pending machine item may be cancelled by its exact requester; a
+destination session first receives/binds it before acting as its owner.
+
+Machine keys remain revocable. Receipt revalidates current credentials and the
+stored destination OS; changing a machine's provisioned OS does not silently
+retarget existing work. If a receiver disappears after binding, another session
+cannot receive the item again. An explicit owner handoff or separately authorized
+intervention remains necessary. This queue adds durable addressing, not dead-owner
+takeover or automatic execution.
+
 ## State transitions and ownership
 
 | Operation | Required state / authority | Result |
 | --- | --- | --- |
-| `receive` | Pending, exact destination | Records explicit receipt; leaves task TODO and unowned. |
+| `receive` | Pending exact destination, or pending-machine eligible receiver | Records explicit receipt; leaves task TODO and unowned. |
 | `claim` | Received, exact eligible destination | Generates a fresh `claim_id`; task becomes in progress with exact `owner_origin`. `started_at` remains null. |
 | `start` | Claimed, exact destination and claim; no cancellation requested | Requires executor's `execution_id` UUID. Records running and `started_at`. |
 | `succeeded` / `failed` | Running, exact destination, claim, and execution | Requires a nonempty result. Records the explicit terminal outcome and marks the task done. |
 | `request_cancel` | Claimed/running, exact requester or destination, current claim | Requires a reason in `result`; records the request without finishing the task or asserting that the executor stopped. |
 | `cancel` | Pending/received: requester or destination. Claimed/running: exact destination and current claim. | Requires a reason. Running cancellation also requires the exact execution ID as the executor's explicit confirmation. Records dispatch `cancelled` and task status `cancelled` with `done_at` null; owner, `owner_origin`, `started_at`, any `cancel_requested_at`/`cancel_reason` and prior event history are kept. Emits `task_cancelled`, not `task_completed`. |
-| `handoff` | Exact destination, nonterminal, no cancellation requested; current claim if claimed/running | Requires a different live eligible `target` and reason. Preserves the prior claim/execution event, returns the task to TODO and the new destination to pending. |
+| `handoff` | Exact destination, nonterminal, no cancellation requested; current claim if claimed/running | Requires a different live eligible `target` or a provisioned `machine_target`, plus a reason. Preserves the prior claim/execution event, returns the task to TODO and the new destination to pending. |
 
 Every mutation, task transition, authentication snapshot, history event, and
 request replay record commits in one SQLite transaction under the gateway DB
@@ -171,8 +230,12 @@ Recovery is read-only:
 
 - `pending` contains pending/received dispatches for the exact caller and
   generation, including work accepted while it was disconnected.
+- `machine_pending` contains unbound `pending_machine` items for this
+  authenticated machine and provisioned OS. Reading the array does not bind,
+  receive, claim, or start them.
 - `machine_dispatches` includes current dispatch documents targeted at this
-  authenticated machine across its sessions and generations.
+  authenticated machine across its sessions and generations, including unbound
+  machine-addressed items.
 - `prior_claims` contains durable claim/start/outcome/cancel and prior-handoff
   snapshots from this destination project and authenticated machine. Each entry
   includes monotonic `id`, `operation`, `dispatch`, `created_at`, and the stored
@@ -231,3 +294,17 @@ notifications, provision live secrets, or rerun real tasks.
 Use the repository checks: `cargo fmt --all -- --check`,
 `cargo clippy --workspace --all-targets -- -D warnings`, and
 `cargo test --workspace`.
+
+The offline machine extension is covered by native router/SQLite tests, including
+file-database reopen, three-session receipt races, exact-owner conflicts,
+request replay, provider/OS eligibility, cancellation, and prior-claim history.
+A real loopback HTTP/process-restart smoke runs without executors:
+
+```bash
+cargo build -p gateway --no-default-features
+python3 crates/gateway/tests/offline_machine_smoke.py
+```
+
+The smoke provisions only its private temporary SQLite fixture under `target/`,
+starts and stops only its own server processes, and never connects a provider.
+Use `--binary` to select a separately built source-pinned executable.

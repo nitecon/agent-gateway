@@ -276,13 +276,55 @@ pub async fn sessions(
     Ok(Json(json!({"sessions":records})))
 }
 
+/// A durable machine address carries no process/session identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachineTarget {
+    pub instance_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvisionedTarget {
+    pub instance_id: String,
+    pub os: String,
+}
+
+fn machine_target(
+    conn: &Connection,
+    project: &str,
+    target: &MachineTarget,
+    required_os: Option<&str>,
+) -> Result<ProvisionedTarget> {
+    let instance =
+        uuid(&target.instance_id).map_err(|_| Conflict("machine instance_id must be a UUID"))?;
+    let os: Option<String> = conn
+        .query_row(
+            "SELECT os FROM task_machines WHERE project_ident=?1 AND instance_id=?2 AND revoked=0",
+            params![project, instance],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let os = os.ok_or(Conflict(
+        "target machine is not provisioned/eligible in project",
+    ))?;
+    if required_os.is_some_and(|required| required != os) {
+        return Err(Conflict("target machine does not match required OS").into());
+    }
+    Ok(ProvisionedTarget {
+        instance_id: instance,
+        os,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dispatch {
     pub task_id: String,
     pub project_ident: String,
     pub source_project_ident: String,
     pub requester: Target,
-    pub target: Target,
+    pub target: Option<Target>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_target: Option<ProvisionedTarget>,
     pub required_os: Option<String>,
     pub required_provider: Option<String>,
     pub state: String,
@@ -303,7 +345,9 @@ pub struct Delegate {
     pub request_id: String,
     pub generation: String,
     pub target_project_ident: String,
-    pub target: Target,
+    pub target: Option<Target>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_target: Option<MachineTarget>,
     pub title: String,
     pub specification: String,
     pub required_os: Option<String>,
@@ -419,13 +463,34 @@ fn delegate(conn: &Connection, source: &str, actor: &AgentOrigin, req: &Delegate
             }
             let target_project =
                 crate::projects::normalize_project_ident(&req.target_project_ident);
-            eligible(
-                conn,
-                &target_project,
-                &req.target,
-                req.required_os.as_deref(),
-                req.required_provider.as_deref(),
-            )?;
+            let machine_target = match (&req.target, &req.machine_target) {
+                (Some(target), None) => {
+                    eligible(
+                        conn,
+                        &target_project,
+                        target,
+                        req.required_os.as_deref(),
+                        req.required_provider.as_deref(),
+                    )?;
+                    None
+                }
+                (None, Some(machine)) => {
+                    if req
+                        .required_provider
+                        .as_deref()
+                        .is_some_and(|p| !matches!(p, "codex" | "claude"))
+                    {
+                        return Err(Conflict("required_provider must be codex or claude").into());
+                    }
+                    Some(machine_target(
+                        conn,
+                        &target_project,
+                        machine,
+                        req.required_os.as_deref(),
+                    )?)
+                }
+                _ => return Err(Conflict("provide exactly one target or machine_target").into()),
+            };
             if req.title.trim().is_empty()
                 || req.title.len() > 512
                 || req.specification.len() > 65536
@@ -448,9 +513,15 @@ fn delegate(conn: &Connection, source: &str, actor: &AgentOrigin, req: &Delegate
                 source_project_ident: source.into(),
                 requester,
                 target: req.target.clone(),
+                machine_target,
                 required_os: req.required_os.clone(),
                 required_provider: req.required_provider.clone(),
-                state: "pending".into(),
+                state: if req.machine_target.is_some() {
+                    "pending_machine"
+                } else {
+                    "pending"
+                }
+                .into(),
                 claim_id: None,
                 received_at: None,
                 claimed_at: None,
@@ -493,6 +564,8 @@ pub struct Action {
     pub execution_id: Option<String>,
     pub result: Option<String>,
     pub target: Option<Target>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_target: Option<MachineTarget>,
 }
 
 fn terminal(state: &str) -> bool {
@@ -523,7 +596,16 @@ fn action(
                 if !registered(conn, project, &caller, true)? {
                     return Err(Conflict("caller session is not registered/live").into());
                 }
-                let is_target = dispatch.project_ident == project && dispatch.target == caller;
+                let is_target =
+                    dispatch.project_ident == project && dispatch.target.as_ref() == Some(&caller);
+                let machine_receive = req.operation == "receive"
+                    && dispatch.state == "pending_machine"
+                    && dispatch.project_ident == project
+                    && dispatch.target.is_none()
+                    && dispatch
+                        .machine_target
+                        .as_ref()
+                        .is_some_and(|m| m.instance_id == actor.instance_id && m.os == actor.os);
                 let is_requester =
                     dispatch.source_project_ident == project && dispatch.requester == caller;
                 let active = matches!(dispatch.state.as_str(), "claimed" | "running");
@@ -531,6 +613,7 @@ fn action(
                     return Err(Conflict("dispatch is terminal").into());
                 }
                 if !(is_target
+                    || machine_receive
                     || is_requester
                         && matches!(req.operation.as_str(), "cancel" | "request_cancel"))
                 {
@@ -544,7 +627,18 @@ fn action(
                 }
                 let now = db::now_ms();
                 match req.operation.as_str() {
-                    "receive" if dispatch.state == "pending" => {
+                    "receive" if dispatch.state == "pending" || machine_receive => {
+                        if machine_receive {
+                            // Bind once, under the same transaction as receipt. This is not a claim.
+                            eligible(
+                                conn,
+                                project,
+                                &caller,
+                                dispatch.required_os.as_deref(),
+                                dispatch.required_provider.as_deref(),
+                            )?;
+                            dispatch.target = Some(caller.clone());
+                        }
                         dispatch.state = "received".into();
                         dispatch.received_at = Some(now);
                     }
@@ -625,23 +719,36 @@ fn action(
                         )?;
                     }
                     "handoff" if is_target && dispatch.cancel_requested_at.is_none() => {
-                        let target = req
-                            .target
-                            .as_ref()
-                            .ok_or(Conflict("explicit handoff target required"))?;
-                        if target == &caller {
-                            return Err(Conflict(
-                                "handoff requires a different session/generation",
-                            )
-                            .into());
-                        }
-                        eligible(
-                            conn,
-                            project,
-                            target,
-                            dispatch.required_os.as_deref(),
-                            dispatch.required_provider.as_deref(),
-                        )?;
+                        let machine = match (&req.target, &req.machine_target) {
+                            (Some(target), None) => {
+                                if target == &caller {
+                                    return Err(Conflict(
+                                        "handoff requires a different session/generation",
+                                    )
+                                    .into());
+                                }
+                                eligible(
+                                    conn,
+                                    project,
+                                    target,
+                                    dispatch.required_os.as_deref(),
+                                    dispatch.required_provider.as_deref(),
+                                )?;
+                                None
+                            }
+                            (None, Some(machine)) => Some(machine_target(
+                                conn,
+                                project,
+                                machine,
+                                dispatch.required_os.as_deref(),
+                            )?),
+                            _ => {
+                                return Err(Conflict(
+                                    "provide exactly one target or machine_target for handoff",
+                                )
+                                .into())
+                            }
+                        };
                         if req.result.as_deref().is_none_or(|r| r.trim().is_empty()) {
                             return Err(Conflict("handoff reason required").into());
                         }
@@ -654,8 +761,14 @@ fn action(
                             &req.generation,
                             "handoff_prior_claim",
                         )?;
-                        dispatch.target = target.clone();
-                        dispatch.state = "pending".into();
+                        dispatch.target = req.target.clone();
+                        dispatch.machine_target = machine;
+                        dispatch.state = if req.machine_target.is_some() {
+                            "pending_machine"
+                        } else {
+                            "pending"
+                        }
+                        .into();
                         dispatch.claim_id = None;
                         dispatch.received_at = None;
                         dispatch.claimed_at = None;
@@ -712,17 +825,18 @@ pub async fn recovery(
         let actor=authenticate(&conn,&project,&headers)?;
         authenticate_session(&conn,&project,&actor,&query.generation,&headers)?;
         let caller=Target{origin:actor.clone(),generation:query.generation};
-        let mut stmt=conn.prepare("SELECT document_json FROM task_dispatches WHERE project_ident=?1 AND json_extract(document_json,'$.target.origin.instance_id')=?2 ORDER BY task_id")?;
+        let mut stmt=conn.prepare("SELECT document_json FROM task_dispatches WHERE project_ident=?1 AND (json_extract(document_json,'$.target.origin.instance_id')=?2 OR json_extract(document_json,'$.machine_target.instance_id')=?2) ORDER BY task_id")?;
         let docs=stmt.query_map(params![project,actor.instance_id],|r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let docs=docs.iter().map(|s| serde_json::from_str::<Dispatch>(s)).collect::<serde_json::Result<Vec<_>>>()?;
-        let pending:Vec<_>=docs.iter().filter(|d|d.target==caller && matches!(d.state.as_str(),"pending"|"received")).collect();
+        let machine_pending:Vec<_>=docs.iter().filter(|d|d.state=="pending_machine" && d.target.is_none() && d.machine_target.as_ref().is_some_and(|m|m.instance_id==actor.instance_id && m.os==actor.os)).collect();
+        let pending:Vec<_>=docs.iter().filter(|d|d.target.as_ref()==Some(&caller) && matches!(d.state.as_str(),"pending"|"received")).collect();
         let mut stmt=conn.prepare("SELECT id,operation,document_json,created_at,authentication_json FROM task_dispatch_events WHERE project_ident=?1 AND instance_id=?2 AND operation IN ('claim','start','handoff_prior_claim','succeeded','failed','cancel') ORDER BY id")?;
         let history=stmt.query_map(params![project,actor.instance_id],|r| Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,String>(4)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let history=history.into_iter().map(|(id,op,doc,at,auth)| -> Result<Value> {Ok(json!({"id":id,"operation":op,"dispatch":serde_json::from_str::<Value>(&doc)?,"created_at":at,"authentication":serde_json::from_str::<Value>(&auth)?}))}).collect::<Result<Vec<_>>>()?;
         let mut stmt=conn.prepare("SELECT document_json FROM task_dispatches WHERE json_extract(document_json,'$.source_project_ident')=?1 AND json_extract(document_json,'$.requester.origin.instance_id')=?2 AND json_extract(document_json,'$.requester.origin.session_id')=?3 AND json_extract(document_json,'$.requester.generation')=?4 ORDER BY task_id")?;
         let requested=stmt.query_map(params![project,actor.instance_id,actor.session_id,caller.generation],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let requested=requested.iter().map(|s|serde_json::from_str::<Value>(s)).collect::<serde_json::Result<Vec<_>>>()?;
-        Ok(Json(json!({"pending":pending,"machine_dispatches":docs,"prior_claims":history,"requested":requested})))
+        Ok(Json(json!({"pending":pending,"machine_pending":machine_pending,"machine_dispatches":docs,"prior_claims":history,"requested":requested})))
     }).await?
 }
 
@@ -939,6 +1053,358 @@ mod tests {
             Value::Null,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn offline_machine_queue_survives_restart_and_binds_one_reconnecting_session() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/offline-machine-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}.sqlite3", id()));
+        let state = fixture(db::open(path.to_str().unwrap()).unwrap());
+        let senders = agents(&state).await;
+        let sender = &senders[0];
+        let instance = id();
+        let key = provision(
+            &state.db.lock().unwrap(),
+            "destination",
+            &instance,
+            "windows",
+        )
+        .unwrap();
+        let body = json!({"request_id":id(),"generation":sender.target.generation,
+            "target_project_ident":"destination","machine_target":{"instance_id":instance},
+            "title":"Offline Windows fixture", "specification":"No executor is launched.",
+            "required_os":"windows","required_provider":"codex"});
+        let accepted = ok(
+            &state,
+            sender,
+            "POST",
+            "/v1/projects/example/task-dispatches",
+            body.clone(),
+        )
+        .await;
+        let task = accepted["task"]["id"].as_str().unwrap().to_string();
+        assert_eq!(accepted["dispatch"]["state"], "pending_machine");
+        assert_eq!(accepted["dispatch"]["target"], Value::Null);
+        assert_eq!(accepted["dispatch"]["machine_target"]["os"], "windows");
+        assert_eq!(accepted["task"]["status"], "todo");
+        assert!(accepted["task"]["owner_origin"].is_null());
+        assert!(accepted["task"]["started_at"].is_null());
+        assert_eq!(
+            accepted["authentication"]["machine"]["project_ident"],
+            "example"
+        );
+        assert_eq!(
+            recovery_for(&state, sender).await["requested"][0]["task_id"],
+            task
+        );
+        assert_eq!(
+            state
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM messages", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        drop(state);
+        // Reopen the real SQLite file: neither accepted request nor unbound destination is lost.
+        let state = fixture(db::open(path.to_str().unwrap()).unwrap());
+        let replay = ok(
+            &state,
+            sender,
+            "POST",
+            "/v1/projects/example/task-dispatches",
+            body,
+        )
+        .await;
+        assert_eq!(accepted, replay);
+        let peers: Vec<_> = (0..3)
+            .map(|_| {
+                let mut peer = Agent::new(&instance, &key);
+                peer.target.origin.os = "windows".into();
+                peer
+            })
+            .collect();
+        let recovery_path = |peer: &Agent| {
+            format!(
+                "/v1/projects/destination/task-dispatches/recovery?generation={}",
+                peer.target.generation
+            )
+        };
+        let actions = format!("/v1/projects/destination/task-dispatches/{task}/actions");
+        for peer in &peers {
+            register_agent(&state, peer, "destination").await;
+            let recovered = ok(&state, peer, "GET", &recovery_path(peer), Value::Null).await;
+            assert_eq!(recovered["machine_pending"].as_array().unwrap().len(), 1);
+            assert_eq!(recovered["pending"].as_array().unwrap().len(), 0);
+            assert_eq!(recovered["machine_pending"][0]["state"], "pending_machine");
+        }
+        let responses = tokio::join!(
+            http(
+                &state,
+                &peers[0],
+                "POST",
+                &actions,
+                peers[0].action("receive", None)
+            ),
+            http(
+                &state,
+                &peers[1],
+                "POST",
+                &actions,
+                peers[1].action("receive", None)
+            ),
+            http(
+                &state,
+                &peers[2],
+                "POST",
+                &actions,
+                peers[2].action("receive", None)
+            ),
+        );
+        let results = [responses.0, responses.1, responses.2];
+        assert_eq!(results.iter().filter(|r| r.0 == StatusCode::OK).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| r.0 == StatusCode::CONFLICT)
+                .count(),
+            2
+        );
+        let winner_index = results.iter().position(|r| r.0 == StatusCode::OK).unwrap();
+        let winner = &peers[winner_index];
+        assert_eq!(
+            results[winner_index].1["dispatch"]["target"],
+            json!(winner.target)
+        );
+        assert_eq!(results[winner_index].1["task"]["status"], "todo");
+        assert!(results[winner_index].1["task"]["owner_origin"].is_null());
+        assert!(results[winner_index].1["dispatch"]["claim_id"].is_null());
+        assert!(results[winner_index].1["task"]["started_at"].is_null());
+        for (index, peer) in peers.iter().enumerate() {
+            if index != winner_index {
+                assert_eq!(
+                    http(&state, peer, "POST", &actions, peer.action("claim", None))
+                        .await
+                        .0,
+                    StatusCode::CONFLICT
+                );
+            }
+        }
+        let claimed = ok(
+            &state,
+            winner,
+            "POST",
+            &actions,
+            winner.action("claim", None),
+        )
+        .await;
+        let claim = claimed["dispatch"]["claim_id"].as_str().unwrap();
+        assert!(claimed["task"]["started_at"].is_null());
+        let execution = id();
+        let mut start = winner.action("start", Some(claim));
+        start["execution_id"] = json!(execution);
+        let running = ok(&state, winner, "POST", &actions, start).await;
+        assert_eq!(running["dispatch"]["state"], "running");
+        let mut restarted = winner.clone();
+        restarted.target.generation = id();
+        restarted.secret = "ab".repeat(32);
+        register_agent(&state, &restarted, "destination").await;
+        let recovery = ok(
+            &state,
+            &restarted,
+            "GET",
+            &recovery_path(&restarted),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(recovery["machine_pending"].as_array().unwrap().len(), 0);
+        assert_eq!(recovery["pending"].as_array().unwrap().len(), 0);
+        assert!(recovery["prior_claims"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["operation"] == "start" && e["dispatch"]["claim_id"] == claim));
+        assert_eq!(
+            http(
+                &state,
+                &restarted,
+                "POST",
+                &actions,
+                restarted.action("claim", Some(claim))
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        // Only the original exact owner may deliberately return its claim to an offline machine queue.
+        let next_instance = id();
+        let next_key = provision(
+            &state.db.lock().unwrap(),
+            "destination",
+            &next_instance,
+            "windows",
+        )
+        .unwrap();
+        let mut handoff = winner.action("handoff", Some(claim));
+        handoff["machine_target"] = json!({"instance_id":next_instance});
+        handoff["result"] = json!("Fixture executor stopped; explicit offline handoff");
+        let queued = ok(&state, winner, "POST", &actions, handoff).await;
+        assert_eq!(queued["dispatch"]["state"], "pending_machine");
+        assert!(queued["dispatch"]["target"].is_null());
+        assert!(queued["dispatch"]["claim_id"].is_null());
+        assert_eq!(queued["task"]["status"], "todo");
+        let prior = ok(
+            &state,
+            &restarted,
+            "GET",
+            &recovery_path(&restarted),
+            Value::Null,
+        )
+        .await;
+        assert!(prior["prior_claims"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["operation"] == "handoff_prior_claim"
+                && e["dispatch"]["claim_id"] == claim
+                && e["dispatch"]["execution_id"] == execution));
+        let mut next = Agent::new(&next_instance, &next_key);
+        next.target.origin.os = "windows".into();
+        register_agent(&state, &next, "destination").await;
+        ok(
+            &state,
+            &next,
+            "POST",
+            &actions,
+            next.action("receive", None),
+        )
+        .await;
+        let new_claim = ok(&state, &next, "POST", &actions, next.action("claim", None)).await;
+        assert_ne!(new_claim["dispatch"]["claim_id"], claim);
+        assert_eq!(
+            http(
+                &state,
+                &next,
+                "POST",
+                &actions,
+                next.action("start", Some(claim))
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        drop(state);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn machine_eligibility_and_replay_keep_existing_session_contracts() {
+        let state = fixture(db::open(":memory:").unwrap());
+        let peers = agents(&state).await;
+        let sender = &peers[0];
+        let instance = id();
+        let key = provision(&state.db.lock().unwrap(), "example", &instance, "windows").unwrap();
+        let body = json!({"request_id":id(),"generation":sender.target.generation,"target_project_ident":"example",
+            "machine_target":{"instance_id":instance},"title":"Offline","specification":"No execution", "required_os":"windows","required_provider":"codex"});
+        for (field, value) in [
+            ("required_os", json!("linux")),
+            ("machine_target", json!({"instance_id":id()})),
+            ("target", json!(peers[1].target)),
+        ] {
+            let mut invalid = body.clone();
+            invalid[field] = value;
+            assert_eq!(
+                http(
+                    &state,
+                    sender,
+                    "POST",
+                    "/v1/projects/example/task-dispatches",
+                    invalid
+                )
+                .await
+                .0,
+                StatusCode::CONFLICT
+            );
+        }
+        let accepted = ok(
+            &state,
+            sender,
+            "POST",
+            "/v1/projects/example/task-dispatches",
+            body.clone(),
+        )
+        .await;
+        let task = accepted["task"]["id"].as_str().unwrap();
+        let mut changed = body.clone();
+        changed["title"] = json!("Changed");
+        assert_eq!(
+            http(
+                &state,
+                sender,
+                "POST",
+                "/v1/projects/example/task-dispatches",
+                changed
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            http(
+                &state,
+                &peers[1],
+                "POST",
+                &actions(task),
+                peers[1].action("receive", None)
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        let mut wrong_provider = Agent::new(&instance, &key);
+        wrong_provider.target.origin.os = "windows".into();
+        wrong_provider.target.origin.provider = "claude".into();
+        register_agent(&state, &wrong_provider, "example").await;
+        assert_eq!(
+            http(
+                &state,
+                &wrong_provider,
+                "POST",
+                &actions(task),
+                wrong_provider.action("receive", None)
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        let mut cancel = sender.action("cancel", None);
+        cancel["result"] = json!("Withdraw before reconnect");
+        let cancelled = ok(&state, sender, "POST", &actions(task), cancel).await;
+        assert_eq!(cancelled["task"]["status"], "cancelled");
+        assert!(cancelled["task"]["started_at"].is_null());
+        assert!(cancelled["task"]["done_at"].is_null());
+        assert_eq!(
+            ok(
+                &state,
+                sender,
+                "POST",
+                "/v1/projects/example/task-dispatches",
+                body
+            )
+            .await,
+            accepted
+        );
+        // Absent machine_target must not change serialized legacy dedup fingerprints.
+        let old = sender.delegation(&peers[1], "example");
+        let parsed: Delegate = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), old);
+        let old = sender.action("receive", None);
+        let parsed: Action = serde_json::from_value(old.clone()).unwrap();
+        let serialized = serde_json::to_value(parsed).unwrap();
+        assert!(serialized.get("machine_target").is_none());
     }
 
     #[tokio::test]
