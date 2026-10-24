@@ -50,7 +50,7 @@ pub async fn create(
     Path((project, id)): Path<(String, String)>,
     Json(request): Json<CreateSubtask>,
 ) -> Result<Json<db::Task>, AppError> {
-    let origin = crate::task_events::origin(&headers)?;
+    let origin = crate::routes::task_creation_origin(&headers)?;
     let conn = state.db.lock().unwrap();
     let parent = db::get_task_detail(&conn, &project, &id)?
         .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "parent task not found".into()))?;
@@ -77,7 +77,7 @@ pub async fn create(
     }
     let reporter = crate::routes::resolve_identity(None, &headers);
     let task = crate::task_events::mutation(&conn, origin.as_ref(), |tx| {
-        let task = db::insert_task(
+        let task = db::insert_task_with_goal(
             tx,
             &target.ident,
             request.title.trim(),
@@ -86,6 +86,11 @@ pub async fn create(
             &request.labels,
             None,
             &reporter,
+            if target.ident == parent.task.project_ident {
+                parent.task.goal.as_deref()
+            } else {
+                None
+            },
         )?;
         tx.execute(
             "INSERT INTO task_subtasks(parent_id,child_id) VALUES (?1,?2)",

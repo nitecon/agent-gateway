@@ -354,6 +354,11 @@ pub struct Delegate {
     pub required_provider: Option<String>,
 }
 
+/// Validate an ordinary task reassignment against the existing live directory.
+pub fn connected_target(conn: &Connection, project: &str, target: &Target) -> Result<()> {
+    eligible(conn, project, target, None, None)
+}
+
 fn eligible(
     conn: &Connection,
     project: &str,
@@ -497,7 +502,7 @@ fn delegate(conn: &Connection, source: &str, actor: &AgentOrigin, req: &Delegate
             {
                 return Err(Conflict("title/specification invalid or too large").into());
             }
-            let task = db::insert_task(
+            let task = db::insert_unassigned_dispatch_task(
                 conn,
                 &target_project,
                 req.title.trim(),
@@ -986,6 +991,14 @@ mod tests {
     }
     fn app(state: &AppState) -> Router {
         router()
+            .route(
+                "/v1/projects/{ident}/tasks",
+                post(crate::routes::create_task_handler),
+            )
+            .route(
+                "/v1/projects/{ident}/tasks/{id}/reassign",
+                post(crate::routes::reassign_task_handler),
+            )
             .route(
                 "/v1/projects/{ident}/tasks/{id}",
                 get(crate::routes::get_task_handler)
@@ -1593,6 +1606,249 @@ mod tests {
         let parsed: Action = serde_json::from_value(old.clone()).unwrap();
         let serialized = serde_json::to_value(parsed).unwrap();
         assert!(serialized.get("machine_target").is_none());
+    }
+
+    #[tokio::test]
+    async fn ordinary_creation_reserves_submitter_and_any_agent_can_reassign() {
+        let state = fixture(db::open(":memory:").unwrap());
+        let peers = agents(&state).await;
+        let mut legacy = peers[0].headers();
+        legacy.insert("x-agent-id", "legacy-machine-label".parse().unwrap());
+        for header in [
+            "x-agent-session-id",
+            "x-agent-instance-id",
+            "x-agent-provider",
+            "x-agent-os",
+        ] {
+            legacy.remove(header);
+        }
+        let error = crate::routes::create_task_handler(
+            State(state.clone()),
+            legacy,
+            Path("example".into()),
+            Json(serde_json::from_value(json!({"title":"Missing native submitter"})).unwrap()),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        let created = ok(
+            &state,
+            &peers[0],
+            "POST",
+            "/v1/projects/example/tasks",
+            json!({"title":"Reserved immediately","reporter":"misleading-display-name"}),
+        )
+        .await;
+        let task_id = created["id"].as_str().unwrap();
+        assert_eq!(created["owner_origin"], json!(peers[0].target.origin));
+        assert_eq!(created["owner_agent_id"], peers[0].target.origin.session_id);
+        assert_eq!(created["status"], "todo");
+        assert!(created["started_at"].is_null());
+        let event = task_events::list(&state.db.lock().unwrap(), &Default::default())
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            event.task["owner_origin"], created["owner_origin"],
+            "the very first INSERT event must already have its owner"
+        );
+        let path = format!("/v1/projects/example/tasks/{task_id}");
+        for peer in &peers[1..] {
+            assert_eq!(
+                http(
+                    &state,
+                    peer,
+                    "PATCH",
+                    &path,
+                    json!({"status":"in_progress"})
+                )
+                .await
+                .0,
+                StatusCode::CONFLICT
+            );
+        }
+        // Third party, deliberately NOT the old owner, invokes the regular API.
+        let moved = ok(
+            &state,
+            &peers[2],
+            "POST",
+            &format!("{path}/reassign"),
+            json!({"target":peers[1].target}),
+        )
+        .await;
+        assert_eq!(moved["owner_origin"], json!(peers[1].target.origin));
+        assert_eq!(moved["status"], "todo");
+        assert!(moved["started_at"].is_null());
+        assert_eq!(
+            http(
+                &state,
+                &peers[0],
+                "PATCH",
+                &path,
+                json!({"status":"in_progress"})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        let claimed = ok(
+            &state,
+            &peers[1],
+            "PATCH",
+            &path,
+            json!({"status":"in_progress"}),
+        )
+        .await;
+        assert_eq!(claimed["owner_origin"], json!(peers[1].target.origin));
+        let mut disconnected = peers[0].target.clone();
+        disconnected.generation = id();
+        assert_eq!(
+            http(
+                &state,
+                &peers[2],
+                "POST",
+                &format!("{path}/reassign"),
+                json!({"target":disconnected})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        let detail = ok(&state, &peers[1], "GET", &path, Value::Null).await;
+        assert_eq!(detail["owner_origin"], claimed["owner_origin"]);
+        assert_eq!(detail["comments"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            detail["comments"][0]["origin"],
+            json!(peers[2].target.origin)
+        );
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE task_sessions SET seen_at=0 WHERE session_id=?1",
+                [&peers[0].target.origin.session_id],
+            )
+            .unwrap();
+        assert_eq!(
+            http(
+                &state,
+                &peers[2],
+                "POST",
+                &format!("{path}/reassign"),
+                json!({"target":peers[0].target})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_assignments_expire_once_after_fifteen_minutes_and_activity_resets_deadline() {
+        let state = fixture(db::open(":memory:").unwrap());
+        let peers = agents(&state).await;
+        let mut tasks = Vec::new();
+        for title in [
+            "idle reserved todo",
+            "comment activity",
+            "task action",
+            "idle in progress",
+        ] {
+            let t = ok(
+                &state,
+                &peers[0],
+                "POST",
+                "/v1/projects/example/tasks",
+                json!({"title":title}),
+            )
+            .await;
+            tasks.push(t["id"].as_str().unwrap().to_string());
+        }
+        ok(
+            &state,
+            &peers[0],
+            "PATCH",
+            &format!("/v1/projects/example/tasks/{}", tasks[3]),
+            json!({"status":"in_progress"}),
+        )
+        .await;
+        let action_before = db::now_ms() - 60_000;
+        {
+            let conn = state.db.lock().unwrap();
+            conn.execute(
+                "UPDATE tasks SET updated_at=?1 WHERE id=?2",
+                params![db::now_ms() - db::TASK_RECLAIM_MS - 1, tasks[1]],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET updated_at=?1 WHERE id=?2",
+                params![action_before, tasks[2]],
+            )
+            .unwrap();
+            db::insert_comment(&conn, &tasks[1], "peer", "agent", "Still working").unwrap();
+        }
+        ok(
+            &state,
+            &peers[0],
+            "PATCH",
+            &format!("/v1/projects/example/tasks/{}", tasks[2]),
+            json!({"title":"Action resets deadline"}),
+        )
+        .await;
+        let conn = state.db.lock().unwrap();
+        for index in [0, 3] {
+            conn.execute(
+                "UPDATE tasks SET updated_at=?1 WHERE id=?2",
+                params![db::now_ms() - db::TASK_RECLAIM_MS - 1, tasks[index]],
+            )
+            .unwrap();
+        }
+        assert_eq!(db::reclaim_all_stale_tasks(&conn).unwrap(), 2);
+        assert_eq!(db::reclaim_all_stale_tasks(&conn).unwrap(), 0);
+        let expired = db::get_task_detail(&conn, "example", &tasks[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired.task.status, "todo");
+        assert!(expired.task.owner_origin.is_none());
+        assert!(expired.task.owner_agent_id.is_none());
+        assert!(expired.comments[0].content.contains("15 minutes"));
+        for task in &tasks[1..3] {
+            assert!(db::get_task_detail(&conn, "example", task)
+                .unwrap()
+                .unwrap()
+                .task
+                .owner_origin
+                .is_some());
+        }
+        let events = task_events::list(&conn, &Default::default()).unwrap();
+        let unclaimed: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == "task_unclaimed")
+            .collect();
+        assert_eq!(unclaimed.len(), 2);
+        assert!(
+            db::get_task_detail(&conn, "example", &tasks[2])
+                .unwrap()
+                .unwrap()
+                .task
+                .updated_at
+                > action_before
+        );
+        let active_expired = db::get_task_detail(&conn, "example", &tasks[3])
+            .unwrap()
+            .unwrap()
+            .task;
+        assert_eq!(active_expired.status, "todo");
+        assert!(active_expired.owner_origin.is_none());
+        assert!(active_expired.started_at.is_none());
+        assert!(unclaimed.iter().any(|e| e.task["id"] == tasks[0]));
+        assert!(unclaimed[0].task["owner_origin"].is_null());
+        assert!(unclaimed[0].comment.as_ref().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .contains("became unclaimed"));
     }
 
     #[tokio::test]

@@ -39,6 +39,7 @@ impl<E: Into<anyhow::Error>> From<E> for AppError {
         let status = if err
             .downcast_ref::<crate::task_events::OwnershipConflict>()
             .is_some()
+            || err.downcast_ref::<TaskGoalConflict>().is_some()
             || err
                 .downcast_ref::<crate::task_dispatch::Conflict>()
                 .is_some()
@@ -3465,7 +3466,7 @@ pub async fn generate_spec_tasks_handler(
     headers: HeaderMap,
     Json(body): Json<GenerateSpecTasksRequest>,
 ) -> Result<Response> {
-    let origin = crate::task_events::origin(&headers)?;
+    let origin = task_creation_origin(&headers)?;
     let (context, authorization) = begin_artifact_mutation(
         &state,
         &headers,
@@ -6801,11 +6802,16 @@ pub struct ListTasksQuery {
     pub status: Option<String>,
     /// When true, include `done` tasks older than 7 days. Default false.
     pub include_stale: Option<bool>,
+    /// Exact goal; an empty value selects tasks without a goal.
+    pub goal: Option<String>,
+    pub all_goals: Option<bool>,
 }
 
 #[derive(Deserialize)]
 pub struct CreateTaskRequest {
     pub title: String,
+    #[serde(default, deserialize_with = "present_nullable_value")]
+    pub goal: Option<Value>,
     pub description: Option<String>,
     pub specification: Option<String>,
     pub details: Option<String>,
@@ -6837,6 +6843,8 @@ fn present_nullable_value<'de, D: serde::Deserializer<'de>>(
 
 #[derive(Deserialize)]
 pub struct UpdateTaskRequest {
+    #[serde(default, deserialize_with = "present_nullable_value")]
+    pub goal: Option<Value>,
     pub status: Option<String>,
     /// `Some(null)` in JSON clears the owner; `Some("xyz")` assigns it;
     /// absent leaves the current owner alone.
@@ -6997,6 +7005,7 @@ pub struct DeleteResponse {
 
 #[derive(Deserialize)]
 pub struct ReorderTasksQuery {
+    pub goal: Option<String>,
     /// Target column (`todo` | `in_progress` | `done`). Required.
     pub status: String,
 }
@@ -7061,8 +7070,26 @@ fn actor_agent_id(headers: &HeaderMap) -> Option<String> {
     }
 }
 
+#[derive(Debug)]
+struct TaskGoalConflict;
+impl std::fmt::Display for TaskGoalConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("select the task's goal with X-Task-Goal before claiming or changing its goal")
+    }
+}
+impl std::error::Error for TaskGoalConflict {}
+
+/// Explicit goal context opts an agent into a goal's queue.
+fn task_goal_header(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-task-goal")
+        .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
+        .map(|s| s.trim().to_string())
+}
+
 pub async fn list_tasks_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(ident): Path<String>,
     Query(q): Query<ListTasksQuery>,
 ) -> Result<Json<Vec<db::TaskSummary>>> {
@@ -7094,6 +7121,10 @@ pub async fn list_tasks_handler(
         }
     }
     let include_stale = q.include_stale.unwrap_or(false);
+    let agent =
+        actor_agent_id(&headers).is_some() || crate::task_events::origin(&headers)?.is_some();
+    let selected_goal = q.goal.or_else(|| task_goal_header(&headers));
+    let filter_goal = !q.all_goals.unwrap_or(false) && (selected_goal.is_some() || agent);
 
     let db = state.db.clone();
     let ident_for_reclaim = ident.clone();
@@ -7103,11 +7134,63 @@ pub async fn list_tasks_handler(
         // Reclaim stale in-progress tasks before listing so clients see a
         // consistent view.
         db::reclaim_stale_tasks(&conn, &ident_for_reclaim)?;
-        db::list_tasks(&conn, &ident_for_list, &statuses, include_stale)
+        let mut tasks = db::list_tasks(&conn, &ident_for_list, &statuses, include_stale)?;
+        if filter_goal {
+            let goal = selected_goal.as_deref().unwrap_or("").trim();
+            tasks.retain(|task| task.goal.as_deref().unwrap_or("") == goal);
+        }
+        Ok(tasks)
     })
     .await??;
 
     Ok(Json(tasks))
+}
+
+/// An agent submitter must identify its session; reporter/display labels are not owners.
+pub(crate) fn task_creation_origin(
+    headers: &HeaderMap,
+) -> Result<Option<crate::task_events::AgentOrigin>> {
+    let origin = crate::task_events::origin(headers)?;
+    if actor_agent_id(headers).is_some() && origin.is_none() {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "agent task creation requires complete X-Agent session/instance/provider/OS headers"
+                .into(),
+        ));
+    }
+    Ok(origin)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReassignTaskRequest {
+    pub target: crate::task_dispatch::Target,
+}
+
+/// Any authenticated calling agent may explicitly reassign an ordinary active task.
+pub async fn reassign_task_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, id)): Path<(String, String)>,
+    Json(req): Json<ReassignTaskRequest>,
+) -> Result<Json<db::Task>> {
+    let origin = crate::task_events::origin(&headers)?.ok_or_else(|| {
+        AppError(
+            StatusCode::BAD_REQUEST,
+            "exact calling agent origin required".into(),
+        )
+    })?;
+    let database = state.db.clone();
+    let task = spawn_blocking(move || -> anyhow::Result<Option<db::Task>> {
+        let conn = database.lock().unwrap();
+        db::reclaim_stale_tasks(&conn, &project)?;
+        crate::task_events::mutation(&conn, Some(&origin), |conn| {
+            db::reassign_task(conn, &project, &id, &req.target)
+        })
+    })
+    .await??;
+    task.map(Json)
+        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "task not found".into()))
 }
 
 pub async fn create_task_handler(
@@ -7116,7 +7199,7 @@ pub async fn create_task_handler(
     Path(ident): Path<String>,
     Json(req): Json<CreateTaskRequest>,
 ) -> Result<Json<TaskCreateResponse>> {
-    let origin = crate::task_events::origin(&headers)?;
+    let origin = task_creation_origin(&headers)?;
     // Verify project exists.
     {
         let conn = state.db.lock().unwrap();
@@ -7141,13 +7224,19 @@ pub async fn create_task_handler(
     let specification = req.specification.or(req.details);
     let labels = req.labels.unwrap_or_default();
     let hostname = req.hostname;
+    let goal = match decode_nullable_string("goal", req.goal)? {
+        Some(goal) => goal,
+        None => task_goal_header(&headers),
+    };
+    let goal = db::normalize_task_goal(goal.as_deref())
+        .map_err(|e| AppError(StatusCode::BAD_REQUEST, e.to_string()))?;
 
     let db = state.db.clone();
     let ident_clone = ident;
     let task = spawn_blocking(move || -> anyhow::Result<db::Task> {
         let conn = db.lock().unwrap();
         crate::task_events::mutation(&conn, origin.as_ref(), |conn| {
-        let task = db::insert_task(
+        let task = db::insert_task_with_goal(
             conn,
             &ident_clone,
             &title,
@@ -7156,8 +7245,9 @@ pub async fn create_task_handler(
             &labels,
             hostname.as_deref(),
             &reporter,
+            goal.as_deref(),
         )?;
-        if task.owner_agent_id.is_none() && task.status == "todo" {
+        if task.goal.is_none() && task.owner_agent_id.is_none() && task.status == "todo" {
             system_nudge(
                 conn,
                 &ident_clone,
@@ -7182,7 +7272,7 @@ pub async fn delegate_task_handler(
     Path(source_ident): Path<String>,
     Json(req): Json<DelegateTaskRequest>,
 ) -> Result<Json<DelegationResponse>> {
-    let origin = crate::task_events::origin(&headers)?;
+    let origin = task_creation_origin(&headers)?;
     let source_ident = normalize_project_ident(&source_ident);
     let target_ident = normalize_project_ident(&req.target_project_ident);
     let title = req.title.trim().to_string();
@@ -7327,6 +7417,10 @@ pub async fn update_task_handler(
     let origin = crate::task_events::origin(&headers)?;
     // Validate & decode the nullable-string fields up-front so we can return
     // 400 on a client-side shape mistake rather than bubbling a 500.
+    let goal_opt = decode_nullable_string("goal", req.goal)?
+        .map(|goal| db::normalize_task_goal(goal.as_deref()))
+        .transpose()
+        .map_err(|e| AppError(StatusCode::BAD_REQUEST, e.to_string()))?;
     let owner_opt = decode_nullable_string("owner_agent_id", req.owner_agent_id)?;
     let description_opt = decode_nullable_string("description", req.description)?;
     let details_opt = if req.specification.is_some() {
@@ -7337,6 +7431,8 @@ pub async fn update_task_handler(
     let hostname_opt = decode_nullable_string("hostname", req.hostname)?;
 
     let actor = actor_agent_id(&headers);
+    let agent_request = actor.is_some() || origin.is_some();
+    let selected_goal = task_goal_header(&headers);
     let db = state.db.clone();
     let ident_for_reclaim = ident.clone();
     let ident_for_update = ident.clone();
@@ -7357,7 +7453,18 @@ pub async fn update_task_handler(
         crate::task_events::mutation(&conn, origin.as_ref(), |conn| {
         let before = db::get_task_detail(conn, &ident_for_update, &task_id_clone)?.map(|d| d.task);
 
+        if agent_request {
+            if let Some(goal) = before.as_ref().and_then(|task| task.goal.as_deref()) {
+                let changes_queue = status.as_deref() == Some("in_progress")
+                    || owner_opt.as_ref().is_some_and(|o| o.is_some())
+                    || goal_opt.is_some();
+                if changes_queue && selected_goal.as_deref() != Some(goal) {
+                    return Err(TaskGoalConflict.into());
+                }
+            }
+        }
         let upd = db::TaskUpdate {
+            goal: goal_opt.as_ref().map(|g| g.as_deref()),
             status: status.as_deref(),
             owner_agent_id: owner_opt.as_ref().map(|inner| inner.as_deref()),
             rank,
@@ -7406,6 +7513,7 @@ pub async fn update_task_handler(
                         &summary,
                     )?;
                     let done_upd = db::TaskUpdate {
+                        goal: None,
                         status: Some("done"),
                         owner_agent_id: None,
                         rank: None,
@@ -7473,6 +7581,7 @@ pub async fn update_delegation_handler(
         });
 
         let source_upd = db::TaskUpdate {
+            goal: None,
             status: None,
             owner_agent_id: None,
             rank: None,
@@ -7493,6 +7602,7 @@ pub async fn update_delegation_handler(
 
         let target_title = req.title.as_deref().map(|t| t.trim_end_matches(" (DELEGATED)"));
         let target_upd = db::TaskUpdate {
+            goal: None,
             status: None,
             owner_agent_id: None,
             rank: None,
@@ -7682,6 +7792,10 @@ pub async fn reorder_tasks_handler(
     }
 
     let actor = actor_agent_id(&headers);
+    let agent_request = actor.is_some() || origin.is_some();
+    let selected_goal = task_goal_header(&headers);
+    let response_goal = q.goal.or_else(|| selected_goal.clone());
+    let filter_goal = agent_request || response_goal.is_some();
     let db = state.db.clone();
     let ident_clone = ident;
     let status_clone = status.clone();
@@ -7690,14 +7804,30 @@ pub async fn reorder_tasks_handler(
     let tasks = spawn_blocking(move || -> anyhow::Result<Vec<db::TaskSummary>> {
         let conn = db.lock().unwrap();
         crate::task_events::mutation(&conn, origin.as_ref(), |conn| {
+            if agent_request && status_clone == "in_progress" {
+                for id in &order {
+                    if let Some(detail) = db::get_task_detail(conn, &ident_clone, id)? {
+                        if let Some(goal) = detail.task.goal.as_deref() {
+                            if selected_goal.as_deref() != Some(goal) {
+                                return Err(TaskGoalConflict.into());
+                            }
+                        }
+                    }
+                }
+            }
             db::reorder_tasks_in_column(conn, &ident_clone, &status_clone, &order, actor.as_deref())
         })?;
-        db::list_tasks(
+        let mut tasks = db::list_tasks(
             &conn,
             &ident_clone,
             std::slice::from_ref(&status_clone),
             false,
-        )
+        )?;
+        if filter_goal {
+            let goal = response_goal.as_deref().unwrap_or("").trim();
+            tasks.retain(|task| task.goal.as_deref().unwrap_or("") == goal);
+        }
+        Ok(tasks)
     })
     .await??;
 
@@ -8027,6 +8157,7 @@ pub async fn pattern_detail_page(
 pub async fn new_task_page(
     State(state): State<AppState>,
     Path(ident): Path<String>,
+    Query(q): Query<crate::ui::tasks::TasksQuery>,
 ) -> Result<Html<String>> {
     let db_handle = state.db.clone();
     let ident_for_lookup = ident.clone();
@@ -8062,6 +8193,10 @@ pub async fn new_task_page(
           <input id="new-task-title" name="title" required>
         </div>
         <div class="nd-form-group">
+          <label for="new-task-goal">Goal (optional)</label>
+          <input id="new-task-goal" name="goal" value="{goal}" placeholder="e.g. authentication-refresh">
+        </div>
+        <div class="nd-form-group">
           <label for="new-task-description">Description</label>
           <textarea id="new-task-description" name="description" rows="5"></textarea>
         </div>
@@ -8077,6 +8212,7 @@ pub async fn new_task_page(
     </div>
   </section>"#,
         ident = ident_attr,
+        goal = he(q.goal.as_deref().unwrap_or("")),
     );
 
     let html = format!(
@@ -8158,6 +8294,7 @@ pub(crate) fn render_task_link_page(detail: &db::TaskDetail, theme: &str) -> Str
     <dl class="task-link-facts nd-mt-lg nd-mb-lg">
       <div><dt>Project</dt><dd><a href="/projects/{ident_path}/tasks">{ident}</a></dd></div>
       <div><dt>Task ID</dt><dd><code>{task_id}</code></dd></div>
+      <div><dt>Goal</dt><dd id="task-link-goal" data-nd-bind="{api_url}" data-nd-field="goal">{goal}</dd></div>
       <div><dt>Status</dt><dd data-nd-bind="{api_url}" data-nd-field="status">{status}</dd></div>
       <div><dt>Rank</dt><dd data-nd-bind="{api_url}" data-nd-field="rank">{rank}</dd></div>
       <div><dt>Owner</dt><dd data-nd-bind="{api_url}" data-nd-field="owner_agent_id">{owner}</dd></div>
@@ -8177,6 +8314,11 @@ pub(crate) fn render_task_link_page(detail: &db::TaskDetail, theme: &str) -> Str
     <h3 class="nd-mt-lg">Labels</h3>
     <div>{labels}</div>
 
+    <form class="nd-flex nd-gap-sm nd-mt-md" data-nd-action="PATCH {api_url}"
+          data-nd-success="refresh:#task-link-goal">
+      <label>Goal <input name="goal" value="{goal_value}" placeholder="Blank removes the goal"></label>
+      <button type="submit" class="nd-btn-secondary nd-btn-sm">Save goal</button>
+    </form>
     <div class="nd-flex nd-gap-sm nd-mt-lg task-link-actions">
       <button type="button" class="nd-btn-primary nd-btn-sm"
               data-nd-action="PATCH {api_url}" data-nd-body='{{"status":"in_progress"}}'
@@ -8238,6 +8380,8 @@ pub(crate) fn render_task_link_page(detail: &db::TaskDetail, theme: &str) -> Str
         status = he(&task.status),
         ident = he(&task.project_ident),
         task_id = he(&task.id),
+        goal = he(task.goal.as_deref().unwrap_or("None")),
+        goal_value = he(task.goal.as_deref().unwrap_or("")),
         rank = task.rank,
         owner = he(task.owner_agent_id.as_deref().unwrap_or("Unassigned")),
         reporter = he(&task.reporter),
@@ -8284,6 +8428,7 @@ pub(crate) fn render_task_link_page(detail: &db::TaskDetail, theme: &str) -> Str
 pub async fn tasks_board(
     State(state): State<AppState>,
     Path(ident): Path<String>,
+    Query(q): Query<crate::ui::tasks::TasksQuery>,
 ) -> Result<Html<String>> {
     let db_handle = state.db.clone();
     let ident_for_lookup = ident.clone();
@@ -8309,7 +8454,7 @@ pub async fn tasks_board(
     let ident_attr = he(&project.ident);
     let page_title = format!("Tasks — {}", project.ident);
     let toolbar = r#"    <a class="nd-btn-ghost nd-btn-sm" href="/tasks">← All projects</a>"#;
-    let content = tasks_board_content(&ident_attr, toolbar);
+    let content = tasks_board_content(&ident_attr, toolbar, q.goal.as_deref());
 
     let html = format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n{head}\n</head>\n{open}\n{content}\n{close}",
@@ -8352,7 +8497,22 @@ pub(crate) const TASKS_BOARD_HEAD_EXTRA: &str = r#"<meta name="var:selectedTaskI
 /// project. `ident_attr` must already be HTML-escaped; `toolbar` is trusted
 /// markup rendered to the left of the "+ New task" button (the project page
 /// passes a back link, `/tasks` passes the project switcher).
-pub(crate) fn tasks_board_content(ident_attr: &str, toolbar: &str) -> String {
+pub(crate) fn tasks_board_content(ident_attr: &str, toolbar: &str, goal: Option<&str>) -> String {
+    let new_goal_query = goal
+        .map(|g| format!("?goal={}", he(&path_segment(g.trim()))))
+        .unwrap_or_default();
+    let goal_query = goal
+        .map(|g| format!("&amp;goal={}", he(&path_segment(g.trim()))))
+        .unwrap_or_default();
+    let goal_filter = format!(
+        r#"<form method="get" class="nd-flex nd-gap-sm">
+      <input type="hidden" name="project" value="{ident_attr}">
+      <label>Goal <input name="goal" value="{}" placeholder="Goal name; blank for ungrouped"></label>
+      <button class="nd-btn-secondary nd-btn-sm" type="submit">Filter</button>
+      <a class="nd-btn-ghost nd-btn-sm" href="?project={ident_attr}">All goals</a>
+    </form>"#,
+        he(goal.unwrap_or(""))
+    );
     // Layout: `.nd-row` gives each `.nd-col-*` 0.5rem of inner padding on
     // both sides (Bootstrap-style gutter). For the cards to have visible
     // space BETWEEN them, the card must live *inside* the col wrapper — if
@@ -8377,7 +8537,8 @@ pub(crate) fn tasks_board_content(ident_attr: &str, toolbar: &str) -> String {
     format!(
         r##"  <div class="nd-flex nd-gap-md nd-mb-md">
 {toolbar}
-    <a class="nd-btn-primary nd-btn-sm" href="/projects/{ident}/tasks/new">+ New task</a>
+{goal_filter}
+    <a class="nd-btn-primary nd-btn-sm" href="/projects/{ident}/tasks/new{new_goal_query}">+ New task</a>
   </div>
 
   <!-- Shared card template used by all three columns. -->
@@ -8391,6 +8552,7 @@ pub(crate) fn tasks_board_content(ident_attr: &str, toolbar: &str) -> String {
         <div class="nd-font-semibold task-card-title">{{{{title}}}}</div>
         <ul class="task-card-meta nd-text-muted nd-text-sm">
           <li>{{{{comment_count}}}} comments</li>
+          <li>Goal: {{{{goal}}}}</li>
         </ul>
       </button>
     </li>
@@ -8402,9 +8564,9 @@ pub(crate) fn tasks_board_content(ident_attr: &str, toolbar: &str) -> String {
         <div class="nd-card-header"><strong>TODO</strong></div>
         <ul class="nd-card-body"
             id="col-todo"
-            data-nd-bind="/v1/projects/{ident}/tasks?status=todo"
+            data-nd-bind="/v1/projects/{ident}/tasks?status=todo{goal_query}"
             data-nd-template="task-card"
-            data-nd-sortable="POST /v1/projects/{ident}/tasks/reorder?status=todo"
+            data-nd-sortable="POST /v1/projects/{ident}/tasks/reorder?status=todo{goal_query}"
             data-nd-sortable-group="tasks"
             data-nd-sortable-refresh="#col-todo,#col-in_progress,#col-done">
           <template data-nd-empty>
@@ -8419,9 +8581,9 @@ pub(crate) fn tasks_board_content(ident_attr: &str, toolbar: &str) -> String {
         <div class="nd-card-header"><strong>IN PROGRESS</strong></div>
         <ul class="nd-card-body"
             id="col-in_progress"
-            data-nd-bind="/v1/projects/{ident}/tasks?status=in_progress"
+            data-nd-bind="/v1/projects/{ident}/tasks?status=in_progress{goal_query}"
             data-nd-template="task-card"
-            data-nd-sortable="POST /v1/projects/{ident}/tasks/reorder?status=in_progress"
+            data-nd-sortable="POST /v1/projects/{ident}/tasks/reorder?status=in_progress{goal_query}"
             data-nd-sortable-group="tasks"
             data-nd-sortable-refresh="#col-todo,#col-in_progress,#col-done">
           <template data-nd-empty>
@@ -8436,9 +8598,9 @@ pub(crate) fn tasks_board_content(ident_attr: &str, toolbar: &str) -> String {
         <div class="nd-card-header"><strong>DONE</strong></div>
         <ul class="nd-card-body"
             id="col-done"
-            data-nd-bind="/v1/projects/{ident}/tasks?status=done"
+            data-nd-bind="/v1/projects/{ident}/tasks?status=done{goal_query}"
             data-nd-template="task-card"
-            data-nd-sortable="POST /v1/projects/{ident}/tasks/reorder?status=done"
+            data-nd-sortable="POST /v1/projects/{ident}/tasks/reorder?status=done{goal_query}"
             data-nd-sortable-group="tasks"
             data-nd-sortable-refresh="#col-todo,#col-in_progress,#col-done">
           <template data-nd-empty>
@@ -8473,6 +8635,7 @@ pub(crate) fn tasks_board_content(ident_attr: &str, toolbar: &str) -> String {
         <template id="task-modal-meta-tmpl">
           <div class="nd-text-muted nd-text-sm nd-mb-md">
             status: {{{{status}}}} · rank {{{{rank}}}} · reporter {{{{reporter}}}}
+            <p>Goal: {{{{goal}}}}</p>
           </div>
           <p class="nd-text-muted nd-text-sm">Description</p>
           <p>{{{{description}}}}</p>
@@ -8481,6 +8644,11 @@ pub(crate) fn tasks_board_content(ident_attr: &str, toolbar: &str) -> String {
         </template>
       </div>
 
+      <form class="nd-flex nd-gap-sm nd-mt-md" data-nd-action="PATCH /v1/projects/{ident}/tasks/${{selectedTaskId}}"
+            data-nd-success="refresh:#col-todo,refresh:#col-in_progress,refresh:#col-done,refresh:#task-modal-meta,reset">
+        <label>Move to goal <input name="goal" placeholder="Blank removes the goal"></label>
+        <button type="submit" class="nd-btn-secondary nd-btn-sm">Save goal</button>
+      </form>
       <div id="task-modal-actions" class="nd-flex nd-gap-sm nd-mt-md nd-mb-lg">
         <button type="button"
                 class="nd-btn-primary nd-btn-sm"
@@ -9499,11 +9667,230 @@ mod tests {
         );
     }
 
+    fn native_task_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            ("x-agent-session-id", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            (
+                "x-agent-instance-id",
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            ),
+            ("x-agent-provider", "codex"),
+            ("x-agent-os", "linux"),
+        ] {
+            headers.insert(name, value.parse().unwrap());
+        }
+        headers
+    }
+
+    #[tokio::test]
+    async fn task_goal_queues_are_explicit_and_preserve_legacy_tasks() {
+        let state = test_state();
+        let mut agent = native_task_headers();
+        agent.insert("x-agent-id", "worker-a".parse().unwrap());
+        let create = |value| Json(serde_json::from_value::<CreateTaskRequest>(value).unwrap());
+        let Json(plain) = create_task_handler(
+            State(state.clone()),
+            agent.clone(),
+            Path("demo".into()),
+            create(serde_json::json!({"title":"General work"})),
+        )
+        .await
+        .unwrap();
+        let Json(scoped) = create_task_handler(
+            State(state.clone()),
+            agent.clone(),
+            Path("demo".into()),
+            create(serde_json::json!({"title":"Goal work", "goal":"  release  "})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(scoped.task.goal.as_deref(), Some("release"));
+        let query = |value| Query(serde_json::from_value::<ListTasksQuery>(value).unwrap());
+        let Json(default) = list_tasks_handler(
+            State(state.clone()),
+            agent.clone(),
+            Path("demo".into()),
+            query(serde_json::json!({})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            default.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec![plain.task.id.as_str()]
+        );
+        let Json(human) = list_tasks_handler(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("demo".into()),
+            query(serde_json::json!({})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(human.len(), 2);
+        let Json(all) = list_tasks_handler(
+            State(state.clone()),
+            agent.clone(),
+            Path("demo".into()),
+            query(serde_json::json!({"all_goals":true})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(all.len(), 2);
+        let Json(selected) = list_tasks_handler(
+            State(state.clone()),
+            agent.clone(),
+            Path("demo".into()),
+            query(serde_json::json!({"goal":"release"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, scoped.task.id);
+        assert_eq!(selected[0].goal.as_deref(), Some("release"));
+        agent.insert("x-task-goal", "release".parse().unwrap());
+        let Json(inherited) = create_task_handler(
+            State(state.clone()),
+            agent.clone(),
+            Path("demo".into()),
+            create(serde_json::json!({"title":"Inherit context"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(inherited.task.goal.as_deref(), Some("release"));
+        let Json(ungrouped) = list_tasks_handler(
+            State(state.clone()),
+            agent,
+            Path("demo".into()),
+            query(serde_json::json!({"goal":""})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ungrouped.len(), 1);
+        let conn = state.db.lock().unwrap();
+        let nudges: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM messages WHERE subject='Task created'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nudges, 0, "goal work must not create project-wide nudges");
+        let events = crate::task_events::list(&conn, &Default::default()).unwrap();
+        let event = events
+            .iter()
+            .find(|e| e.task["id"] == scoped.task.id)
+            .unwrap();
+        assert_eq!(
+            event.task["goal"], "release",
+            "the initial event must include the goal"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_goal_claims_require_matching_context_and_can_be_cleared() {
+        let state = test_state();
+        let Json(created) = create_task_handler(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("demo".into()),
+            Json(
+                serde_json::from_value(serde_json::json!({"title":"Scoped", "goal":"release"}))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        let path = || Path(("demo".into(), created.task.id.clone()));
+        let update = |value| Json(serde_json::from_value::<UpdateTaskRequest>(value).unwrap());
+        let mut agent = native_task_headers();
+        agent.insert("x-agent-id", "worker-b".parse().unwrap());
+        // Goal mutations of a claim require the exact claiming session too.
+        agent.insert(
+            "x-agent-session-id",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".parse().unwrap(),
+        );
+        agent.insert(
+            "x-agent-instance-id",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".parse().unwrap(),
+        );
+        agent.insert("x-agent-provider", "codex".parse().unwrap());
+        agent.insert("x-agent-os", "linux".parse().unwrap());
+        for goal in [None, Some("different")] {
+            if let Some(goal) = goal {
+                agent.insert("x-task-goal", goal.parse().unwrap());
+            }
+            let error = update_task_handler(
+                State(state.clone()),
+                agent.clone(),
+                path(),
+                update(serde_json::json!({"status":"in_progress"})),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.0, StatusCode::CONFLICT);
+        }
+        // Reorder is also a claim path and cannot bypass goal selection.
+        let error = reorder_tasks_handler(
+            State(state.clone()),
+            agent.clone(),
+            Path("demo".into()),
+            Query(ReorderTasksQuery {
+                goal: None,
+                status: "in_progress".into(),
+            }),
+            Json(ReorderTasksRequest {
+                order: vec![created.task.id.clone()],
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        agent.insert("x-task-goal", "release".parse().unwrap());
+        let Json(claimed) = update_task_handler(
+            State(state.clone()),
+            agent.clone(),
+            path(),
+            update(serde_json::json!({"status":"in_progress"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claimed.owner_agent_id.as_deref(), Some("worker-b"));
+        let Json(retained) = update_task_handler(
+            State(state.clone()),
+            agent.clone(),
+            path(),
+            update(serde_json::json!({"title":"Renamed"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(retained.goal.as_deref(), Some("release"));
+        let Json(cleared) = update_task_handler(
+            State(state.clone()),
+            agent,
+            path(),
+            update(serde_json::json!({"goal":null})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cleared.goal, None);
+        let error = update_task_handler(
+            State(state),
+            HeaderMap::new(),
+            path(),
+            update(serde_json::json!({"goal":123})),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
     fn sample_task() -> db::Task {
         db::Task {
             id: "task-1".to_string(),
             project_ident: "demo-project".to_string(),
             title: "Demo task".to_string(),
+            goal: None,
             description: Some("Short context".to_string()),
             details: Some("Long handoff spec".to_string()),
             status: "todo".to_string(),
@@ -10589,10 +10976,12 @@ mod tests {
         key: &str,
         manifest_item_ids: Option<Vec<String>>,
     ) -> (StatusCode, Value) {
+        let mut headers = mutation_headers(key);
+        headers.extend(native_task_headers());
         let response = generate_spec_tasks_handler(
             State(state.clone()),
             Path(("demo".to_string(), artifact_id.to_string())),
-            mutation_headers(key),
+            headers,
             Json(GenerateSpecTasksRequest {
                 confirmed: true,
                 manifest_item_ids,
@@ -11721,13 +12110,14 @@ mod tests {
             State(state.clone()),
             Query(crate::ui::tasks::TasksQuery {
                 project: Some("nope".into()),
+                goal: None,
             }),
         )
         .await
         .unwrap();
         assert!(page.0.contains(r#"<option value="demo" selected>"#));
 
-        let board = tasks_board(State(state), Path("demo".into()))
+        let board = tasks_board(State(state), Path("demo".into()), Query(Default::default()))
             .await
             .unwrap();
         assert_eq!(

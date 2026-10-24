@@ -283,7 +283,7 @@ still retain their historical claim-time meaning; explicit executor-start
 semantics apply to dispatch-managed tasks.
 
 Dispatch-managed tasks reject ordinary PATCH, reorder, DELETE, and legacy
-operator release; automatic one-hour stale reclaim excludes them. Comments and
+operator release; automatic 15-minute stale reclaim excludes them. Comments and
 ordinary reads do not constitute receipt or execution. Legacy APIs are not
 machine-authenticated by the new protocol, and client-supplied origin headers
 alone do not prove a machine. The gateway's existing public bearer-authenticated

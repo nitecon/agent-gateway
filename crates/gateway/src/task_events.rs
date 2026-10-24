@@ -176,7 +176,8 @@ pub fn initialize(conn: &Connection) -> Result<()> {
         DROP TRIGGER IF EXISTS task_event_created;
         DROP TRIGGER IF EXISTS task_event_commented;
         DROP TRIGGER IF EXISTS task_event_completed;
-        DROP TRIGGER IF EXISTS task_event_cancelled;")?;
+        DROP TRIGGER IF EXISTS task_event_cancelled;
+        DROP TRIGGER IF EXISTS task_event_unclaimed;")?;
     let actor = "(SELECT origin_json FROM task_mutation_context WHERE id=1)";
     let task = task_json("NEW");
     let commented_task = task_json("t");
@@ -197,6 +198,14 @@ pub fn initialize(conn: &Connection) -> Result<()> {
         VALUES ('task_completed',NEW.project_ident,(SELECT canonical_remote FROM projects WHERE ident=NEW.project_ident),{task},
         (SELECT {latest_comment} FROM task_comments c WHERE c.task_id=NEW.id AND c.author_type!='system' ORDER BY c.created_at DESC,c.id DESC LIMIT 1),NEW.updated_at,{actor});
     END;
+    CREATE TRIGGER IF NOT EXISTS task_event_unclaimed AFTER UPDATE OF status,owner_agent_id,owner_origin_json ON tasks
+    WHEN NEW.status='todo' AND NEW.owner_agent_id IS NULL AND NEW.owner_origin_json IS NULL
+      AND (OLD.owner_agent_id IS NOT NULL OR OLD.owner_origin_json IS NOT NULL OR OLD.status='in_progress')
+      AND NOT EXISTS(SELECT 1 FROM task_dispatches d WHERE d.task_id=NEW.id) BEGIN
+        INSERT INTO task_events(kind,project_ident,canonical_remote,task_json,comment_json,created_at,origin_json)
+        VALUES ('task_unclaimed',NEW.project_ident,(SELECT canonical_remote FROM projects WHERE ident=NEW.project_ident),{task},
+          (SELECT {latest_comment} FROM task_comments c WHERE c.task_id=NEW.id ORDER BY c.created_at DESC,c.id DESC LIMIT 1),NEW.updated_at,{actor});
+    END;
     CREATE TRIGGER IF NOT EXISTS task_event_cancelled AFTER UPDATE OF status ON tasks
     WHEN NEW.status='cancelled' AND OLD.status!='cancelled' BEGIN
         INSERT INTO task_events(kind,project_ident,canonical_remote,task_json,created_at,origin_json)
@@ -211,6 +220,7 @@ fn task_json(alias: &str) -> String {
         "id",
         "project_ident",
         "title",
+        "goal",
         "description",
         "details",
         "status",
@@ -785,6 +795,7 @@ mod tests {
 
     fn status_update(status: &str) -> db::TaskUpdate<'_> {
         db::TaskUpdate {
+            goal: None,
             status: Some(status),
             owner_agent_id: None,
             rank: None,

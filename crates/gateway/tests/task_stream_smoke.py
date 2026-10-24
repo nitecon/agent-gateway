@@ -20,6 +20,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 ROOT = Path(__file__).resolve().parents[3]
 FIXTURE = Path(tempfile.mkdtemp(prefix="task-stream-smoke-", dir=ROOT / "target"))
@@ -32,6 +33,9 @@ URL = f"http://127.0.0.1:{PORT}"
 
 def api(path, body=None, method=None, origin=None, headers=None):
     request_headers={"Authorization": "Bearer "+TOKEN, "Content-Type":"application/json", "X-Agent-Id":"fixture-agent"}
+    if origin is None and body is not None and (method is None or method == "POST") and path.endswith("/tasks"):
+        # Browser-created fixtures have no submitting agent to reserve.
+        request_headers.pop("X-Agent-Id", None)
     if origin:
         request_headers.update({"X-Agent-Session-Id":origin["session_id"], "X-Agent-Instance-Id":origin["instance_id"], "X-Agent-Provider":origin["provider"], "X-Agent-OS":origin["os"]})
     request_headers.update(headers or {})
@@ -143,7 +147,7 @@ class StreamSocket:
 
 def main():
     binary=str(ROOT/"target/debug/gateway")
-    env={"PATH":"/usr/bin:/bin","HOME":str(FIXTURE),"GATEWAY_API_KEY":TOKEN,
+    env={"PATH":"/usr/bin:/bin","GATEWAY_API_KEY":TOKEN,
          "GATEWAY_HOST":"127.0.0.1","GATEWAY_PORT":str(PORT),"DATABASE_PATH":str(FIXTURE/"gateway.db"),"GATEWAY_UI_AUTH":"on"}
     for username,flags in [("fixture-admin",["--admin"]),("fixture-member",[])]:
         subprocess.run([binary,"user","add",username,*flags],env={**env,"GATEWAY_USER_PASSWORD":"fixture-password-123"},check=True,capture_output=True)
@@ -152,6 +156,8 @@ def main():
         conn.execute("INSERT INTO execution_runs(id,project_ident,trigger,dedup_key,status,created_at,summary) VALUES ('legacy-run','legacy','task','legacy-run','running',1,'Preserved old summary')")
         for key in ['execution','execution.templates','execution.project.legacy']:
             conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)",(key,'{"enabled":true,"on_task_received":true}'))
+    (FIXTURE/".env").write_text("# Private fixture; no ancestor configuration.\n")
+    env.update({"HTTP_PROXY":"http://127.0.0.1:9","HTTPS_PROXY":"http://127.0.0.1:9","NO_PROXY":"127.0.0.1,localhost"})
     log=(FIXTURE/"gateway.log").open("w")
     process=None
     def start():
@@ -242,6 +248,15 @@ def main():
         assert all(e["origin"]==REQUESTER for e in received)
         target_path=f"/v1/projects/beta/tasks/{delegation['target_task']['id']}"
         source_path=f"/v1/projects/alpha/tasks/{delegation['source_task']['id']}"
+        assert api(target_path)["owner_origin"] == REQUESTER
+        rejected(409,target_path,{"status":"in_progress"},origin=WORKER)
+        machine_key=subprocess.check_output([binary,"task-machine","issue","beta",WORKER["instance_id"],WORKER["os"]],cwd=FIXTURE,env=env,text=True).strip().splitlines()[-1]
+        target=api("/v1/projects/beta/task-sessions",{"generation":str(uuid.uuid4())},origin=WORKER,
+                   headers={"X-Gateway-Machine-Key":machine_key,"X-Gateway-Session-Key":os.urandom(32).hex()})["target"]
+        third={**REQUESTER,"session_id":str(uuid.uuid4())}
+        moved=api(target_path+"/reassign",{"target":target},origin=third)
+        assert moved["owner_origin"] == WORKER and moved["status"] == "todo" and moved["started_at"] is None
+        reassigned=receive_event(client,"task_commented");assert reassigned["origin"]==third and reassigned["task"]["owner_origin"]==WORKER;ack(client,reassigned)
         api(source_path,{"status":"in_progress"},"PATCH",origin=REQUESTER)
         claimed=api(target_path,{"status":"in_progress"},"PATCH",origin=WORKER)
         assert claimed["owner_origin"]==WORKER
@@ -256,6 +271,7 @@ def main():
         rejected(400,target_path,{"status":"done"},origin={**WORKER,"session_id":"invalid"})
         released=api(target_path,{"status":"todo"},"PATCH",origin=WORKER)
         assert released["owner_origin"] is None and released["owner_agent_id"] is None
+        ack(client,receive_event(client,"task_unclaimed"))
         api(target_path,{"status":"in_progress"},"PATCH",origin=WORKER)
         comment=api(target_path+"/comments",{"content":"A different session commented last"},origin=REQUESTER)
         event=receive_event(client,"task_commented")
@@ -291,6 +307,18 @@ def main():
         assert api(source_path)["status"]=="done" and api(source_path)["comments"][-1]["origin"]==WORKER
         large=api("/v1/projects/alpha/tasks",{"title":"<script>fixture</script>","specification":("🦀\n"+TOKEN)*10000})
         event=receive_event(client,"task_created");assert event["truncated"] and TOKEN not in json.dumps(event);ack(client,event)
+        # Only the maintenance timer can release this assigned TODO: no task reads drive it.
+        expiring=api("/v1/projects/alpha/tasks",{"title":"Idle reserved task"},origin=WORKER)
+        event=receive_event(client,"task_created");assert event["task"]["owner_origin"]==WORKER;ack(client,event)
+        with sqlite3.connect(FIXTURE/"gateway.db") as conn:
+            conn.execute("UPDATE tasks SET updated_at=? WHERE id=?",(int(time.time()*1000)-15*60*1000-1,expiring["id"]))
+        client.sock.settimeout(40)
+        audit=receive_event(client,"task_commented");assert audit["task"]["id"]==expiring["id"] and "15 minutes" in audit["comment"]["content"];ack(client,audit)
+        expired=receive_event(client,"task_unclaimed")
+        assert expired["task"]["id"]==expiring["id"] and expired["task"]["owner_origin"] is None and expired["task"]["owner_agent_id"] is None
+        assert expired["task"]["status"]=="todo" and expired["origin"] is None
+        ack(client,expired)
+        api(f"/v1/projects/alpha/tasks/{expiring['id']}",{"status":"in_progress"},"PATCH",origin=REQUESTER)
         rows=api("/v1/task-events")
         assert TOKEN not in json.dumps(rows)
         for path in ['/v1/execution/settings','/v1/execution/templates','/v1/execution/clients','/v1/projects/alpha/execution','/v1/execution/connect','/v1/execution/sessions']:

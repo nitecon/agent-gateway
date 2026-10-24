@@ -251,7 +251,11 @@ can be overridden per request with an explicit `reporter`/`author` field.
 Session-origin builds also accept `X-Agent-Session-Id` (UUID),
 `X-Agent-Instance-Id` (UUID), `X-Agent-Provider` (`codex`/`claude`) and
 `X-Agent-OS` (`linux`/`windows`/`macos`) together. Partial or malformed headers
-return 400. Legacy requests without these headers remain unattributed.
+return 400. Agent task creation (including delegated tasks and subtasks) requires
+these origin headers; browser-created tasks without an agent remain unassigned.
+An agent-created task is assigned to the submitting session in its initial
+INSERT, including its first WebSocket snapshot. It remains `todo` with no start
+time. `reporter` and `X-Agent-Id` display labels do not override that assignment.
 Attributed claims persist `owner_origin`; status or owner changes then require
 the exact claiming session and instance (409 otherwise), including requests
 sharing the same `X-Agent-Id` and unattributed callers. Release/reopen to `todo`
@@ -265,21 +269,79 @@ atomically with target completion. The protocol-v1 broadcast and receipt
 contract is unchanged; see [task_events.rs](crates/gateway/src/task_events.rs)
 for the wire contract.
 
-Two background reconciliations run on every list and detail read:
+Inactivity expiry runs every 30 seconds and also on task list/detail reads:
 
-- **Stale reclaim (1h).** An `in_progress` task with no `updated_at` activity
-  for more than 1 hour is flipped back to `todo`, its owner is cleared, and a
-  system comment is appended so the next agent verifies prior progress.
+- **Stale reclaim (15 minutes).** An assigned `todo` or ordinary `in_progress`
+  task with no comment or task action for 15 minutes becomes unclaimed `todo`.
+  Any comment or task update resets the deadline through `updated_at`.
+  The owner and start time are cleared, an audit comment is stored, and a durable
+  `task_unclaimed` WebSocket event contains the unclaimed task snapshot. No board
+  read is needed: expiry is delivered within the next 30-second maintenance tick.
+  Repeated sweeps do not emit duplicate expiry events. Explicit releases also
+  emit `task_unclaimed`. Credential-bound dispatch tasks retain their separate
+  receipt/claim/start/handoff protocol and do not automatically transfer work.
 - **Done fade (7d).** `done` tasks are hidden from list results once their
   `done_at` is older than 7 days. Pass `include_stale=true` to include them.
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/v1/projects/:ident/tasks` | List task summaries. `status` is a comma-separated filter (`todo,in_progress`); defaults to `todo,in_progress` when omitted. `include_stale=true` includes faded `done` tasks. Returns `[{id, title, status, rank, labels, owner_agent_id, hostname, reporter, comment_count, created_at, updated_at, kind, delegated_to_project_ident, delegated_to_task_id}]`. |
-| `POST` | `/v1/projects/:ident/tasks` | Create a task. Body: `title` (required), optional `description`, `specification` (alias `details`), `labels`, `hostname`, `reporter`. Returns the created task flattened with `specification` and a `hint` field. |
+| `POST` | `/v1/projects/:ident/tasks` | Create a task. Body: `title` (required), optional `goal`, `description`, `specification` (alias `details`), `labels`, `hostname`, `reporter`. Returns the created task flattened with `specification` and a `hint` field. |
 | `GET` | `/v1/projects/:ident/tasks/:id` | Fetch one task with its `comments[]` and a derived `actions[]` array (see below). |
-| `PATCH` | `/v1/projects/:ident/tasks/:id` | Update a task. Body fields: `status`, `rank`, `title`, `labels`, plus nullable `owner_agent_id`, `description`, `specification` (alias `details`), `hostname`. For the nullable fields, JSON `null` clears the column, a string sets it, and an absent key leaves it unchanged. |
+| `PATCH` | `/v1/projects/:ident/tasks/:id` | Update a task. Body fields: `status`, `rank`, `title`, `labels`, plus nullable `goal`, `owner_agent_id`, `description`, `specification` (alias `details`), `hostname`. For the nullable fields, JSON `null` clears the column, a string sets it, and an absent key leaves it unchanged. |
+| `POST` | `/v1/projects/:ident/tasks/:id/reassign` | Reassign an ordinary active task to a live registered session. Any authenticated calling agent may call it; the current owner is not required. Body: `{target: {origin: {session_id, instance_id, provider, os}, generation}}`. Returns the updated flat task and stores an audit comment. |
 | `POST` | `/v1/projects/:ident/tasks/:id/comments` | Add a comment. Body: `content` (required), optional `author`, and `author_type` (`agent` or `user`; defaults from whether `X-Agent-Id` is present). |
+
+#### Reassignment
+
+Call `POST /v1/projects/:ident/tasks/:id/reassign` with the usual gateway bearer
+and complete calling-agent origin headers. It is a regular authenticated API;
+the caller can reassign another agent's task as well as its own. Choose an exact
+live target from the existing credential-bound `GET /v1/projects/:ident/task-sessions`
+directory. Expired, revoked, unregistered, and other-project targets return 409.
+For example:
+
+```json
+{"target":{"origin":{"session_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","instance_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","provider":"codex","os":"linux"},"generation":"cccccccc-cccc-4ccc-8ccc-cccccccccccc"}}
+```
+
+Reassignment atomically sets `owner_origin` and `owner_agent_id` (the target's
+session UUID), returns the task to `todo`, clears its start time, records the
+calling agent in an audit comment, and resets inactivity expiry. The new owner
+can then claim the task. Ordinary PATCH/status ownership checks continue to
+prevent peers from accidentally claiming assigned work. Finished tasks must be
+reopened first; dispatch-managed tasks use their existing dispatch handoff API.
+
+#### Goal queues
+
+Tasks can carry an optional `goal`, such as `release` or `authentication-refresh`.
+Set it on creation or PATCH an existing task; strings are trimmed, and an empty
+string or PATCH `null` removes the association. Names are case-sensitive, allow
+at most 128 UTF-8 bytes, and cannot contain control characters. Task summaries, details, and
+lifecycle event snapshots include `goal` (null for existing ungrouped tasks).
+The board offers a goal filter, and creation/edit forms let operators set it.
+Same-project subtasks inherit their parent's goal; cross-project subtasks start
+ungrouped.
+
+Agent task lists (requests with `X-Agent-Id` or session-origin headers) default
+to ungrouped tasks. `?goal=release` selects that goal, `?goal=` selects ungrouped
+tasks, and `?all_goals=true` explicitly includes every goal. Human requests
+continue to list all goals by default. Status and stale-done filters still apply.
+
+Agents can send `X-Task-Goal: release` as their queue context. It supplies the
+list filter when `goal` is absent and the creation goal when the body omits it.
+An explicit creation `goal: null` or empty string creates ungrouped work.
+Claiming a goal task (PATCH or reorder into `in_progress`, or assigning an
+owner) requires the matching context header; changing an existing goal also
+requires that header. A mismatch returns 409. Existing exact session claim
+ownership checks continue to apply. Goals provide explicit opt-in isolation;
+they do not reserve an entire goal for one agent.
+
+Goal tasks do not create project-wide "Task created" nudges. The task stream
+still broadcasts durable events, including `task.goal`; terminal clients must
+route goal events only to sessions that selected that goal. CLI/hook goal
+selection and terminal delivery integration are maintained in their respective
+client repositories.
 
 #### Status transitions and `actions[]`
 
@@ -301,7 +363,9 @@ A crashed session or a change from legacy to native actor registration can
 leave a claim whose exact owner can no longer release it. Comments from a
 replacement session count as activity, so they delay automatic stale reclaim.
 The gateway does not infer that an owner died from missing CMUX membership or
-a disconnected client, and an ordinary agent cannot override another session.
+a disconnected client. Ordinary PATCH/status changes retain session ownership
+checks; the explicit reassignment API above allows any authenticated calling
+agent to choose a live replacement.
 
 An authorized local operator with access to the gateway database can inspect
 and recover a confirmed orphan. This uses the same local administration

@@ -551,6 +551,28 @@ async fn main() -> Result<()> {
     // ── Inbound message processor ─────────────────────────────────────────────
     spawn_inbound_processor(db.clone(), rx);
 
+    // Expiry emits durable task_unclaimed events even when no client reads the board.
+    {
+        let database = db.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                let database = database.clone();
+                match spawn_blocking(move || {
+                    let conn = database.lock().unwrap();
+                    db::reclaim_all_stale_tasks(&conn)
+                })
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => tracing::warn!("Task expiry failed: {e}"),
+                    Err(e) => tracing::warn!("Task expiry task failed: {e}"),
+                }
+            }
+        });
+    }
+
     // ── Retention task ────────────────────────────────────────────────────────
     {
         let db = db.clone();
@@ -597,6 +619,7 @@ async fn main() -> Result<()> {
 
     // API routes require bearer auth.
     let api = Router::new()
+        .route("/v1/projects/{ident}/tasks/{id}/reassign", post(routes::reassign_task_handler))
         .route("/v1/projects/{ident}/tasks/{id}/subtasks", get(subtasks::get).post(subtasks::create))
         .route("/v1/tasks/stream", get(task_events::connect))
         .route("/v1/task-events", get(task_events::events))

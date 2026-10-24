@@ -16,6 +16,7 @@ use tokio::task::spawn_blocking;
 #[derive(Deserialize, Default)]
 pub struct TasksQuery {
     pub project: Option<String>,
+    pub goal: Option<String>,
 }
 
 /// GET /tasks — the three-column drag-and-drop board with a project switcher.
@@ -64,7 +65,7 @@ pub async fn tasks_index_page(
       <select class="nd-input" onchange="if (this.value) window.location.href = '/tasks?project=' + encodeURIComponent(this.value)">{options}</select>
     </label>"#
             );
-            crate::routes::tasks_board_content(&he(&ident), &toolbar)
+            crate::routes::tasks_board_content(&he(&ident), &toolbar, q.goal.as_deref())
         }
     };
 

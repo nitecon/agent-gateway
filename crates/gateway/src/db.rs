@@ -1174,6 +1174,14 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         [],
     );
     let _ = conn.execute("ALTER TABLE tasks ADD COLUMN delegated_to_task_id TEXT", []);
+    let has_goal: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name='goal')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_goal {
+        conn.execute_batch("ALTER TABLE tasks ADD COLUMN goal TEXT")?;
+    }
     crate::execution_history::initialize(conn)?;
 
     conn.execute_batch(
@@ -7590,9 +7598,9 @@ pub fn delete_skill(conn: &Connection, name: &str) -> Result<bool> {
 
 // ── Tasks ─────────────────────────────────────────────────────────────────────
 
-/// How long an `in_progress` task with no activity before it is considered
-/// abandoned and returned to `todo` by `reclaim_stale_tasks`.
-pub const TASK_RECLAIM_MS: i64 = 60 * 60 * 1000; // 1 hour
+/// How long an assigned TODO or ordinary in-progress task may have no activity
+/// before returning to unclaimed TODO through `reclaim_stale_tasks`.
+pub const TASK_RECLAIM_MS: i64 = 15 * 60 * 1000; // 15 minutes
 /// How long a `done` task remains in the default list view before it falls off.
 pub const TASK_DONE_FALLOFF_MS: i64 = 7 * 24 * 60 * 60 * 1000; // 7 days
 
@@ -7601,6 +7609,7 @@ pub struct Task {
     pub id: String,
     pub project_ident: String,
     pub title: String,
+    pub goal: Option<String>,
     pub description: Option<String>,
     pub details: Option<String>,
     /// One of `"todo"`, `"in_progress"`, `"done"`.
@@ -7653,6 +7662,7 @@ pub struct TaskDelegation {
 pub struct TaskSummary {
     pub id: String,
     pub title: String,
+    pub goal: Option<String>,
     pub status: String,
     pub rank: i64,
     pub labels: Vec<String>,
@@ -7677,6 +7687,7 @@ pub struct TaskDetail {
 /// "do not touch"; for the `Option<Option<_>>` fields, `Some(None)` means
 /// "clear the column" and `Some(Some(x))` means "set to x".
 pub struct TaskUpdate<'a> {
+    pub goal: Option<Option<&'a str>>,
     pub status: Option<&'a str>,
     pub owner_agent_id: Option<Option<&'a str>>,
     pub rank: Option<i64>,
@@ -8181,16 +8192,17 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         delegated_to_project_ident: row.get(16)?,
         delegated_to_task_id: row.get(17)?,
         owner_origin: crate::task_events::read_origin(row, 18)?,
+        goal: row.get(19)?,
     })
 }
 
 const TASK_SELECT_COLS: &str =
     "id, project_ident, title, description, details, status, rank, labels, \
      hostname, owner_agent_id, reporter, created_at, updated_at, started_at, done_at, \
-     kind, delegated_to_project_ident, delegated_to_task_id, owner_origin_json";
+     kind, delegated_to_project_ident, delegated_to_task_id, owner_origin_json, goal";
 
-/// Reclaim any task in this project that has been `in_progress` for longer than
-/// [`TASK_RECLAIM_MS`] without any `updated_at` activity. Reclaimed tasks are
+/// Reclaim assigned TODO and ordinary in-progress tasks after [`TASK_RECLAIM_MS`]
+/// without comments or task actions (`updated_at` activity). Reclaimed tasks are
 /// flipped back to `todo`, the owner is cleared, and a system comment is
 /// appended so the next agent knows to verify prior progress. Runs in a single
 /// transaction.
@@ -8204,10 +8216,9 @@ pub fn reclaim_stale_tasks(conn: &Connection, project_ident: &str) -> Result<usi
         let mut stmt = tx.prepare(
             "SELECT id FROM tasks
              WHERE project_ident = ?1
-               AND status = 'in_progress'
-               AND started_at IS NOT NULL
-               AND started_at < ?2
-               AND updated_at < ?2
+               AND status IN ('todo','in_progress')
+               AND (owner_agent_id IS NOT NULL OR owner_origin_json IS NOT NULL OR status='in_progress')
+               AND updated_at <= ?2
                AND NOT EXISTS(SELECT 1 FROM task_dispatches d WHERE d.task_id=tasks.id)",
         )?;
         let rows = stmt
@@ -8223,7 +8234,7 @@ pub fn reclaim_stale_tasks(conn: &Connection, project_ident: &str) -> Result<usi
         return Ok(0);
     }
 
-    let comment_body = "Reclaimed after 1h of inactivity. Next agent please \
+    let comment_body = "Task became unclaimed after 15 minutes of inactivity. Next agent please \
                         verify prior progress before continuing.";
 
     for task_id in &stale_ids {
@@ -8256,7 +8267,17 @@ pub fn reclaim_stale_tasks(conn: &Connection, project_ident: &str) -> Result<usi
     Ok(stale_ids.len())
 }
 
-/// Insert a new task in the `todo` column. Rank is auto-assigned as
+/// Timer-driven sweep; list/detail reads also reconcile before returning tasks.
+pub fn reclaim_all_stale_tasks(conn: &Connection) -> Result<usize> {
+    let mut total = 0;
+    for project in all_projects(conn)? {
+        total += reclaim_stale_tasks(conn, &project.ident)?;
+    }
+    Ok(total)
+}
+
+/// Insert TODO, reserving it for the mutation's submitting session if present.
+/// Rank is auto-assigned as
 /// `MAX(rank) + 1` among existing `todo` rows for this project.
 #[allow(clippy::too_many_arguments)]
 pub fn insert_task(
@@ -8279,6 +8300,74 @@ pub fn insert_task(
         hostname,
         reporter,
         None,
+        None,
+        true,
+    )
+}
+
+/// Explicit dispatch destinations retain their separate receive/claim/start protocol.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_unassigned_dispatch_task(
+    conn: &Connection,
+    project_ident: &str,
+    title: &str,
+    description: Option<&str>,
+    details: Option<&str>,
+    labels: &[String],
+    hostname: Option<&str>,
+    reporter: &str,
+) -> Result<Task> {
+    insert_task_record(
+        conn,
+        project_ident,
+        title,
+        description,
+        details,
+        labels,
+        hostname,
+        reporter,
+        None,
+        None,
+        false,
+    )
+}
+
+/// Goal names match the native session registration's compact queue context.
+pub fn normalize_task_goal(goal: Option<&str>) -> Result<Option<String>> {
+    let goal = goal.map(str::trim).filter(|g| !g.is_empty());
+    if let Some(goal) = goal {
+        if goal.len() > 128 || goal.chars().any(char::is_control) {
+            anyhow::bail!("goal must be at most 128 UTF-8 bytes with no control characters");
+        }
+    }
+    Ok(goal.map(str::to_string))
+}
+
+/// Create with a goal in the initial INSERT so lifecycle events carry it.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_task_with_goal(
+    conn: &Connection,
+    project_ident: &str,
+    title: &str,
+    description: Option<&str>,
+    details: Option<&str>,
+    labels: &[String],
+    hostname: Option<&str>,
+    reporter: &str,
+    goal: Option<&str>,
+) -> Result<Task> {
+    insert_task_record(
+        conn,
+        project_ident,
+        title,
+        description,
+        details,
+        labels,
+        hostname,
+        reporter,
+        None,
+        goal,
+        true,
     )
 }
 
@@ -8293,8 +8382,12 @@ fn insert_task_record(
     hostname: Option<&str>,
     reporter: &str,
     delegation: Option<(&str, &str)>,
+    goal: Option<&str>,
+    assign_submitter: bool,
 ) -> Result<Task> {
     let project_ident = normalize_project_ident(project_ident);
+    let goal = normalize_task_goal(goal)?;
+    let goal = goal.as_deref();
     let kind = if delegation.is_some() {
         "delegated"
     } else {
@@ -8303,6 +8396,12 @@ fn insert_task_record(
     let id = new_uuid();
     let now = now_ms();
     let labels_json = serialize_string_array(labels);
+    let owner_origin = if assign_submitter {
+        crate::task_events::current_origin(conn)?
+    } else {
+        None
+    };
+    let owner_agent_id = owner_origin.as_ref().map(|o| o.session_id.clone());
 
     let rank: i64 = conn.query_row(
         "SELECT COALESCE(MAX(rank), 0) + 1 FROM tasks
@@ -8317,13 +8416,21 @@ fn insert_task_record(
             crud_col("id", id.as_str()),
             crud_col("project_ident", project_ident.as_str()),
             crud_col("title", title),
+            crud_col("goal", goal),
             crud_col("description", description),
             crud_col("details", details),
             crud_col("status", "todo"),
             crud_col("rank", rank),
             crud_col("labels", labels_json),
             crud_col("hostname", hostname),
-            crud_col("owner_agent_id", DbValue::null()),
+            crud_col("owner_agent_id", owner_agent_id.as_deref()),
+            crud_col(
+                "owner_origin_json",
+                owner_origin
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+            ),
             crud_col("reporter", reporter),
             crud_col("created_at", now),
             crud_col("updated_at", now),
@@ -8339,14 +8446,15 @@ fn insert_task_record(
         id,
         project_ident,
         title: title.to_string(),
+        goal: goal.map(str::to_string),
         description: description.map(str::to_string),
         details: details.map(str::to_string),
         status: "todo".to_string(),
         rank,
         labels: labels.to_vec(),
         hostname: hostname.map(str::to_string),
-        owner_agent_id: None,
-        owner_origin: None,
+        owner_agent_id,
+        owner_origin,
         reporter: reporter.to_string(),
         created_at: now,
         updated_at: now,
@@ -8370,6 +8478,8 @@ pub fn insert_delegated_task(conn: &Connection, task: &DelegatedTaskInsert<'_>) 
         task.hostname,
         task.reporter,
         Some((&target, task.target_task_id)),
+        None,
+        true,
     )
 }
 
@@ -8407,7 +8517,7 @@ pub fn list_tasks(
                     t.owner_agent_id, t.hostname, t.reporter,
                     (SELECT COUNT(*) FROM task_comments tc WHERE tc.task_id = t.id),
                     t.created_at, t.updated_at, t.kind,
-                    t.delegated_to_project_ident, t.delegated_to_task_id
+                    t.delegated_to_project_ident, t.delegated_to_task_id, t.goal
              FROM tasks t
              WHERE t.project_ident = ?1
                AND t.status IN ({in_clause})
@@ -8420,7 +8530,7 @@ pub fn list_tasks(
                     t.owner_agent_id, t.hostname, t.reporter,
                     (SELECT COUNT(*) FROM task_comments tc WHERE tc.task_id = t.id),
                     t.created_at, t.updated_at, t.kind,
-                    t.delegated_to_project_ident, t.delegated_to_task_id
+                    t.delegated_to_project_ident, t.delegated_to_task_id, t.goal
              FROM tasks t
              WHERE t.project_ident = ?1
                AND t.status IN ({in_clause})
@@ -8457,6 +8567,7 @@ pub fn list_tasks(
                 kind: r.get(11)?,
                 delegated_to_project_ident: r.get(12)?,
                 delegated_to_task_id: r.get(13)?,
+                goal: r.get(14)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -8616,6 +8727,7 @@ pub fn recover_task_claim(
             bail!("task claim changed; inspect it again before recovering");
         }
         let update = TaskUpdate {
+            goal: None,
             status: Some("todo"),
             owner_agent_id: Some(None),
             rank: None,
@@ -8641,6 +8753,69 @@ pub fn recover_task_claim(
             .ok_or_else(|| anyhow::anyhow!("task not found in project"))?
             .task)
     })
+}
+
+/// Explicit regular-API reassignment. Caller authority is authenticated by the route,
+/// not restricted to the old owner. Run inside task_events::mutation for atomic audit.
+pub fn reassign_task(
+    conn: &Connection,
+    project: &str,
+    id: &str,
+    target: &crate::task_dispatch::Target,
+) -> Result<Option<Task>> {
+    let Some(detail) = get_task_detail(conn, project, id)? else {
+        return Ok(None);
+    };
+    let previous = detail.task;
+    if crate::task_dispatch::managed(conn, id)? {
+        return Err(
+            crate::task_dispatch::Conflict("dispatch tasks use the dispatch handoff API").into(),
+        );
+    }
+    if !matches!(previous.status.as_str(), "todo" | "in_progress") {
+        return Err(crate::task_dispatch::Conflict("only active tasks can be reassigned").into());
+    }
+    let caller = crate::task_events::current_origin(conn)?.ok_or(
+        crate::task_dispatch::Conflict("exact calling agent origin required"),
+    )?;
+    crate::task_dispatch::connected_target(conn, &previous.project_ident, target)?;
+    let now = now_ms();
+    crud(conn).update(
+        "tasks",
+        &[
+            crud_col("status", "todo"),
+            crud_col("owner_agent_id", target.origin.session_id.as_str()),
+            crud_col("owner_origin_json", serde_json::to_string(&target.origin)?),
+            crud_col("started_at", DbValue::null()),
+            crud_col("done_at", DbValue::null()),
+            crud_col("updated_at", now),
+        ],
+        &[
+            crud_eq("id", id),
+            crud_eq("project_ident", previous.project_ident.as_str()),
+        ],
+    )?;
+    insert_comment(
+        conn,
+        id,
+        &caller.session_id,
+        "agent",
+        &format!(
+            "Task reassigned to session {} on instance {}. Previous assignment: {}.",
+            target.origin.session_id,
+            target.origin.instance_id,
+            previous
+                .owner_origin
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?
+                .unwrap_or_else(|| previous
+                    .owner_agent_id
+                    .clone()
+                    .unwrap_or_else(|| "unclaimed".into())),
+        ),
+    )?;
+    Ok(get_task_detail(conn, project, id)?.map(|d| d.task))
 }
 
 /// Apply a partial update to a task, enforcing status-transition side effects
@@ -8707,7 +8882,8 @@ fn update_task_inner(
         )
         .into());
     }
-    if enforce_owner && (upd.status.is_some() || upd.owner_agent_id.is_some()) {
+    if enforce_owner && (upd.status.is_some() || upd.owner_agent_id.is_some() || upd.goal.is_some())
+    {
         if current.owner_origin.is_none()
             && (current.owner_agent_id.is_some() || current.status == "in_progress")
         {
@@ -8773,6 +8949,9 @@ fn update_task_inner(
     // Build dynamic UPDATE.
     let mut assignments: Vec<CrudColumn<'_>> = Vec::new();
 
+    if let Some(goal) = upd.goal {
+        assignments.push(crud_col("goal", normalize_task_goal(goal)?));
+    }
     if let Some(title) = upd.title {
         assignments.push(crud_col("title", title));
     }
@@ -10256,6 +10435,18 @@ mod tests {
     }
 
     #[test]
+    fn task_goal_names_normalize_and_fit_session_context() {
+        assert_eq!(
+            normalize_task_goal(Some("  release  ")).unwrap().as_deref(),
+            Some("release")
+        );
+        assert_eq!(normalize_task_goal(Some("  ")).unwrap(), None);
+        assert!(normalize_task_goal(Some(&"é".repeat(64))).is_ok());
+        assert!(normalize_task_goal(Some(&"é".repeat(65))).is_err());
+        assert!(normalize_task_goal(Some("release\nother")).is_err());
+    }
+
+    #[test]
     fn database_config_defaults_to_sqlite_path() {
         let config = DatabaseConfig::from_env_with(env_lookup(&[])).unwrap();
 
@@ -11220,6 +11411,7 @@ mod tests {
             insert_task(&conn, "charlie", "c1", None, None, &[], None, "tester").unwrap();
 
         let in_progress = TaskUpdate {
+            goal: None,
             status: Some("in_progress"),
             owner_agent_id: None,
             rank: None,
@@ -11239,6 +11431,7 @@ mod tests {
         .unwrap();
 
         let done = TaskUpdate {
+            goal: None,
             status: Some("done"),
             ..in_progress
         };
