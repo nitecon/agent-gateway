@@ -244,6 +244,7 @@ fn task_json(alias: &str) -> String {
         "'labels',json(CASE WHEN json_valid({alias}.labels) THEN {alias}.labels ELSE '[]' END)"
     ));
     entries.push(format!("'owner_origin',json({alias}.owner_origin_json)"));
+    entries.push(format!("'routing',json({alias}.routing_json)"));
     format!("json_object({})", entries.join(","))
 }
 

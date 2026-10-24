@@ -356,6 +356,9 @@ pub struct Delegate {
 
 /// Validate an ordinary task reassignment against the existing live directory.
 pub fn connected_target(conn: &Connection, project: &str, target: &Target) -> Result<()> {
+    if crate::task_targets::connected(conn, project, target)? {
+        return Ok(());
+    }
     eligible(conn, project, target, None, None)
 }
 
@@ -992,6 +995,10 @@ mod tests {
     fn app(state: &AppState) -> Router {
         router()
             .route(
+                "/v1/projects/{ident}/task-targets",
+                get(crate::task_targets::list).post(crate::task_targets::heartbeat),
+            )
+            .route(
                 "/v1/projects/{ident}/tasks",
                 post(crate::routes::create_task_handler),
             )
@@ -1606,6 +1613,298 @@ mod tests {
         let parsed: Action = serde_json::from_value(old.clone()).unwrap();
         let serialized = serde_json::to_value(parsed).unwrap();
         assert!(serialized.get("machine_target").is_none());
+    }
+
+    // Ordinary desktop requests deliberately carry no machine/session credentials.
+    async fn desktop_http(
+        state: &AppState,
+        headers: HeaderMap,
+        method: &str,
+        path: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        *request.headers_mut() = headers;
+        request
+            .headers_mut()
+            .insert("content-type", "application/json".parse().unwrap());
+        let response = app(state).oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 2_000_000).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| json!({"raw":String::from_utf8_lossy(&bytes)})),
+        )
+    }
+    fn human_headers() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "Bearer fixture-bearer".parse().unwrap());
+        h
+    }
+    fn ordinary_headers(agent: &Agent) -> HeaderMap {
+        let mut h = agent.headers();
+        h.remove("x-gateway-machine-key");
+        h.remove("x-gateway-session-key");
+        h
+    }
+    fn repository_fixture(state: &AppState) {
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE projects SET canonical_remote='github.com/acme/' || ident",
+                [],
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn desktop_targets_need_only_existing_gateway_auth_and_keep_human_audit() {
+        let state = fixture(db::open(":memory:").unwrap());
+        repository_fixture(&state);
+        let agent = Agent::new(&id(), "unused");
+        let endpoint = "/v1/projects/example/task-targets";
+        let beat = json!({"generation":agent.target.generation,"canonical_remote":"git@github.com:acme/example.git"});
+        assert_eq!(
+            desktop_http(&state, HeaderMap::new(), "GET", endpoint, Value::Null)
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            desktop_http(&state, human_headers(), "POST", endpoint, beat.clone())
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            desktop_http(
+                &state,
+                ordinary_headers(&agent),
+                "POST",
+                endpoint,
+                json!({"generation":id(),"canonical_remote":"github.com/other/example"})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        let (status, response) =
+            desktop_http(&state, ordinary_headers(&agent), "POST", endpoint, beat).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["target"], json!(agent.target));
+        let (_, directory) =
+            desktop_http(&state, human_headers(), "GET", endpoint, Value::Null).await;
+        assert_eq!(directory["targets"].as_array().unwrap().len(), 1);
+        assert_eq!(directory["canonical_remote"], "github.com/acme/example");
+        let body = json!({"title":"Human selects agent","canonical_remote":"https://github.com/acme/example.git","routing":{"mode":"session","target":directory["targets"][0]["target"]}});
+        let (status, task) = desktop_http(
+            &state,
+            human_headers(),
+            "POST",
+            "/v1/projects/example/tasks",
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{task}");
+        assert_eq!(task["owner_origin"], json!(agent.target.origin));
+        assert_eq!(task["status"], "todo");
+        assert!(task["started_at"].is_null());
+        assert_eq!(task["reporter"], "user");
+        assert_eq!(task["routing"], body["routing"]);
+        {
+            let conn = state.db.lock().unwrap();
+            let events = task_events::list(
+                &conn,
+                &task_events::EventQuery {
+                    task_id: Some(task["id"].as_str().unwrap().into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].kind, "task_created");
+            assert!(events[0].origin.is_none());
+            assert_eq!(events[0].task["owner_origin"], task["owner_origin"]);
+            assert_eq!(events[0].task["routing"], body["routing"]);
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM task_machines", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM task_sessions", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        // Same real calling agent may reassign without any extra credentials.
+        assert_eq!(
+            desktop_http(
+                &state,
+                ordinary_headers(&agent),
+                "POST",
+                &format!(
+                    "/v1/projects/example/tasks/{}/reassign",
+                    task["id"].as_str().unwrap()
+                ),
+                json!({"target":agent.target})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(desktop_http(&state,human_headers(),"POST","/v1/projects/destination/tasks",json!({"title":"Wrong project","canonical_remote":"github.com/acme/destination","routing":body["routing"]})).await.0,StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn desktop_routing_modes_and_stale_targets_fail_without_partial_tasks() {
+        let state = fixture(db::open(":memory:").unwrap());
+        repository_fixture(&state);
+        let agent = Agent::new(&id(), "unused");
+        let other = Agent::new(&agent.target.origin.instance_id, "unused");
+        for mode in ["auto", "unassigned", "broadcast"] {
+            let (status,task)=desktop_http(&state,ordinary_headers(&agent),"POST","/v1/projects/example/tasks",json!({"title":mode,"canonical_remote":"github.com/acme/example","routing":{"mode":mode}})).await;
+            assert_eq!(status, StatusCode::OK, "{task}");
+            assert_eq!(task["routing"]["mode"], mode);
+            if mode == "auto" {
+                assert_eq!(task["owner_origin"], json!(agent.target.origin));
+            } else {
+                assert!(task["owner_origin"].is_null());
+                assert!(task["owner_agent_id"].is_null());
+            }
+            if mode == "broadcast" {
+                let path = format!(
+                    "/v1/projects/example/tasks/{}",
+                    task["id"].as_str().unwrap()
+                );
+                assert_eq!(
+                    desktop_http(
+                        &state,
+                        ordinary_headers(&agent),
+                        "PATCH",
+                        &path,
+                        json!({"status":"in_progress"})
+                    )
+                    .await
+                    .0,
+                    StatusCode::OK
+                );
+                assert_eq!(
+                    desktop_http(
+                        &state,
+                        ordinary_headers(&other),
+                        "PATCH",
+                        &path,
+                        json!({"status":"in_progress"})
+                    )
+                    .await
+                    .0,
+                    StatusCode::CONFLICT
+                );
+            }
+        }
+        let endpoint = "/v1/projects/example/task-targets";
+        let body = |generation: &str| json!({"generation":generation,"canonical_remote":"github.com/acme/example"});
+        assert_eq!(
+            desktop_http(
+                &state,
+                ordinary_headers(&agent),
+                "POST",
+                endpoint,
+                body(&agent.target.generation)
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let mut replacement = agent.target.clone();
+        replacement.generation = id();
+        assert_eq!(
+            desktop_http(
+                &state,
+                ordinary_headers(&agent),
+                "POST",
+                endpoint,
+                body(&replacement.generation)
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let create = |target: &Target| json!({"title":"stale","canonical_remote":"github.com/acme/example","routing":{"mode":"session","target":target}});
+        assert_eq!(
+            desktop_http(
+                &state,
+                human_headers(),
+                "POST",
+                "/v1/projects/example/tasks",
+                create(&agent.target)
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE task_target_presence SET seen_at=?1",
+                [db::now_ms() - crate::task_targets::TTL_MS - 1],
+            )
+            .unwrap();
+        let (_, directory) =
+            desktop_http(&state, human_headers(), "GET", endpoint, Value::Null).await;
+        assert!(directory["targets"].as_array().unwrap().is_empty());
+        assert_eq!(
+            desktop_http(
+                &state,
+                human_headers(),
+                "POST",
+                "/v1/projects/example/tasks",
+                create(&replacement)
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(desktop_http(&state,human_headers(),"POST","/v1/projects/example/tasks",json!({"title":"mismatch","canonical_remote":"github.com/other/example","routing":{"mode":"broadcast"}})).await.0,StatusCode::CONFLICT);
+        assert_eq!(
+            desktop_http(
+                &state,
+                human_headers(),
+                "POST",
+                "/v1/projects/example/tasks",
+                json!({"title":"bad mode","routing":{"mode":"invented"}})
+            )
+            .await
+            .0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let conn = state.db.lock().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM tasks", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM task_events WHERE kind='task_created'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            3
+        );
     }
 
     #[tokio::test]

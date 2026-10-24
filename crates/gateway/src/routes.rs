@@ -6809,6 +6809,9 @@ pub struct ListTasksQuery {
 
 #[derive(Deserialize)]
 pub struct CreateTaskRequest {
+    pub canonical_remote: Option<String>,
+    #[serde(default)]
+    pub routing: crate::task_targets::Routing,
     pub title: String,
     #[serde(default, deserialize_with = "present_nullable_value")]
     pub goal: Option<Value>,
@@ -7233,10 +7236,13 @@ pub async fn create_task_handler(
 
     let db = state.db.clone();
     let ident_clone = ident;
-    let task = spawn_blocking(move || -> anyhow::Result<db::Task> {
+    let task = spawn_blocking(move || -> Result<db::Task> {
         let conn = db.lock().unwrap();
-        crate::task_events::mutation(&conn, origin.as_ref(), |conn| {
-        let task = db::insert_task_with_goal(
+        if !matches!(req.routing, crate::task_targets::Routing::Auto) || req.canonical_remote.is_some() {
+            crate::task_targets::require_remote(&conn, &ident_clone, req.canonical_remote.as_deref())?;
+        }
+        Ok(crate::task_events::mutation(&conn, origin.as_ref(), |conn| {
+        let task = db::insert_task_with_routing(
             conn,
             &ident_clone,
             &title,
@@ -7246,8 +7252,10 @@ pub async fn create_task_handler(
             hostname.as_deref(),
             &reporter,
             goal.as_deref(),
+            &req.routing,
         )?;
-        if task.goal.is_none() && task.owner_agent_id.is_none() && task.status == "todo" {
+        if task.goal.is_none() && task.owner_agent_id.is_none() && task.status == "todo"
+            && !matches!(task.routing, crate::task_targets::Routing::Unassigned) {
             system_nudge(
                 conn,
                 &ident_clone,
@@ -7259,7 +7267,7 @@ pub async fn create_task_handler(
             )?;
         }
         Ok(task)
-        })
+        })?)
     })
     .await??;
 
@@ -9899,6 +9907,7 @@ mod tests {
             hostname: Some("host".to_string()),
             owner_agent_id: None,
             owner_origin: None,
+            routing: Default::default(),
             reporter: "agent".to_string(),
             created_at: 1,
             updated_at: 1,

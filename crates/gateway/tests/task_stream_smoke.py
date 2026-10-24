@@ -216,6 +216,22 @@ def main():
         client.send({"type":"heartbeat"});client.receive("heartbeat_ack")
         duplicate=StreamSocket();duplicate.send({"type":"subscribe","protocol_version":1,"consumer_id":"fixture-cmux"})
         assert 'already connected' in duplicate.receive("error")["message"];duplicate.close()
+        # Human task routing through ordinary presence: no machine/session keys.
+        presence=api('/v1/projects/alpha/task-targets',{'generation':str(uuid.uuid4()),'canonical_remote':'https://github.com/fixture/alpha.git'},origin=REQUESTER)
+        directory=api('/v1/projects/alpha/task-targets')
+        assert directory['targets'][0]['target']==presence['target']
+        routed=api('/v1/projects/alpha/tasks',{'title':'Human selected a connected agent','canonical_remote':'github.com/fixture/alpha','routing':{'mode':'session','target':presence['target']}})
+        event=receive_event(client,'task_created')
+        assert event['task']['id']==routed['id'] and event['origin'] is None
+        assert event['task']['routing']==routed['routing'] and event['task']['owner_origin']==REQUESTER
+        assert routed['status']=='todo' and routed['started_at'] is None
+        ack(client,event)
+        for mode in ['unassigned','broadcast']:
+            queued=api('/v1/projects/alpha/tasks',{'title':'Desktop '+mode,'canonical_remote':'github.com/fixture/alpha','routing':{'mode':mode}})
+            event=receive_event(client,'task_created')
+            assert event['task']['id']==queued['id'] and event['task']['routing']=={'mode':mode}
+            assert event['task']['owner_origin'] is None and event['task']['owner_agent_id'] is None
+            ack(client,event)
         task=api("/v1/projects/alpha/tasks",{"title":"Ordinary task streams without policy","specification":"Fixture context"})
         event=receive_event(client,"task_created")
         assert event["task"]["id"]==task["id"] and event["canonical_remote"]=="github.com/fixture/alpha" and event["origin"] is None
@@ -237,6 +253,7 @@ def main():
         process.terminate();process.wait(timeout=10)
         process=start()
         client,hello=subscribe("fixture-cmux");assert hello["cursor"]==replay["id"]
+        assert api('/v1/projects/alpha/tasks/'+routed['id'])['routing']==routed['routing']
         delegation=api("/v1/projects/alpha/tasks/delegate",{"target_project_ident":"beta","title":"Incoming delegated task"},origin=REQUESTER)
         received=[receive_event(client)];ack(client,received[-1])
         for _ in range(3):

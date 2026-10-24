@@ -297,8 +297,11 @@ Inactivity expiry runs every 30 seconds and also on task list/detail reads:
 Call `POST /v1/projects/:ident/tasks/:id/reassign` with the usual gateway bearer
 and complete calling-agent origin headers. It is a regular authenticated API;
 the caller can reassign another agent's task as well as its own. Choose an exact
-live target from the existing credential-bound `GET /v1/projects/:ident/task-sessions`
-directory. Expired, revoked, unregistered, and other-project targets return 409.
+live target from `GET /v1/projects/:ident/task-targets`. Ordinary target presence
+uses the existing gateway connection and native session identity; it needs no
+additional machine/session keys or operator provisioning. Expired, replaced,
+unregistered, and other-project targets return 409. Existing credential-bound
+dispatch registrations remain compatible with reassignment.
 For example:
 
 ```json
@@ -311,6 +314,50 @@ calling agent in an audit comment, and resets inactivity expiry. The new owner
 can then claim the task. Ordinary PATCH/status ownership checks continue to
 prevent peers from accidentally claiming assigned work. Finished tasks must be
 reopened first; dispatch-managed tasks use their existing dispatch handoff API.
+
+#### Desktop routing and available agents
+
+`POST /v1/projects/:ident/task-targets` advertises an actual native agent through
+the usual gateway bearer connection and complete native origin headers. The
+body is `{"generation":"<executor UUID>","canonical_remote":"<repository remote>"}`.
+There are no additional credentials. The server checks that the remote matches
+the project's registered canonical repository. Heartbeat at least every 60 seconds;
+availability expires after 120 seconds. A new generation replaces the old one
+for the same session/instance. Availability expiry does not release task ownership;
+the separate 15-minute task activity deadline still applies.
+
+The heartbeat returns `{target:{origin,generation},seen_at,expires_at,canonical_remote}`.
+`GET` on the same endpoint requires only the usual gateway bearer and returns
+`{targets:[{target,seen_at,expires_at}],canonical_remote}`. Times are Unix milliseconds;
+no machine/session secrets are returned. Advertise real observed native identities;
+do not derive them from labels, OS process discovery or a selected recipient.
+
+Task creation accepts optional `routing`:
+
+| Routing | Creation and notification behavior |
+| --- | --- |
+| omitted or `{"mode":"auto"}` | Existing behavior: agent submission reserves its own session; human submission creates an unclaimed task for ordinary project routing. |
+| `{"mode":"unassigned"}` | One unclaimed TODO; no immediate task-created nudge or agent delivery. |
+| `{"mode":"broadcast"}` | One unclaimed TODO; notify all matching workspace agents without claiming on their behalf. |
+| `{"mode":"session","target":<directory target>}` | One TODO reserved for that exact live agent in the initial INSERT; no start time. |
+
+Explicit non-auto modes require `canonical_remote` in the creation body, matching
+the server project. A supplied remote is also checked for auto mode. A stale,
+replaced or cross-project session target returns 409 before any task/event is
+inserted. Human creation sends no agent origin headers; its event `origin` stays
+null even when its `task.owner_origin` names the selected agent.
+
+Task creation/detail/list responses and durable event task snapshots include
+`routing`; existing tasks default to `{"mode":"auto"}`. Consumers apply this
+notification intent to `task_created`, always enforcing repository and goal
+matching. Queue-only events stay on the board; broadcast fans out locally to
+matching agents. The existing WebSocket transports one event per task, not a
+separate task/claim per recipient. Clients must implement these delivery modes;
+older clients that ignore `routing` cannot provide queue-only/broadcast semantics.
+Later events use current ownership/status: a `task_unclaimed` event after release
+or inactivity can route normally regardless of the original session recipient.
+Task claims retain the existing single-owner arbitration and 15-minute expiry.
+The server does not schedule or start an executor.
 
 #### Goal queues
 
