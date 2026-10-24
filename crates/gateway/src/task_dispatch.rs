@@ -1003,6 +1003,14 @@ mod tests {
                 post(crate::routes::create_task_handler),
             )
             .route(
+                "/v1/projects/{ident}/tasks/{id}/assign",
+                post(crate::routes::assign_task_handler),
+            )
+            .route(
+                "/v1/projects/{ident}/tasks/{id}/comments",
+                post(crate::routes::add_comment_handler),
+            )
+            .route(
                 "/v1/projects/{ident}/tasks/{id}/reassign",
                 post(crate::routes::reassign_task_handler),
             )
@@ -1908,7 +1916,407 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_creation_reserves_submitter_and_any_agent_can_reassign() {
+    async fn human_assignment_and_live_labels_preserve_user_task_controls() {
+        let state = fixture(db::open(":memory:").unwrap());
+        repository_fixture(&state);
+        let owner = Agent::new(&id(), "unused");
+        let target = Agent::new(&id(), "unused");
+        let endpoint = "/v1/projects/example/task-targets";
+        let beat = json!({"generation":target.target.generation,"canonical_remote":"github.com/acme/example","display_name":"  Grace Hopper - Codex  ","hostname":"  Defcon2  "});
+        let (status, presence) =
+            desktop_http(&state, ordinary_headers(&target), "POST", endpoint, beat).await;
+        assert_eq!(status, StatusCode::OK, "{presence}");
+        assert_eq!(presence["display_name"], "Grace Hopper - Codex");
+        assert_eq!(presence["hostname"], "Defcon2");
+        let (_, directory) =
+            desktop_http(&state, human_headers(), "GET", endpoint, Value::Null).await;
+        assert_eq!(
+            directory["targets"][0]["display_name"],
+            presence["display_name"]
+        );
+        assert_eq!(directory["targets"][0]["hostname"], presence["hostname"]);
+        let (_, task) = desktop_http(
+            &state,
+            ordinary_headers(&owner),
+            "POST",
+            "/v1/projects/example/tasks",
+            json!({"title":"Owner work"}),
+        )
+        .await;
+        let path = format!(
+            "/v1/projects/example/tasks/{}",
+            task["id"].as_str().unwrap()
+        );
+        let assign = format!("{path}/assign");
+        let body = json!({"target":target.target});
+        assert_eq!(
+            desktop_http(&state, HeaderMap::new(), "POST", &assign, body.clone())
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            desktop_http(
+                &state,
+                ordinary_headers(&owner),
+                "POST",
+                &assign,
+                body.clone()
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        let (status, moved) = desktop_http(&state, human_headers(), "POST", &assign, body).await;
+        assert_eq!(status, StatusCode::OK, "{moved}");
+        assert_eq!(moved["owner_origin"], json!(target.target.origin));
+        assert_eq!(moved["status"], "todo");
+        assert!(moved["started_at"].is_null());
+        let (_, detail) = desktop_http(&state, human_headers(), "GET", &path, Value::Null).await;
+        assert_eq!(detail["comments"].as_array().unwrap().len(), 1);
+        assert_eq!(detail["comments"][0]["author_type"], "user");
+        assert!(detail["comments"][0]["origin"].is_null());
+        assert_eq!(
+            desktop_http(
+                &state,
+                ordinary_headers(&owner),
+                "PATCH",
+                &path,
+                json!({"status":"done"})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            desktop_http(
+                &state,
+                human_headers(),
+                "PATCH",
+                &path,
+                json!({"title":"User edited","description":"User details"})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            desktop_http(
+                &state,
+                human_headers(),
+                "POST",
+                &format!("{path}/comments"),
+                json!({"content":"User comment"})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let (status, done) = desktop_http(
+            &state,
+            human_headers(),
+            "PATCH",
+            &path,
+            json!({"status":"done"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{done}");
+        assert_eq!(done["status"], "done");
+        assert_eq!(done["owner_origin"], json!(target.target.origin));
+        {
+            let conn = state.db.lock().unwrap();
+            let events = task_events::list(
+                &conn,
+                &task_events::EventQuery {
+                    task_id: Some(task["id"].as_str().unwrap().into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let completed = events.iter().find(|e| e.kind == "task_completed").unwrap();
+            assert!(completed.origin.is_none());
+            let assigned = events
+                .iter()
+                .find(|e| {
+                    e.kind == "task_commented"
+                        && e.comment.as_ref().unwrap()["content"]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("Task reassigned")
+                })
+                .unwrap();
+            assert!(assigned.origin.is_none());
+            assert_eq!(assigned.task["owner_origin"], json!(target.target.origin));
+        }
+        // Old clients omit optional labels; nullable fields remain compatible.
+        let (_,legacy)=desktop_http(&state,ordinary_headers(&target),"POST",endpoint,json!({"generation":target.target.generation,"canonical_remote":"github.com/acme/example"})).await;
+        assert!(legacy["display_name"].is_null());
+        assert!(legacy["hostname"].is_null());
+        let (_, directory) =
+            desktop_http(&state, human_headers(), "GET", endpoint, Value::Null).await;
+        assert!(directory["targets"][0]["display_name"].is_null());
+        assert_eq!(desktop_http(&state,ordinary_headers(&target),"POST",endpoint,json!({"generation":target.target.generation,"canonical_remote":"github.com/acme/example","display_name":"x".repeat(129)})).await.0,StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn user_assignment_rejects_invalid_expired_and_cross_project_targets_without_mutation() {
+        let state = fixture(db::open(":memory:").unwrap());
+        repository_fixture(&state);
+        let owner = Agent::new(&id(), "unused");
+        let target = Agent::new(&id(), "unused");
+        let endpoint = "/v1/projects/example/task-targets";
+        assert_eq!(desktop_http(&state,ordinary_headers(&target),"POST",endpoint,json!({"generation":target.target.generation,"canonical_remote":"github.com/acme/example"})).await.0,StatusCode::OK);
+        let (_, task) = desktop_http(
+            &state,
+            ordinary_headers(&owner),
+            "POST",
+            "/v1/projects/example/tasks",
+            json!({"title":"Reserved"}),
+        )
+        .await;
+        let path = format!(
+            "/v1/projects/example/tasks/{}",
+            task["id"].as_str().unwrap()
+        );
+        let mut invalid = target.target.clone();
+        invalid.generation = id();
+        let mut another = target.target.clone();
+        another.origin.instance_id = id();
+        for bad in [&invalid, &another] {
+            assert_eq!(
+                desktop_http(
+                    &state,
+                    human_headers(),
+                    "POST",
+                    &format!("{path}/assign"),
+                    json!({"target":bad})
+                )
+                .await
+                .0,
+                StatusCode::CONFLICT
+            );
+            assert_eq!(
+                desktop_http(
+                    &state,
+                    ordinary_headers(&owner),
+                    "POST",
+                    &format!("{path}/reassign"),
+                    json!({"target":bad})
+                )
+                .await
+                .0,
+                StatusCode::CONFLICT
+            );
+        }
+        let (_, destination) = desktop_http(
+            &state,
+            human_headers(),
+            "POST",
+            "/v1/projects/destination/tasks",
+            json!({"title":"Other project"}),
+        )
+        .await;
+        assert_eq!(
+            desktop_http(
+                &state,
+                human_headers(),
+                "POST",
+                &format!(
+                    "/v1/projects/destination/tasks/{}/assign",
+                    destination["id"].as_str().unwrap()
+                ),
+                json!({"target":target.target})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE task_target_presence SET seen_at=0", [])
+            .unwrap();
+        assert_eq!(
+            desktop_http(
+                &state,
+                human_headers(),
+                "POST",
+                &format!("{path}/assign"),
+                json!({"target":target.target})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        // Changed registry repository invalidates otherwise fresh presence.
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE task_target_presence SET seen_at=?1", [db::now_ms()])
+            .unwrap();
+        state.db.lock().unwrap().execute("UPDATE projects SET canonical_remote='github.com/acme/replaced' WHERE ident='example'",[]).unwrap();
+        assert_eq!(
+            desktop_http(
+                &state,
+                human_headers(),
+                "POST",
+                &format!("{path}/assign"),
+                json!({"target":target.target})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        let (_, after) = desktop_http(&state, human_headers(), "GET", &path, Value::Null).await;
+        assert_eq!(after["owner_origin"], task["owner_origin"]);
+        assert_eq!(after["updated_at"], task["updated_at"]);
+        assert!(after["comments"].as_array().unwrap().is_empty());
+        let conn = state.db.lock().unwrap();
+        assert_eq!(
+            task_events::list(
+                &conn,
+                &task_events::EventQuery {
+                    task_id: Some(task["id"].as_str().unwrap().into()),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn presence_heartbeat_never_extends_user_or_agent_task_assignment() {
+        let state = fixture(db::open(":memory:").unwrap());
+        repository_fixture(&state);
+        let owner = Agent::new(&id(), "unused");
+        let beat = json!({"generation":owner.target.generation,"canonical_remote":"github.com/acme/example"});
+        assert_eq!(
+            desktop_http(
+                &state,
+                ordinary_headers(&owner),
+                "POST",
+                "/v1/projects/example/task-targets",
+                beat.clone()
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let (_, agent_task) = desktop_http(
+            &state,
+            ordinary_headers(&owner),
+            "POST",
+            "/v1/projects/example/tasks",
+            json!({"title":"Agent assignment"}),
+        )
+        .await;
+        let (_, human_task) = desktop_http(
+            &state,
+            human_headers(),
+            "POST",
+            "/v1/projects/example/tasks",
+            json!({"title":"User assignment"}),
+        )
+        .await;
+        let path = |task: &Value| {
+            format!(
+                "/v1/projects/example/tasks/{}",
+                task["id"].as_str().unwrap()
+            )
+        };
+        assert_eq!(
+            desktop_http(
+                &state,
+                human_headers(),
+                "POST",
+                &format!("{}/assign", path(&human_task)),
+                json!({"target":owner.target})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let stale = db::now_ms() - db::TASK_RECLAIM_MS - 1;
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE tasks SET updated_at=?1", [stale])
+            .unwrap();
+        assert_eq!(
+            desktop_http(
+                &state,
+                ordinary_headers(&owner),
+                "POST",
+                "/v1/projects/example/task-targets",
+                beat
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            state
+                .db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM tasks WHERE updated_at=?1",
+                    [stale],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2
+        );
+        // Reassign does its normal stale sweep first; the stale owner cannot resurrect a claim.
+        assert_eq!(
+            desktop_http(
+                &state,
+                ordinary_headers(&owner),
+                "POST",
+                &format!("{}/reassign", path(&agent_task)),
+                json!({"target":owner.target})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        for task in [&agent_task, &human_task] {
+            let (_, detail) =
+                desktop_http(&state, human_headers(), "GET", &path(task), Value::Null).await;
+            assert_eq!(detail["status"], "todo");
+            assert!(detail["owner_origin"].is_null());
+            assert!(detail["owner_agent_id"].is_null());
+        }
+        {
+            let conn = state.db.lock().unwrap();
+            let events = task_events::list(&conn, &Default::default()).unwrap();
+            assert_eq!(
+                events.iter().filter(|e| e.kind == "task_unclaimed").count(),
+                2
+            );
+        }
+        // Normal claim is separate and remains available after time decay.
+        assert_eq!(
+            desktop_http(
+                &state,
+                ordinary_headers(&owner),
+                "PATCH",
+                &path(&agent_task),
+                json!({"status":"in_progress"})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_creation_reserves_submitter_and_only_owner_can_reassign() {
         let state = fixture(db::open(":memory:").unwrap());
         let peers = agents(&state).await;
         let mut legacy = peers[0].headers();
@@ -1967,10 +2375,22 @@ mod tests {
                 StatusCode::CONFLICT
             );
         }
-        // Third party, deliberately NOT the old owner, invokes the regular API.
+        // A peer cannot take the owner's assignment; the exact current owner can hand off.
+        assert_eq!(
+            http(
+                &state,
+                &peers[2],
+                "POST",
+                &format!("{path}/reassign"),
+                json!({"target":peers[1].target})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
         let moved = ok(
             &state,
-            &peers[2],
+            &peers[0],
             "POST",
             &format!("{path}/reassign"),
             json!({"target":peers[1].target}),
@@ -2005,7 +2425,7 @@ mod tests {
         assert_eq!(
             http(
                 &state,
-                &peers[2],
+                &peers[1],
                 "POST",
                 &format!("{path}/reassign"),
                 json!({"target":disconnected})
@@ -2019,7 +2439,7 @@ mod tests {
         assert_eq!(detail["comments"].as_array().unwrap().len(), 1);
         assert_eq!(
             detail["comments"][0]["origin"],
-            json!(peers[2].target.origin)
+            json!(peers[0].target.origin)
         );
         state
             .db
@@ -2033,7 +2453,7 @@ mod tests {
         assert_eq!(
             http(
                 &state,
-                &peers[2],
+                &peers[1],
                 "POST",
                 &format!("{path}/reassign"),
                 json!({"target":peers[0].target})

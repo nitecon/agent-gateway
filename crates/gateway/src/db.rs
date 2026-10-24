@@ -8821,13 +8821,32 @@ pub fn recover_task_claim(
     })
 }
 
-/// Explicit regular-API reassignment. Caller authority is authenticated by the route,
-/// not restricted to the old owner. Run inside task_events::mutation for atomic audit.
+/// Agent reassignment requires the exact current owner; human assignment uses its
+/// distinct route. Both run inside task_events::mutation for atomic audit.
 pub fn reassign_task(
     conn: &Connection,
     project: &str,
     id: &str,
     target: &crate::task_dispatch::Target,
+) -> Result<Option<Task>> {
+    assign_task_inner(conn, project, id, target, false)
+}
+
+pub fn assign_task_from_user(
+    conn: &Connection,
+    project: &str,
+    id: &str,
+    target: &crate::task_dispatch::Target,
+) -> Result<Option<Task>> {
+    assign_task_inner(conn, project, id, target, true)
+}
+
+fn assign_task_inner(
+    conn: &Connection,
+    project: &str,
+    id: &str,
+    target: &crate::task_dispatch::Target,
+    human: bool,
 ) -> Result<Option<Task>> {
     let Some(detail) = get_task_detail(conn, project, id)? else {
         return Ok(None);
@@ -8841,10 +8860,29 @@ pub fn reassign_task(
     if !matches!(previous.status.as_str(), "todo" | "in_progress") {
         return Err(crate::task_dispatch::Conflict("only active tasks can be reassigned").into());
     }
-    let caller = crate::task_events::current_origin(conn)?.ok_or(
-        crate::task_dispatch::Conflict("exact calling agent origin required"),
-    )?;
-    crate::task_dispatch::connected_target(conn, &previous.project_ident, target)?;
+    let caller = crate::task_events::current_origin(conn)?;
+    if human {
+        if caller.is_some() {
+            return Err(crate::task_dispatch::Conflict(
+                "human assignment must not impersonate an agent",
+            )
+            .into());
+        }
+        if !crate::task_targets::connected(conn, &previous.project_ident, target)? {
+            return Err(crate::task_dispatch::Conflict(
+                "target is unavailable or does not match the project repository",
+            )
+            .into());
+        }
+    } else {
+        let caller = caller.as_ref().ok_or(crate::task_dispatch::Conflict(
+            "exact calling agent origin required",
+        ))?;
+        if previous.owner_origin.as_ref() != Some(caller) {
+            return Err(crate::task_events::OwnershipConflict.into());
+        }
+        crate::task_dispatch::connected_target(conn, &previous.project_ident, target)?;
+    }
     let now = now_ms();
     crud(conn).update(
         "tasks",
@@ -8864,8 +8902,11 @@ pub fn reassign_task(
     insert_comment(
         conn,
         id,
-        &caller.session_id,
-        "agent",
+        caller
+            .as_ref()
+            .map(|o| o.session_id.as_str())
+            .unwrap_or("user"),
+        if human { "user" } else { "agent" },
         &format!(
             "Task reassigned to session {} on instance {}. Previous assignment: {}.",
             target.origin.session_id,
@@ -8898,6 +8939,28 @@ pub fn update_task(
     actor_agent_id: Option<&str>,
 ) -> Result<Option<Task>> {
     update_task_inner(conn, project_ident, task_id, upd, actor_agent_id, true)
+}
+
+/// Human task-sidebar controls may edit/release/finish assigned ordinary tasks.
+/// Ownership assignment still goes through the live-target assignment endpoint.
+pub fn update_task_from_user(
+    conn: &Connection,
+    project: &str,
+    id: &str,
+    upd: &TaskUpdate<'_>,
+) -> Result<Option<Task>> {
+    if crate::task_events::current_origin(conn)?.is_some()
+        || crate::task_dispatch::managed(conn, id)?
+    {
+        return Err(crate::task_dispatch::Conflict(
+            "user controls require an ordinary human task request",
+        )
+        .into());
+    }
+    if upd.owner_agent_id.is_some() || upd.status == Some("in_progress") {
+        return update_task(conn, project, id, upd, None);
+    }
+    update_task_inner(conn, project, id, upd, None, false)
 }
 
 /// Only automatic delegated result propagation bypasses source ownership.

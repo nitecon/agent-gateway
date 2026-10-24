@@ -32,6 +32,18 @@ pub fn initialize(conn: &Connection) -> anyhow::Result<()> {
         PRIMARY KEY(project_ident,instance_id,session_id)
     )",
     )?;
+    for column in ["display_name", "hostname"] {
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('task_target_presence') WHERE name=?1)",
+            [column],
+            |r| r.get(0),
+        )?;
+        if !present {
+            conn.execute_batch(&format!(
+                "ALTER TABLE task_target_presence ADD COLUMN {column} TEXT"
+            ))?;
+        }
+    }
     Ok(())
 }
 
@@ -55,6 +67,8 @@ pub fn connected(conn: &Connection, project: &str, target: &Target) -> anyhow::R
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Heartbeat {
+    pub display_name: Option<String>,
+    pub hostname: Option<String>,
     pub canonical_remote: String,
     pub generation: String,
 }
@@ -74,16 +88,18 @@ pub async fn heartbeat(
     let generation = uuid::Uuid::parse_str(&req.generation)
         .map_err(|_| AppError(StatusCode::BAD_REQUEST, "generation must be a UUID".into()))?
         .to_string();
+    let display_name = label(req.display_name)?;
+    let hostname = label(req.hostname)?;
     let project = crate::projects::normalize_project_ident(&project);
     let conn = state.db.lock().unwrap();
     let remote = require_remote(&conn, &project, Some(&req.canonical_remote))?;
     let seen = db::now_ms();
-    conn.execute("INSERT INTO task_target_presence(project_ident,instance_id,session_id,origin_json,generation,seen_at,canonical_remote)
-        VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(project_ident,instance_id,session_id)
-        DO UPDATE SET origin_json=excluded.origin_json,generation=excluded.generation,seen_at=excluded.seen_at,canonical_remote=excluded.canonical_remote",
-        params![project,origin.instance_id,origin.session_id,serde_json::to_string(&origin)?,generation,seen,remote])?;
+    conn.execute("INSERT INTO task_target_presence(project_ident,instance_id,session_id,origin_json,generation,seen_at,canonical_remote,display_name,hostname)
+        VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(project_ident,instance_id,session_id)
+        DO UPDATE SET origin_json=excluded.origin_json,generation=excluded.generation,seen_at=excluded.seen_at,canonical_remote=excluded.canonical_remote,display_name=excluded.display_name,hostname=excluded.hostname",
+        params![project,origin.instance_id,origin.session_id,serde_json::to_string(&origin)?,generation,seen,remote,display_name,hostname])?;
     Ok(Json(
-        json!({"target":Target{origin,generation},"seen_at":seen,"expires_at":seen+TTL_MS,"canonical_remote":remote}),
+        json!({"target":Target{origin,generation},"seen_at":seen,"expires_at":seen+TTL_MS,"canonical_remote":remote,"display_name":display_name,"hostname":hostname}),
     ))
 }
 
@@ -97,7 +113,7 @@ pub async fn list(
         return Err(AppError(StatusCode::NOT_FOUND, "project not found".into()));
     }
     let mut stmt = conn.prepare(
-        "SELECT s.origin_json,s.generation,s.seen_at FROM task_target_presence s JOIN projects p ON p.ident=s.project_ident AND p.canonical_remote=s.canonical_remote
+        "SELECT s.origin_json,s.generation,s.seen_at,s.display_name,s.hostname FROM task_target_presence s JOIN projects p ON p.ident=s.project_ident AND p.canonical_remote=s.canonical_remote
         WHERE s.project_ident=?1 AND seen_at>=?2 ORDER BY instance_id,session_id",
     )?;
     let records = stmt
@@ -106,11 +122,13 @@ pub async fn list(
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, i64>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let targets=records.into_iter().map(|(origin,generation,seen)| -> anyhow::Result<Value> {
-        Ok(json!({"target":Target{origin:serde_json::from_str(&origin)?,generation},"seen_at":seen,"expires_at":seen+TTL_MS}))
+    let targets=records.into_iter().map(|(origin,generation,seen,display_name,hostname)| -> anyhow::Result<Value> {
+        Ok(json!({"target":Target{origin:serde_json::from_str(&origin)?,generation},"seen_at":seen,"expires_at":seen+TTL_MS,"display_name":display_name,"hostname":hostname}))
     }).collect::<anyhow::Result<Vec<_>>>()?;
     let remote = db::get_project(&conn, &project)?.and_then(|p| p.canonical_remote);
     Ok(Json(json!({"targets":targets,"canonical_remote":remote})))
@@ -142,4 +160,21 @@ pub fn require_remote(
         ));
     }
     Ok(remote)
+}
+
+fn label(value: Option<String>) -> Result<Option<String>, AppError> {
+    let value = value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if value
+        .as_ref()
+        .is_some_and(|s| s.len() > 128 || s.chars().any(char::is_control))
+    {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "display_name and hostname must be at most 128 UTF-8 bytes with no control characters"
+                .into(),
+        ));
+    }
+    Ok(value)
 }

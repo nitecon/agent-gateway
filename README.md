@@ -295,8 +295,9 @@ Inactivity expiry runs every 30 seconds and also on task list/detail reads:
 #### Reassignment
 
 Call `POST /v1/projects/:ident/tasks/:id/reassign` with the usual gateway bearer
-and complete calling-agent origin headers. It is a regular authenticated API;
-the caller can reassign another agent's task as well as its own. Choose an exact
+and complete calling-agent origin headers. Only the exact current owning
+session/instance may reassign; non-owners, unassigned tasks and expired claims
+return 409. Normal claim remains a separate action. Choose an exact
 live target from `GET /v1/projects/:ident/task-targets`. Ordinary target presence
 uses the existing gateway connection and native session identity; it needs no
 additional machine/session keys or operator provisioning. Expired, replaced,
@@ -315,6 +316,18 @@ can then claim the task. Ordinary PATCH/status ownership checks continue to
 prevent peers from accidentally claiming assigned work. Finished tasks must be
 reopened first; dispatch-managed tasks use their existing dispatch handoff API.
 
+For the human desktop task sidebar, use the distinct
+`POST /v1/projects/:ident/tasks/:id/assign` with the same `{target}` body and
+usual gateway bearer, without agent identity headers. It returns the acknowledged
+flat Task, including exact `owner_origin`. The target must come from the live
+ordinary `task-targets` directory and still match the project's repository and
+generation. Invalid or stale targets return 409 without assignment or audit
+mutation. Human assignment records a user comment with null origin. Human task
+PATCH editing, release and completion, and POST comments, remain available for
+assigned ordinary tasks. Agent requests retain exact-owner checks. Task ownership
+assignment through the human sidebar uses `/assign`, not a display-name override.
+Both user and agent assignments retain the 15-minute inactivity deadline.
+
 #### Desktop routing and available agents
 
 `POST /v1/projects/:ident/task-targets` advertises an actual native agent through
@@ -329,7 +342,14 @@ the separate 15-minute task activity deadline still applies.
 The heartbeat returns `{target:{origin,generation},seen_at,expires_at,canonical_remote}`.
 `GET` on the same endpoint requires only the usual gateway bearer and returns
 `{targets:[{target,seen_at,expires_at}],canonical_remote}`. Times are Unix milliseconds;
-no machine/session secrets are returned. Advertise real observed native identities;
+no machine/session secrets are returned. Heartbeat bodies also accept optional
+nullable `display_name` and `hostname`. The heartbeat response and each directory
+entry return those fields (null for older clients). Values are trimmed, blank
+values become null, and nonblank values allow at most 128 UTF-8 bytes with no
+control characters. Omission or null clears the label. These labels are display
+metadata only; session/instance/provider/OS and generation remain the routing
+identity. Presence heartbeats never update task activity or extend task claims.
+Advertise real observed native identities;
 do not derive them from labels, OS process discovery or a selected recipient.
 
 Task creation accepts optional `routing`:
@@ -410,9 +430,9 @@ A crashed session or a change from legacy to native actor registration can
 leave a claim whose exact owner can no longer release it. Comments from a
 replacement session count as activity, so they delay automatic stale reclaim.
 The gateway does not infer that an owner died from missing CMUX membership or
-a disconnected client. Ordinary PATCH/status changes retain session ownership
-checks; the explicit reassignment API above allows any authenticated calling
-agent to choose a live replacement.
+a disconnected client. Agent PATCH/status changes retain session ownership
+checks; an owning agent can explicitly hand off through `/reassign`, while the
+human sidebar can select a live replacement through `/assign`.
 
 An authorized local operator with access to the gateway database can inspect
 and recover a confirmed orphan. This uses the same local administration

@@ -7170,7 +7170,7 @@ pub struct ReassignTaskRequest {
     pub target: crate::task_dispatch::Target,
 }
 
-/// Any authenticated calling agent may explicitly reassign an ordinary active task.
+/// The exact current owning agent may reassign an ordinary active task.
 pub async fn reassign_task_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -7189,6 +7189,31 @@ pub async fn reassign_task_handler(
         db::reclaim_stale_tasks(&conn, &project)?;
         crate::task_events::mutation(&conn, Some(&origin), |conn| {
             db::reassign_task(conn, &project, &id, &req.target)
+        })
+    })
+    .await??;
+    task.map(Json)
+        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "task not found".into()))
+}
+
+/// Desktop user assignment uses the existing bearer connection, with no agent origin.
+pub async fn assign_task_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, id)): Path<(String, String)>,
+    Json(req): Json<ReassignTaskRequest>,
+) -> Result<Json<db::Task>> {
+    if crate::task_events::origin(&headers)?.is_some() || actor_agent_id(&headers).is_some() {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "human assignment must not send agent identity headers".into(),
+        ));
+    }
+    let task = spawn_blocking(move || -> anyhow::Result<Option<db::Task>> {
+        let conn = state.db.lock().unwrap();
+        db::reclaim_stale_tasks(&conn, &project)?;
+        crate::task_events::mutation(&conn, None, |conn| {
+            db::assign_task_from_user(conn, &project, &id, &req.target)
         })
     })
     .await??;
@@ -7482,13 +7507,11 @@ pub async fn update_task_handler(
             labels: labels.as_deref(),
             hostname: hostname_opt.as_ref().map(|inner| inner.as_deref()),
         };
-        let updated = db::update_task(
-            conn,
-            &ident_for_update,
-            &task_id_clone,
-            &upd,
-            actor.as_deref(),
-        )?;
+        let updated = if agent_request {
+            db::update_task(conn, &ident_for_update, &task_id_clone, &upd, actor.as_deref())?
+        } else {
+            db::update_task_from_user(conn, &ident_for_update, &task_id_clone, &upd)?
+        };
 
         if let (Some(before), Some(after)) = (&before, &updated) {
             if before.status != "done" && after.status == "done" {

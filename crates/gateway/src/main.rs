@@ -622,6 +622,7 @@ async fn main() -> Result<()> {
     let api = Router::new()
         .route("/v1/projects/{ident}/task-targets", get(task_targets::list).post(task_targets::heartbeat))
         .route("/v1/projects/{ident}/tasks/{id}/reassign", post(routes::reassign_task_handler))
+        .route("/v1/projects/{ident}/tasks/{id}/assign", post(routes::assign_task_handler))
         .route("/v1/projects/{ident}/tasks/{id}/subtasks", get(subtasks::get).post(subtasks::create))
         .route("/v1/tasks/stream", get(task_events::connect))
         .route("/v1/task-events", get(task_events::events))

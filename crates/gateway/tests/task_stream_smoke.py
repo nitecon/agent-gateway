@@ -39,6 +39,7 @@ def api(path, body=None, method=None, origin=None, headers=None):
     if origin:
         request_headers.update({"X-Agent-Session-Id":origin["session_id"], "X-Agent-Instance-Id":origin["instance_id"], "X-Agent-Provider":origin["provider"], "X-Agent-OS":origin["os"]})
     request_headers.update(headers or {})
+    request_headers={k:v for k,v in request_headers.items() if v is not None}
     request = urllib.request.Request(URL+path, data=json.dumps(body).encode() if body is not None else None,
         method=method or ("POST" if body is not None else "GET"),
         headers=request_headers)
@@ -217,15 +218,26 @@ def main():
         duplicate=StreamSocket();duplicate.send({"type":"subscribe","protocol_version":1,"consumer_id":"fixture-cmux"})
         assert 'already connected' in duplicate.receive("error")["message"];duplicate.close()
         # Human task routing through ordinary presence: no machine/session keys.
-        presence=api('/v1/projects/alpha/task-targets',{'generation':str(uuid.uuid4()),'canonical_remote':'https://github.com/fixture/alpha.git'},origin=REQUESTER)
+        presence=api('/v1/projects/alpha/task-targets',{'generation':str(uuid.uuid4()),'canonical_remote':'https://github.com/fixture/alpha.git','display_name':'Grace Hopper','hostname':'FixtureBox'},origin=REQUESTER)
         directory=api('/v1/projects/alpha/task-targets')
         assert directory['targets'][0]['target']==presence['target']
+        assert presence['display_name']=='Grace Hopper' and directory['targets'][0]['hostname']=='FixtureBox'
         routed=api('/v1/projects/alpha/tasks',{'title':'Human selected a connected agent','canonical_remote':'github.com/fixture/alpha','routing':{'mode':'session','target':presence['target']}})
         event=receive_event(client,'task_created')
         assert event['task']['id']==routed['id'] and event['origin'] is None
         assert event['task']['routing']==routed['routing'] and event['task']['owner_origin']==REQUESTER
         assert routed['status']=='todo' and routed['started_at'] is None
         ack(client,event)
+        worker_presence=api('/v1/projects/alpha/task-targets',{'generation':str(uuid.uuid4()),'canonical_remote':'github.com/fixture/alpha'},origin=WORKER)
+        human={'X-Agent-Id':None}
+        assigned=api('/v1/projects/alpha/tasks/'+routed['id']+'/assign',{'target':worker_presence['target']},headers=human)
+        assert assigned['owner_origin']==WORKER
+        event=receive_event(client,'task_commented');assert event['origin'] is None and event['comment']['author_type']=='user';ack(client,event)
+        api('/v1/projects/alpha/tasks/'+routed['id'],{'title':'User edited assigned work'},'PATCH',headers=human)
+        api('/v1/projects/alpha/tasks/'+routed['id']+'/comments',{'content':'User follow-up'},headers=human)
+        event=receive_event(client,'task_commented');assert event['origin'] is None;ack(client,event)
+        api('/v1/projects/alpha/tasks/'+routed['id'],{'status':'done'},'PATCH',headers=human)
+        event=receive_event(client,'task_completed');assert event['origin'] is None and event['task']['owner_origin']==WORKER;ack(client,event)
         for mode in ['unassigned','broadcast']:
             queued=api('/v1/projects/alpha/tasks',{'title':'Desktop '+mode,'canonical_remote':'github.com/fixture/alpha','routing':{'mode':mode}})
             event=receive_event(client,'task_created')
@@ -271,9 +283,10 @@ def main():
         target=api("/v1/projects/beta/task-sessions",{"generation":str(uuid.uuid4())},origin=WORKER,
                    headers={"X-Gateway-Machine-Key":machine_key,"X-Gateway-Session-Key":os.urandom(32).hex()})["target"]
         third={**REQUESTER,"session_id":str(uuid.uuid4())}
-        moved=api(target_path+"/reassign",{"target":target},origin=third)
+        rejected(409,target_path+"/reassign",{"target":target},method="POST",origin=third)
+        moved=api(target_path+"/reassign",{"target":target},origin=REQUESTER)
         assert moved["owner_origin"] == WORKER and moved["status"] == "todo" and moved["started_at"] is None
-        reassigned=receive_event(client,"task_commented");assert reassigned["origin"]==third and reassigned["task"]["owner_origin"]==WORKER;ack(client,reassigned)
+        reassigned=receive_event(client,"task_commented");assert reassigned["origin"]==REQUESTER and reassigned["task"]["owner_origin"]==WORKER;ack(client,reassigned)
         api(source_path,{"status":"in_progress"},"PATCH",origin=REQUESTER)
         claimed=api(target_path,{"status":"in_progress"},"PATCH",origin=WORKER)
         assert claimed["owner_origin"]==WORKER
