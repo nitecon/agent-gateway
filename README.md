@@ -249,8 +249,8 @@ All messaging endpoints accept an optional `X-Agent-Id` header. When provided, e
 
 ### Tasks
 
-Per-project kanban task board. Tasks move through three statuses — `todo`,
-`in_progress`, and `done` — and back. Identity is resolved from the
+Per-project kanban task board. Tasks move through four statuses — `todo`,
+`in_progress`, `user_review`, and `done` — and back. Identity is resolved from the
 `X-Agent-Id` header (falling back to `"user"` when absent or `_default`) and
 can be overridden per request with an explicit `reporter`/`author` field.
 
@@ -430,6 +430,22 @@ route goal events only to sessions that selected that goal. CLI/hook goal
 selection and terminal delivery integration are maintained in their respective
 client repositories.
 
+#### User review
+
+Agents can park an ordinary task for a user decision by adding a comment with
+the question/context, then PATCHing `{"status":"user_review"}`. The claiming
+session must perform this transition if the task is assigned. This clears its
+owner and start/completion timestamps. Review tasks stay out of the default
+agent work queue and do not expire back to TODO.
+
+The board has a **User review** swimlane with drag-and-drop support and a
+**User review** action in task details. Use **Return to TODO** to approve further
+work or **Close** to move it to done. Agent requests cannot move a review task
+back into the queue, claim it, or complete/cancel it; a user makes that decision
+through the browser. Comments remain available while waiting. Fetch review
+items explicitly with `GET /v1/projects/:ident/tasks?status=user_review`.
+Dispatch-managed tasks retain their existing credential-bound workflow.
+
 #### Status transitions and `actions[]`
 
 The task detail response includes a server-derived `actions[]` array alongside
@@ -438,8 +454,9 @@ The task detail response includes a server-derived `actions[]` array alongside
 
 | Current status | Actions (`verb` → `target_status`) |
 |----------------|-------------------------------------|
-| `todo` | `Claim` (primary) → `in_progress`; `Done` (primary) → `done` |
-| `in_progress` | `Release` (secondary) → `todo`; `Done` (primary) → `done` |
+| `todo` | `Claim` (primary) → `in_progress`; `Done` (primary) → `done`; `User review` → `user_review` |
+| `in_progress` | `Release` (secondary) → `todo`; `Done` (primary) → `done`; `User review` → `user_review` |
+| `user_review` | `Return to TODO` (secondary) → `todo`; `Close` (primary) → `done` (user decision) |
 | `done` | `Reopen` (secondary) → `todo` |
 
 To perform a transition, `PATCH` the task with the chosen `target_status`.

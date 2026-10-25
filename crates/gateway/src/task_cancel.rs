@@ -19,7 +19,9 @@ use serde::{Deserialize, Serialize};
 
 const REASON_BYTES: usize = 16384;
 const OLD_STATUS_CHECK: &str = "CHECK(status IN ('todo','in_progress','done'))";
-const NEW_STATUS_CHECK: &str = "CHECK(status IN ('todo','in_progress','done','cancelled'))";
+const CANCEL_STATUS_CHECK: &str = "CHECK(status IN ('todo','in_progress','done','cancelled'))";
+const NEW_STATUS_CHECK: &str =
+    "CHECK(status IN ('todo','in_progress','user_review','done','cancelled'))";
 
 /// Widen the tasks status CHECK once, then create the cancellation record table.
 /// Runs before task lifecycle triggers are (re)created.
@@ -30,9 +32,13 @@ pub fn initialize(conn: &Connection) -> Result<()> {
         |r| r.get(0),
     )?;
     if !sql.contains(NEW_STATUS_CHECK) {
-        if !sql.contains(OLD_STATUS_CHECK) {
-            bail!("unrecognized tasks status constraint; refusing cancellation migration");
-        }
+        let old_check = if sql.contains(CANCEL_STATUS_CHECK) {
+            CANCEL_STATUS_CHECK
+        } else if sql.contains(OLD_STATUS_CHECK) {
+            OLD_STATUS_CHECK
+        } else {
+            bail!("unrecognized tasks status constraint; refusing task status migration");
+        };
         // Dropping `tasks` with foreign keys on would cascade-delete comments.
         conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
         let off: i64 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
@@ -44,7 +50,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         // The stored name may be quoted after an earlier rename; keep only the body.
-        let body = sql.replacen(OLD_STATUS_CHECK, NEW_STATUS_CHECK, 1);
+        let body = sql.replacen(old_check, NEW_STATUS_CHECK, 1);
         let create = format!(
             "CREATE TABLE tasks_cancel_rebuild {}",
             &body[body.find('(').unwrap_or(0)..]
@@ -173,6 +179,9 @@ pub fn cancel(
                 }));
             }
             return Err(Conflict("task is already cancelled").into());
+        }
+        if before.status == "user_review" {
+            return Err(Conflict("tasks in user review require a user decision").into());
         }
         if before.status == "done" {
             return Err(Conflict("completed tasks cannot be cancelled").into());
@@ -374,6 +383,8 @@ mod tests {
             1
         );
         assert_eq!(count("PRAGMA foreign_keys"), 1);
+        conn.execute("UPDATE tasks SET status='user_review'", [])
+            .unwrap();
         conn.execute("UPDATE tasks SET status='cancelled'", [])
             .unwrap();
         assert!(conn.execute("UPDATE tasks SET status='bogus'", []).is_err());
@@ -385,6 +396,12 @@ mod tests {
 
     #[test]
     fn full_schema_upgrade_keeps_history_and_lifecycle_triggers() {
+        for old_check in [OLD_STATUS_CHECK, CANCEL_STATUS_CHECK] {
+            full_schema_upgrade(old_check);
+        }
+    }
+
+    fn full_schema_upgrade(old_check: &str) {
         let dir = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../target/task-cancel-fixture"
@@ -406,10 +423,11 @@ mod tests {
                 )
                 .unwrap();
             conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
-            conn.execute_batch(
-                &sql.replacen(NEW_STATUS_CHECK, OLD_STATUS_CHECK, 1)
-                    .replacen("CREATE TABLE tasks", "CREATE TABLE tasks_old_shape", 1),
-            )
+            conn.execute_batch(&sql.replacen(NEW_STATUS_CHECK, old_check, 1).replacen(
+                "CREATE TABLE tasks",
+                "CREATE TABLE tasks_old_shape",
+                1,
+            ))
             .unwrap();
             conn.execute_batch("DROP TRIGGER task_event_created; DROP TRIGGER task_event_commented; DROP TRIGGER task_event_completed; DROP TRIGGER task_event_cancelled;
                 INSERT INTO tasks_old_shape SELECT * FROM tasks; DROP TABLE tasks; ALTER TABLE tasks_old_shape RENAME TO tasks; PRAGMA foreign_keys=ON;").unwrap();

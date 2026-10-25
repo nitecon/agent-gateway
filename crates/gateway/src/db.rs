@@ -1125,7 +1125,7 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         );",
     )?;
 
-    // ── Tasks: per-project kanban (todo/in_progress/done; cancelled is terminal) ─
+    // ── Tasks: per-project kanban (todo/in_progress/user_review/done; cancelled is terminal) ─
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS tasks (
             id              TEXT PRIMARY KEY,
@@ -1134,7 +1134,7 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             description     TEXT,
             details         TEXT,
             status          TEXT NOT NULL DEFAULT 'todo'
-                            CHECK(status IN ('todo','in_progress','done','cancelled')),
+                            CHECK(status IN ('todo','in_progress','user_review','done','cancelled')),
             rank            INTEGER NOT NULL DEFAULT 0,
             labels          TEXT,
             hostname        TEXT,
@@ -7724,7 +7724,7 @@ pub struct Task {
     pub goal: Option<String>,
     pub description: Option<String>,
     pub details: Option<String>,
-    /// One of `"todo"`, `"in_progress"`, `"done"`.
+    /// One of `"todo"`, `"in_progress"`, `"user_review"`, `"done"`, `"cancelled"`.
     pub status: String,
     pub rank: i64,
     /// Parsed from the JSON-array-encoded `labels` column; empty when the
@@ -9084,8 +9084,8 @@ fn update_task_inner(
     let project_ident = normalize_project_ident(project_ident);
     // Validate requested status early.
     if let Some(s) = upd.status {
-        if s != "todo" && s != "in_progress" && s != "done" {
-            anyhow::bail!("invalid status '{s}': must be todo|in_progress|done");
+        if !matches!(s, "todo" | "in_progress" | "user_review" | "done") {
+            anyhow::bail!("invalid status '{s}': must be todo|in_progress|user_review|done");
         }
     }
 
@@ -9126,6 +9126,16 @@ fn update_task_inner(
             }
         }
     }
+    if enforce_owner
+        && current.status == "user_review"
+        && (origin.is_some() || actor_agent_id.is_some())
+        && (upd.status.is_some_and(|status| status != "user_review")
+            || upd.owner_agent_id.is_some())
+    {
+        return Err(
+            crate::task_dispatch::Conflict("tasks in user review require a user decision").into(),
+        );
+    }
     let now = now_ms();
     let new_status = upd.status.unwrap_or(&current.status).to_string();
     let owner_explicit = upd.owner_agent_id.is_some();
@@ -9142,7 +9152,17 @@ fn update_task_inner(
 
     if transitioning {
         match (current.status.as_str(), new_status.as_str()) {
-            ("todo", "in_progress") => {
+            (_, "user_review") => {
+                started_at = Some(None);
+                done_at = Some(None);
+                owner = Some(None);
+            }
+            ("user_review", "todo") => {
+                started_at = Some(None);
+                done_at = Some(None);
+                owner = Some(None);
+            }
+            ("todo" | "user_review", "in_progress") => {
                 started_at = Some(Some(now));
                 done_at = Some(None);
                 if !owner_explicit {
@@ -9217,7 +9237,7 @@ fn update_task_inner(
             "owner_origin_json",
             origin.as_ref().map(serde_json::to_string).transpose()?,
         ));
-    } else if transitioning && new_status == "todo" {
+    } else if transitioning && matches!(new_status.as_str(), "todo" | "user_review") {
         assignments.push(crud_col("owner_origin_json", DbValue::null()));
     }
 
@@ -9485,8 +9505,13 @@ pub fn reorder_tasks_in_column(
     actor_agent_id: Option<&str>,
 ) -> Result<()> {
     let project_ident = normalize_project_ident(project_ident);
-    if target_status != "todo" && target_status != "in_progress" && target_status != "done" {
-        anyhow::bail!("invalid status '{target_status}': must be todo|in_progress|done");
+    if !matches!(
+        target_status,
+        "todo" | "in_progress" | "user_review" | "done"
+    ) {
+        anyhow::bail!(
+            "invalid status '{target_status}': must be todo|in_progress|user_review|done"
+        );
     }
 
     if order.is_empty() {
@@ -9543,6 +9568,12 @@ pub fn reorder_tasks_in_column(
         let mut new_origin = old_origin.clone();
 
         if old_status != target_status {
+            if old_status == "user_review" && (origin.is_some() || actor_agent_id.is_some()) {
+                return Err(crate::task_dispatch::Conflict(
+                    "tasks in user review require a user decision",
+                )
+                .into());
+            }
             if old_origin.is_none() && (old_owner.is_some() || old_status == "in_progress") {
                 return Err(crate::task_events::OwnershipConflict.into());
             }
@@ -9556,11 +9587,19 @@ pub fn reorder_tasks_in_column(
             if target_status == "in_progress" {
                 new_origin = origin.clone();
             }
-            if target_status == "todo" {
+            if matches!(target_status, "todo" | "user_review") {
                 new_origin = None;
             }
             match (old_status.as_str(), target_status) {
-                ("todo", "in_progress") => {
+                (_, "user_review") | ("user_review", "todo") => {
+                    new_started_at = None;
+                    new_done_at = None;
+                    new_owner = None;
+                }
+                ("user_review", "done") => {
+                    new_done_at = Some(now);
+                }
+                ("todo" | "user_review", "in_progress") => {
                     new_started_at = Some(now);
                     new_done_at = None;
                     if new_owner.is_none() {

@@ -7014,10 +7014,16 @@ fn actions_for_status(status: &str) -> Vec<TaskAction> {
         "todo" => vec![
             mk("Claim", "primary", "in_progress"),
             mk("Done", "primary", "done"),
+            mk("User review", "secondary", "user_review"),
         ],
         "in_progress" => vec![
             mk("Release", "secondary", "todo"),
             mk("Done", "primary", "done"),
+            mk("User review", "secondary", "user_review"),
+        ],
+        "user_review" => vec![
+            mk("Return to TODO", "secondary", "todo"),
+            mk("Close", "primary", "done"),
         ],
         "done" => vec![mk("Reopen", "secondary", "todo")],
         _ => vec![],
@@ -7032,7 +7038,7 @@ pub struct DeleteResponse {
 #[derive(Deserialize)]
 pub struct ReorderTasksQuery {
     pub goal: Option<String>,
-    /// Target column (`todo` | `in_progress` | `done`). Required.
+    /// Target column (`todo` | `in_progress` | `user_review` | `done`). Required.
     pub status: String,
 }
 
@@ -7139,10 +7145,15 @@ pub async fn list_tasks_handler(
             .collect(),
     };
     for s in &statuses {
-        if s != "todo" && s != "in_progress" && s != "done" && s != "cancelled" {
+        if !matches!(
+            s.as_str(),
+            "todo" | "in_progress" | "user_review" | "done" | "cancelled"
+        ) {
             return Err(AppError(
                 StatusCode::BAD_REQUEST,
-                format!("invalid status '{s}': must be todo|in_progress|done|cancelled"),
+                format!(
+                    "invalid status '{s}': must be todo|in_progress|user_review|done|cancelled"
+                ),
             ));
         }
     }
@@ -7838,10 +7849,13 @@ pub async fn reorder_tasks_handler(
     }
 
     let status = q.status.clone();
-    if status != "todo" && status != "in_progress" && status != "done" {
+    if !matches!(
+        status.as_str(),
+        "todo" | "in_progress" | "user_review" | "done"
+    ) {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            format!("invalid status '{status}': must be todo|in_progress|done"),
+            format!("invalid status '{status}': must be todo|in_progress|user_review|done"),
         ));
     }
 
@@ -8379,10 +8393,13 @@ pub(crate) fn render_task_link_page(detail: &db::TaskDetail, theme: &str) -> Str
               data-nd-success="refresh:#task-link-title,refresh:#task-link-status,refresh:#task-link-description,refresh:#task-link-specification">Claim</button>
       <button type="button" class="nd-btn-secondary nd-btn-sm"
               data-nd-action="PATCH {api_url}" data-nd-body='{{"status":"todo"}}'
-              data-nd-success="refresh:#task-link-title,refresh:#task-link-status,refresh:#task-link-description,refresh:#task-link-specification">Release</button>
+              data-nd-success="refresh:#task-link-title,refresh:#task-link-status,refresh:#task-link-description,refresh:#task-link-specification">Return to TODO</button>
+      <button type="button" class="nd-btn-primary nd-btn-sm"
+              data-nd-action="PATCH {api_url}" data-nd-body='{{"status":"user_review"}}'
+              data-nd-success="refresh:#task-link-title,refresh:#task-link-status,refresh:#task-link-description,refresh:#task-link-specification">User review</button>
       <button type="button" class="nd-btn-primary nd-btn-sm"
               data-nd-action="PATCH {api_url}" data-nd-body='{{"status":"done"}}'
-              data-nd-success="refresh:#task-link-title,refresh:#task-link-status,refresh:#task-link-description,refresh:#task-link-specification">Done</button>
+              data-nd-success="refresh:#task-link-title,refresh:#task-link-status,refresh:#task-link-description,refresh:#task-link-specification">Close</button>
       <button type="button" class="nd-btn-secondary nd-btn-sm"
               data-nd-action="PATCH {api_url}" data-nd-body='{{"status":"todo"}}'
               data-nd-success="refresh:#task-link-title,refresh:#task-link-status,refresh:#task-link-description,refresh:#task-link-specification">Reopen</button>
@@ -8595,7 +8612,7 @@ pub(crate) fn tasks_board_content(ident_attr: &str, toolbar: &str, goal: Option<
     <a class="nd-btn-primary nd-btn-sm" href="/projects/{ident}/tasks/new{new_goal_query}">+ New task</a>
   </div>
 
-  <!-- Shared card template used by all three columns. -->
+  <!-- Shared card template used by all four columns. -->
   <template id="task-card">
     <li class="nd-card nd-mb-sm task-kind-{{{{kind}}}}" data-id="{{{{id}}}}">
       <button type="button"
@@ -8613,7 +8630,7 @@ pub(crate) fn tasks_board_content(ident_attr: &str, toolbar: &str, goal: Option<
   </template>
 
   <div class="nd-row">
-    <div class="nd-col-4">
+    <div class="nd-col-3">
       <section class="nd-card">
         <div class="nd-card-header"><strong>TODO</strong></div>
         <ul class="nd-card-body"
@@ -8622,7 +8639,7 @@ pub(crate) fn tasks_board_content(ident_attr: &str, toolbar: &str, goal: Option<
             data-nd-template="task-card"
             data-nd-sortable="POST /v1/projects/{ident}/tasks/reorder?status=todo{goal_query}"
             data-nd-sortable-group="tasks"
-            data-nd-sortable-refresh="#col-todo,#col-in_progress,#col-done">
+            data-nd-sortable-refresh="#col-todo,#col-in_progress,#col-user_review,#col-done">
           <template data-nd-empty>
             <li class="nd-text-muted nd-text-sm">No tasks.</li>
           </template>
@@ -8630,7 +8647,7 @@ pub(crate) fn tasks_board_content(ident_attr: &str, toolbar: &str, goal: Option<
       </section>
     </div>
 
-    <div class="nd-col-4">
+    <div class="nd-col-3">
       <section class="nd-card">
         <div class="nd-card-header"><strong>IN PROGRESS</strong></div>
         <ul class="nd-card-body"
@@ -8639,7 +8656,7 @@ pub(crate) fn tasks_board_content(ident_attr: &str, toolbar: &str, goal: Option<
             data-nd-template="task-card"
             data-nd-sortable="POST /v1/projects/{ident}/tasks/reorder?status=in_progress{goal_query}"
             data-nd-sortable-group="tasks"
-            data-nd-sortable-refresh="#col-todo,#col-in_progress,#col-done">
+            data-nd-sortable-refresh="#col-todo,#col-in_progress,#col-user_review,#col-done">
           <template data-nd-empty>
             <li class="nd-text-muted nd-text-sm">No tasks.</li>
           </template>
@@ -8647,7 +8664,24 @@ pub(crate) fn tasks_board_content(ident_attr: &str, toolbar: &str, goal: Option<
       </section>
     </div>
 
-    <div class="nd-col-4">
+    <div class="nd-col-3">
+      <section class="nd-card">
+        <div class="nd-card-header"><strong>User review</strong></div>
+        <ul class="nd-card-body"
+            id="col-user_review"
+            data-nd-bind="/v1/projects/{ident}/tasks?status=user_review{goal_query}"
+            data-nd-template="task-card"
+            data-nd-sortable="POST /v1/projects/{ident}/tasks/reorder?status=user_review{goal_query}"
+            data-nd-sortable-group="tasks"
+            data-nd-sortable-refresh="#col-todo,#col-in_progress,#col-user_review,#col-done">
+          <template data-nd-empty>
+            <li class="nd-text-muted nd-text-sm">No tasks awaiting your decision.</li>
+          </template>
+        </ul>
+      </section>
+    </div>
+
+    <div class="nd-col-3">
       <section class="nd-card">
         <div class="nd-card-header"><strong>DONE</strong></div>
         <ul class="nd-card-body"
@@ -8656,7 +8690,7 @@ pub(crate) fn tasks_board_content(ident_attr: &str, toolbar: &str, goal: Option<
             data-nd-template="task-card"
             data-nd-sortable="POST /v1/projects/{ident}/tasks/reorder?status=done{goal_query}"
             data-nd-sortable-group="tasks"
-            data-nd-sortable-refresh="#col-todo,#col-in_progress,#col-done">
+            data-nd-sortable-refresh="#col-todo,#col-in_progress,#col-user_review,#col-done">
           <template data-nd-empty>
             <li class="nd-text-muted nd-text-sm">No tasks.</li>
           </template>
@@ -8699,7 +8733,7 @@ pub(crate) fn tasks_board_content(ident_attr: &str, toolbar: &str, goal: Option<
       </div>
 
       <form class="nd-flex nd-gap-sm nd-mt-md" data-nd-action="PATCH /v1/projects/{ident}/tasks/${{selectedTaskId}}"
-            data-nd-success="refresh:#col-todo,refresh:#col-in_progress,refresh:#col-done,refresh:#task-modal-meta,reset">
+            data-nd-success="refresh:#col-todo,refresh:#col-in_progress,refresh:#col-user_review,refresh:#col-done,refresh:#task-modal-meta,reset">
         <label>Move to goal <input name="goal" placeholder="Blank removes the goal"></label>
         <button type="submit" class="nd-btn-secondary nd-btn-sm">Save goal</button>
       </form>
@@ -8708,28 +8742,35 @@ pub(crate) fn tasks_board_content(ident_attr: &str, toolbar: &str, goal: Option<
                 class="nd-btn-primary nd-btn-sm"
                 data-nd-action="PATCH /v1/projects/{ident}/tasks/${{selectedTaskId}}"
                 data-nd-body='{{"status":"in_progress"}}'
-                data-nd-success="refresh:#col-todo,refresh:#col-in_progress,refresh:#col-done,refresh:#task-modal-header,refresh:#task-modal-meta">
+                data-nd-success="refresh:#col-todo,refresh:#col-in_progress,refresh:#col-user_review,refresh:#col-done,refresh:#task-modal-header,refresh:#task-modal-meta">
           Claim
         </button>
         <button type="button"
                 class="nd-btn-secondary nd-btn-sm"
                 data-nd-action="PATCH /v1/projects/{ident}/tasks/${{selectedTaskId}}"
                 data-nd-body='{{"status":"todo"}}'
-                data-nd-success="refresh:#col-todo,refresh:#col-in_progress,refresh:#col-done,refresh:#task-modal-header,refresh:#task-modal-meta">
-          Release
+                data-nd-success="refresh:#col-todo,refresh:#col-in_progress,refresh:#col-user_review,refresh:#col-done,refresh:#task-modal-header,refresh:#task-modal-meta">
+          Return to TODO
+        </button>
+        <button type="button"
+                class="nd-btn-primary nd-btn-sm"
+                data-nd-action="PATCH /v1/projects/{ident}/tasks/${{selectedTaskId}}"
+                data-nd-body='{{"status":"user_review"}}'
+                data-nd-success="refresh:#col-todo,refresh:#col-in_progress,refresh:#col-user_review,refresh:#col-done,refresh:#task-modal-header,refresh:#task-modal-meta">
+          User review
         </button>
         <button type="button"
                 class="nd-btn-primary nd-btn-sm"
                 data-nd-action="PATCH /v1/projects/{ident}/tasks/${{selectedTaskId}}"
                 data-nd-body='{{"status":"done"}}'
-                data-nd-success="refresh:#col-todo,refresh:#col-in_progress,refresh:#col-done,refresh:#task-modal-header,refresh:#task-modal-meta">
-          Done
+                data-nd-success="refresh:#col-todo,refresh:#col-in_progress,refresh:#col-user_review,refresh:#col-done,refresh:#task-modal-header,refresh:#task-modal-meta">
+          Close
         </button>
         <button type="button"
                 class="nd-btn-secondary nd-btn-sm"
                 data-nd-action="PATCH /v1/projects/{ident}/tasks/${{selectedTaskId}}"
                 data-nd-body='{{"status":"todo"}}'
-                data-nd-success="refresh:#col-todo,refresh:#col-in_progress,refresh:#col-done,refresh:#task-modal-header,refresh:#task-modal-meta">
+                data-nd-success="refresh:#col-todo,refresh:#col-in_progress,refresh:#col-user_review,refresh:#col-done,refresh:#task-modal-header,refresh:#task-modal-meta">
           Reopen
         </button>
       </div>
@@ -9597,7 +9638,8 @@ mod tests {
             todo,
             vec![
                 ("Claim".into(), "in_progress".into()),
-                ("Done".into(), "done".into())
+                ("Done".into(), "done".into()),
+                ("User review".into(), "user_review".into())
             ],
         );
 
@@ -9609,7 +9651,8 @@ mod tests {
             in_progress,
             vec![
                 ("Release".into(), "todo".into()),
-                ("Done".into(), "done".into())
+                ("Done".into(), "done".into()),
+                ("User review".into(), "user_review".into())
             ],
         );
 
@@ -9619,6 +9662,17 @@ mod tests {
             .collect();
         assert_eq!(done, vec![("Reopen".into(), "todo".into())]);
 
+        let review: Vec<_> = actions_for_status("user_review")
+            .into_iter()
+            .map(|a| (a.verb, a.target_status))
+            .collect();
+        assert_eq!(
+            review,
+            vec![
+                ("Return to TODO".into(), "todo".into()),
+                ("Close".into(), "done".into())
+            ]
+        );
         assert!(actions_for_status("nonsense").is_empty());
     }
 
@@ -9842,6 +9896,192 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_review_holds_work_until_a_user_decides() {
+        let state = test_state();
+        let agent = native_task_headers();
+        let Json(created) = create_task_handler(
+            State(state.clone()),
+            agent.clone(),
+            Path("demo".into()),
+            Json(
+                serde_json::from_value(serde_json::json!({
+                    "title": "Still needed?", "specification": "Keep this context"
+                }))
+                .unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        let id = created.task.id;
+        let path = || Path(("demo".into(), id.clone()));
+        let update = |status: &str| {
+            Json(
+                serde_json::from_value::<UpdateTaskRequest>(serde_json::json!({"status": status}))
+                    .unwrap(),
+            )
+        };
+        let reorder = |status: &str| {
+            Query(ReorderTasksQuery {
+                goal: None,
+                status: status.into(),
+            })
+        };
+        for via_reorder in [false, true] {
+            let _ = update_task_handler(
+                State(state.clone()),
+                agent.clone(),
+                path(),
+                update("in_progress"),
+            )
+            .await
+            .unwrap();
+            // A peer cannot move another session's claimed task to user review.
+            let mut peer = agent.clone();
+            peer.insert(
+                "x-agent-session-id",
+                "cccccccc-cccc-4ccc-8ccc-cccccccccccc".parse().unwrap(),
+            );
+            assert_eq!(
+                update_task_handler(State(state.clone()), peer, path(), update("user_review"))
+                    .await
+                    .unwrap_err()
+                    .0,
+                StatusCode::CONFLICT
+            );
+            if via_reorder {
+                let _ = reorder_tasks_handler(
+                    State(state.clone()),
+                    agent.clone(),
+                    Path("demo".into()),
+                    reorder("user_review"),
+                    Json(ReorderTasksRequest {
+                        order: vec![id.clone()],
+                    }),
+                )
+                .await
+                .unwrap();
+            } else {
+                let _ = update_task_handler(
+                    State(state.clone()),
+                    agent.clone(),
+                    path(),
+                    update("user_review"),
+                )
+                .await
+                .unwrap();
+            }
+            let Json(detail) = get_task_handler(State(state.clone()), path())
+                .await
+                .unwrap();
+            assert_eq!(detail.task.status, "user_review");
+            assert!(detail.task.owner_agent_id.is_none());
+            assert!(detail.task.owner_origin.is_none());
+            assert!(detail.task.started_at.is_none());
+            assert!(detail.task.done_at.is_none());
+            assert_eq!(detail.task.details.as_deref(), Some("Keep this context"));
+            let Json(review) = list_tasks_handler(
+                State(state.clone()),
+                HeaderMap::new(),
+                Path("demo".into()),
+                Query(
+                    serde_json::from_value(serde_json::json!({
+                        "status": "user_review"
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(review.len(), 1);
+            let Json(queue) = list_tasks_handler(
+                State(state.clone()),
+                agent.clone(),
+                Path("demo".into()),
+                Query(serde_json::from_value(serde_json::json!({})).unwrap()),
+            )
+            .await
+            .unwrap();
+            assert!(queue.is_empty());
+            for status in ["todo", "in_progress", "done"] {
+                assert_eq!(
+                    update_task_handler(
+                        State(state.clone()),
+                        agent.clone(),
+                        path(),
+                        update(status)
+                    )
+                    .await
+                    .unwrap_err()
+                    .0,
+                    StatusCode::CONFLICT
+                );
+                assert_eq!(
+                    reorder_tasks_handler(
+                        State(state.clone()),
+                        agent.clone(),
+                        Path("demo".into()),
+                        reorder(status),
+                        Json(ReorderTasksRequest {
+                            order: vec![id.clone()]
+                        })
+                    )
+                    .await
+                    .unwrap_err()
+                    .0,
+                    StatusCode::CONFLICT
+                );
+            }
+            {
+                let conn = state.db.lock().unwrap();
+                conn.execute("UPDATE tasks SET updated_at=0 WHERE id=?1", [&id])
+                    .unwrap();
+                assert_eq!(db::reclaim_stale_tasks(&conn, "demo").unwrap(), 0);
+            }
+            // Browser decisions work after ownership has been released.
+            if via_reorder {
+                let _ = reorder_tasks_handler(
+                    State(state.clone()),
+                    HeaderMap::new(),
+                    Path("demo".into()),
+                    reorder("todo"),
+                    Json(ReorderTasksRequest {
+                        order: vec![id.clone()],
+                    }),
+                )
+                .await
+                .unwrap();
+            } else {
+                let _ = update_task_handler(
+                    State(state.clone()),
+                    HeaderMap::new(),
+                    path(),
+                    update("todo"),
+                )
+                .await
+                .unwrap();
+            }
+        }
+        let _ = update_task_handler(
+            State(state.clone()),
+            agent.clone(),
+            path(),
+            update("user_review"),
+        )
+        .await
+        .unwrap();
+        let Json(closed) = update_task_handler(
+            State(state.clone()),
+            HeaderMap::new(),
+            path(),
+            update("done"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(closed.status, "done");
+        assert!(closed.done_at.is_some());
+    }
+
+    #[tokio::test]
     async fn task_goal_claims_require_matching_context_and_can_be_cleared() {
         let state = test_state();
         let Json(created) = create_task_handler(
@@ -10014,8 +10254,8 @@ mod tests {
         assert!(html.contains("data-nd-action=\"PATCH /v1/projects/demo-project/tasks/019f770c-0000-7000-8000-000000000001\""));
         assert!(html.contains("data-nd-action=\"POST /v1/projects/demo-project/tasks/019f770c-0000-7000-8000-000000000001/comments\""));
         assert!(html.contains(">Claim</button>"));
-        assert!(html.contains(">Release</button>"));
-        assert!(html.contains(">Done</button>"));
+        assert!(html.contains(">Return to TODO</button>"));
+        assert!(html.contains(">Close</button>"));
         assert!(html.contains(">Reopen</button>"));
         assert!(!html.contains("Please check <this>"));
     }
@@ -12132,7 +12372,7 @@ mod tests {
         assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
     }
 
-    /// `/tasks` is the drag-and-drop board (not a list): three sortable
+    /// `/tasks` is the drag-and-drop board (not a list): four sortable
     /// columns for the selected project plus a project switcher, and the
     /// per-project route renders the same columns.
     #[tokio::test]
@@ -12145,7 +12385,7 @@ mod tests {
         .await
         .unwrap();
         let html = page.0;
-        for col in ["todo", "in_progress", "done"] {
+        for col in ["todo", "in_progress", "user_review", "done"] {
             assert!(
                 html.contains(&format!(
                     r#"data-nd-sortable="POST /v1/projects/demo/tasks/reorder?status={col}""#
@@ -12153,7 +12393,7 @@ mod tests {
                 "missing sortable column {col}: {html}"
             );
         }
-        assert_eq!(html.matches(r#"data-nd-sortable-group="tasks""#).count(), 3);
+        assert_eq!(html.matches(r#"data-nd-sortable-group="tasks""#).count(), 4);
         assert!(html.contains(r#"<option value="demo" selected>"#));
         assert!(
             !html.contains("status=open"),
@@ -12177,7 +12417,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             board.0.matches(r#"data-nd-sortable-group="tasks""#).count(),
-            3
+            4
         );
         assert!(board.0.contains(r#"href="/tasks">← All projects</a>"#));
     }
