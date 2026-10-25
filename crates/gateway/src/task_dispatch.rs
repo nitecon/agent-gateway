@@ -3417,4 +3417,245 @@ mod tests {
         assert_eq!(auth["session"], json!(target.target.origin));
         assert_eq!(auth["generation"], target.target.generation);
     }
+
+    async fn windows_agent(state: &AppState) -> Agent {
+        let instance = id();
+        let key = provision(&state.db.lock().unwrap(), "example", &instance, "windows").unwrap();
+        let mut agent = Agent::new(&instance, &key);
+        agent.target.origin.os = "windows".into();
+        register_agent(state, &agent, "example").await;
+        agent
+    }
+
+    #[tokio::test]
+    async fn ordinary_task_os_labels_gate_creation_claims_assignment_and_set_os() {
+        let state = fixture(db::open(":memory:").unwrap());
+        let linux = agents(&state).await;
+        let windows = windows_agent(&state).await;
+        let tasks = "/v1/projects/example/tasks";
+        for labels in [
+            json!(["os:freebsd"]),
+            json!(["os:linux", "os:windows"]),
+            json!(["os:linux", "os:linux"]),
+            json!(["OS:linux"]),
+        ] {
+            let (status, body) = http(
+                &state,
+                &linux[0],
+                "POST",
+                tasks,
+                json!({"title":"bad","labels":labels}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{labels} {body}");
+        }
+
+        // A submitter on another OS leaves the task unassigned TODO.
+        let wrong = ok(
+            &state,
+            &linux[0],
+            "POST",
+            tasks,
+            json!({"title":"Windows only","labels":["autoreview-finding","os:windows"]}),
+        )
+        .await;
+        assert!(wrong["owner_origin"].is_null() && wrong["owner_agent_id"].is_null());
+        assert_eq!(wrong["status"], "todo");
+        assert_eq!(wrong["labels"], json!(["autoreview-finding", "os:windows"]));
+        let wrong_path = format!("{tasks}/{}", wrong["id"].as_str().unwrap());
+        assert_eq!(
+            http(
+                &state,
+                &linux[1],
+                "PATCH",
+                &wrong_path,
+                json!({"status":"in_progress"})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        let claimed = ok(
+            &state,
+            &windows,
+            "PATCH",
+            &wrong_path,
+            json!({"status":"in_progress"}),
+        )
+        .await;
+        assert_eq!(claimed["owner_origin"], json!(windows.target.origin));
+
+        // Explicit routing and reassignment refuse an incompatible target.
+        assert_eq!(http(&state, &linux[0], "POST", tasks,
+            json!({"title":"routed","labels":["os:windows"],"routing":{"mode":"session","target":linux[1].target}})).await.0,
+            StatusCode::CONFLICT);
+        let owned = ok(
+            &state,
+            &linux[0],
+            "POST",
+            tasks,
+            json!({"title":"Linux","labels":["os:linux"]}),
+        )
+        .await;
+        assert_eq!(owned["owner_origin"], json!(linux[0].target.origin));
+        let path = format!("{tasks}/{}", owned["id"].as_str().unwrap());
+        assert_eq!(
+            http(
+                &state,
+                &linux[0],
+                "POST",
+                &format!("{path}/reassign"),
+                json!({"target":windows.target})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        let moved = ok(
+            &state,
+            &linux[0],
+            "POST",
+            &format!("{path}/reassign"),
+            json!({"target":linux[1].target}),
+        )
+        .await;
+        assert_eq!(moved["owner_origin"], json!(linux[1].target.origin));
+        assert_eq!(
+            moved["routing"],
+            json!({"mode":"session","target":linux[1].target}),
+            "reassign replaces the stale route"
+        );
+        ok(
+            &state,
+            &linux[1],
+            "PATCH",
+            &path,
+            json!({"status":"in_progress"}),
+        )
+        .await;
+
+        // Only the exact owner may change OS, never combined with status/owner changes.
+        assert_eq!(
+            http(
+                &state,
+                &linux[2],
+                "PATCH",
+                &path,
+                json!({"labels":["os:windows"]})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            http(
+                &state,
+                &linux[1],
+                "PATCH",
+                &path,
+                json!({"labels":["os:windows"],"status":"todo"})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            http(
+                &state,
+                &linux[1],
+                "PATCH",
+                &path,
+                json!({"labels":["os:mac"]})
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        // Same-OS label edits keep the claim.
+        let kept = ok(
+            &state,
+            &linux[1],
+            "PATCH",
+            &path,
+            json!({"labels":["os:linux","keep"]}),
+        )
+        .await;
+        assert_eq!(kept["status"], "in_progress");
+        let released = ok(
+            &state,
+            &linux[1],
+            "PATCH",
+            &path,
+            json!({"labels":["keep","os:windows"]}),
+        )
+        .await;
+        assert_eq!(released["status"], "todo");
+        assert!(
+            released["owner_origin"].is_null()
+                && released["owner_agent_id"].is_null()
+                && released["started_at"].is_null()
+        );
+        assert_eq!(released["routing"], json!({"mode":"auto"}));
+        assert_eq!(released["labels"], json!(["keep", "os:windows"]));
+        assert_eq!(
+            http(
+                &state,
+                &linux[1],
+                "PATCH",
+                &path,
+                json!({"status":"in_progress"})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        ok(
+            &state,
+            &windows,
+            "PATCH",
+            &path,
+            json!({"status":"in_progress"}),
+        )
+        .await;
+        // Removing the restriction never releases a compatible owner.
+        assert_eq!(
+            ok(&state, &windows, "PATCH", &path, json!({"labels":["keep"]})).await["status"],
+            "in_progress"
+        );
+
+        // User review and closed tasks stay protected from agent OS changes.
+        ok(
+            &state,
+            &windows,
+            "PATCH",
+            &wrong_path,
+            json!({"status":"user_review"}),
+        )
+        .await;
+        assert_eq!(
+            http(
+                &state,
+                &windows,
+                "PATCH",
+                &wrong_path,
+                json!({"labels":["os:linux"]})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        ok(&state, &windows, "PATCH", &path, json!({"status":"done"})).await;
+        assert_eq!(
+            http(
+                &state,
+                &windows,
+                "PATCH",
+                &path,
+                json!({"labels":["os:linux"]})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+    }
 }

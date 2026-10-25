@@ -250,7 +250,7 @@ def main():
         worker_presence=api('/v1/projects/alpha/task-targets',{'generation':str(uuid.uuid4()),'canonical_remote':'github.com/fixture/alpha'},origin=WORKER)
         human={'X-Agent-Id':None}
         assigned=api('/v1/projects/alpha/tasks/'+routed['id']+'/assign',{'target':worker_presence['target']},headers=human)
-        assert assigned['owner_origin']==WORKER
+        assert assigned['owner_origin']==WORKER and assigned['routing']=={'mode':'session','target':worker_presence['target']}
         event=receive_event(client,'task_commented');assert event['origin'] is None and event['comment']['author_type']=='user';ack(client,event)
         api('/v1/projects/alpha/tasks/'+routed['id'],{'title':'User edited assigned work'},'PATCH',headers=human)
         api('/v1/projects/alpha/tasks/'+routed['id']+'/comments',{'content':'User follow-up'},headers=human)
@@ -284,7 +284,7 @@ def main():
         process.terminate();process.wait(timeout=10)
         process=start()
         client,hello=subscribe("fixture-cmux");assert hello["cursor"]==replay["id"]
-        assert api('/v1/projects/alpha/tasks/'+routed['id'])['routing']==routed['routing']
+        assert api('/v1/projects/alpha/tasks/'+routed['id'])['routing']==assigned['routing']
         assert api('/v1/projects/local-games/tasks/'+local_task['id'])['owner_origin']==WORKER
         assert api('/v1/projects/local-games/task-targets')['canonical_remote'] is None
         delegation=api("/v1/projects/alpha/tasks/delegate",{"target_project_ident":"beta","title":"Incoming delegated task"},origin=REQUESTER)

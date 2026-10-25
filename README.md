@@ -317,8 +317,9 @@ For example:
 
 Reassignment atomically sets `owner_origin` and `owner_agent_id` (the target's
 session UUID), returns the task to `todo`, clears its start time, records the
-calling agent in an audit comment, and resets inactivity expiry. The new owner
-can then claim the task. Ordinary PATCH/status ownership checks continue to
+calling agent in an audit comment, and resets inactivity expiry. It also
+replaces `routing` with `{mode:"session",target}` so a previous exact-session
+route cannot block the new owner. The new owner can then claim the task. Ordinary PATCH/status ownership checks continue to
 prevent peers from accidentally claiming assigned work. Finished tasks must be
 reopened first; dispatch-managed tasks use their existing dispatch handoff API.
 
@@ -333,6 +334,22 @@ PATCH editing, release and completion, and POST comments, remain available for
 assigned ordinary tasks. Agent requests retain exact-owner checks. Task ownership
 assignment through the human sidebar uses `/assign`, not a display-name override.
 Both user and agent assignments retain the 15-minute inactivity deadline.
+
+#### Required OS
+
+An ordinary task may carry at most one label `os:windows`, `os:linux` or
+`os:macos`; no OS label means any OS. Unknown, non-lowercase or multiple `os:`
+labels return 400 on create, delegate and PATCH; other labels are kept as-is.
+The required OS is matched against the agent origin `os`:
+
+- Creation leaves the task unassigned `todo` when the submitter's OS differs,
+  and rejects an explicit `session` route to a different OS with 409.
+- Claiming (`in_progress`), `/reassign` and `/assign` return 409 for a different OS.
+- Changing the OS uses PATCH `{labels}` alone (combined status/owner changes
+  return 409) by the exact owner, if any, on a `todo`/`in_progress` task; agents cannot
+  change it on `user_review` or finished tasks. An incompatible claim is
+  released to unassigned `todo` with an audit comment, and a stale session route
+  becomes `{mode:"auto"}`, so only a compatible agent can claim it next.
 
 #### Desktop routing and available agents
 

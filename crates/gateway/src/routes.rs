@@ -45,6 +45,8 @@ impl<E: Into<anyhow::Error>> From<E> for AppError {
                 .is_some()
         {
             StatusCode::CONFLICT
+        } else if err.downcast_ref::<db::InvalidTaskLabels>().is_some() {
+            StatusCode::BAD_REQUEST
         } else {
             StatusCode::INTERNAL_SERVER_ERROR
         };

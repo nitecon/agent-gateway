@@ -7796,6 +7796,42 @@ pub struct TaskDetail {
     pub comments: Vec<TaskComment>,
 }
 
+/// Rejected task labels are a client request error, not a state conflict.
+#[derive(Debug)]
+pub struct InvalidTaskLabels(pub String);
+impl std::fmt::Display for InvalidTaskLabels {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for InvalidTaskLabels {}
+
+/// Ordinary tasks restrict their executing agent OS with at most one canonical
+/// `os:windows|os:linux|os:macos` label; no OS label means unrestricted.
+pub fn task_required_os(labels: &[String]) -> Result<Option<&str>> {
+    let mut required = None;
+    for label in labels
+        .iter()
+        .filter(|l| l.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("os:")))
+    {
+        let os = &label[3..];
+        if !matches!(label.get(..3), Some("os:")) || !matches!(os, "windows" | "linux" | "macos") {
+            return Err(InvalidTaskLabels(format!(
+                "unsupported OS label '{label}': use os:windows, os:linux or os:macos"
+            ))
+            .into());
+        }
+        if required.replace(os).is_some() {
+            return Err(InvalidTaskLabels("a task may carry at most one os: label".into()).into());
+        }
+    }
+    Ok(required)
+}
+
+fn os_mismatch(required: Option<&str>, origin: Option<&crate::task_events::AgentOrigin>) -> bool {
+    required.is_some_and(|os| origin.is_none_or(|o| o.os != os))
+}
+
 /// Dynamic update payload for `update_task`. `None` on any field means
 /// "do not touch"; for the `Option<Option<_>>` fields, `Some(None)` means
 /// "clear the column" and `Some(Some(x))` means "set to x".
@@ -8547,13 +8583,22 @@ fn insert_task_record(
     let now = now_ms();
     let labels_json = serialize_string_array(labels);
     let routing = routing.cloned().unwrap_or_default();
+    let required_os = task_required_os(labels)?;
     let owner_origin = match &routing {
         crate::task_targets::Routing::Session { target } => {
+            if os_mismatch(required_os, Some(&target.origin)) {
+                return Err(crate::task_dispatch::Conflict(
+                    "target agent OS does not match the task os: label",
+                )
+                .into());
+            }
             crate::task_dispatch::connected_target(conn, &project_ident, target)?;
             Some(target.origin.clone())
         }
+        // A submitter on another OS leaves the task unassigned for a compatible agent.
         crate::task_targets::Routing::Auto if assign_submitter => {
             crate::task_events::current_origin(conn)?
+                .filter(|origin| !os_mismatch(required_os, Some(origin)))
         }
         _ => None,
     };
@@ -8960,6 +9005,12 @@ fn assign_task_inner(
     if !matches!(previous.status.as_str(), "todo" | "in_progress") {
         return Err(crate::task_dispatch::Conflict("only active tasks can be reassigned").into());
     }
+    if os_mismatch(task_required_os(&previous.labels)?, Some(&target.origin)) {
+        return Err(crate::task_dispatch::Conflict(
+            "target agent OS does not match the task os: label",
+        )
+        .into());
+    }
     let caller = crate::task_events::current_origin(conn)?;
     if human {
         if caller.is_some() {
@@ -8990,6 +9041,13 @@ fn assign_task_inner(
             crud_col("status", "todo"),
             crud_col("owner_agent_id", target.origin.session_id.as_str()),
             crud_col("owner_origin_json", serde_json::to_string(&target.origin)?),
+            // Route to the new owner so a previous exact-session route cannot block it.
+            crud_col(
+                "routing_json",
+                serde_json::to_string(&crate::task_targets::Routing::Session {
+                    target: target.clone(),
+                })?,
+            ),
             crud_col("started_at", DbValue::null()),
             crud_col("done_at", DbValue::null()),
             crud_col("updated_at", now),
@@ -9111,7 +9169,32 @@ fn update_task_inner(
         )
         .into());
     }
-    if enforce_owner && (upd.status.is_some() || upd.owner_agent_id.is_some() || upd.goal.is_some())
+    // Stored labels predate validation, so only new labels are rejected.
+    let current_os = task_required_os(&current.labels).ok().flatten();
+    let next_os = match upd.labels {
+        Some(labels) => task_required_os(labels)?,
+        None => current_os,
+    };
+    let os_changed = next_os != current_os;
+    if os_changed && (upd.status.is_some() || upd.owner_agent_id.is_some()) {
+        return Err(crate::task_dispatch::Conflict(
+            "change the task os: label without a status or owner change",
+        )
+        .into());
+    }
+    if os_changed
+        && (origin.is_some() || actor_agent_id.is_some())
+        && !matches!(current.status.as_str(), "todo" | "in_progress")
+    {
+        return Err(
+            crate::task_dispatch::Conflict("only active tasks can change their os: label").into(),
+        );
+    }
+    if enforce_owner
+        && (upd.status.is_some()
+            || upd.owner_agent_id.is_some()
+            || upd.goal.is_some()
+            || os_changed)
     {
         if current.owner_origin.is_none()
             && (current.owner_agent_id.is_some() || current.status == "in_progress")
@@ -9140,6 +9223,21 @@ fn update_task_inner(
     let new_status = upd.status.unwrap_or(&current.status).to_string();
     let owner_explicit = upd.owner_agent_id.is_some();
     let transitioning = upd.status.is_some() && new_status != current.status;
+    if transitioning && new_status == "in_progress" && os_mismatch(next_os, origin.as_ref()) {
+        return Err(crate::task_dispatch::Conflict(
+            "claiming agent OS does not match the task os: label",
+        )
+        .into());
+    }
+    // Moving to another OS returns an incompatible claim to the queue; it never
+    // falls back to an agent on a different OS.
+    let release_owner = os_changed
+        && (current.owner_agent_id.is_some() || current.owner_origin.is_some())
+        && os_mismatch(next_os, current.owner_origin.as_ref());
+    let reset_routing = os_changed
+        && (release_owner
+            || matches!(&current.routing, crate::task_targets::Routing::Session { target }
+                if os_mismatch(next_os, Some(&target.origin))));
 
     // Compute derived fields based on the transition.
     // started_at: Some(Some(v)) = set, Some(None) = clear, None = leave alone
@@ -9240,6 +9338,18 @@ fn update_task_inner(
     } else if transitioning && matches!(new_status.as_str(), "todo" | "user_review") {
         assignments.push(crud_col("owner_origin_json", DbValue::null()));
     }
+    if release_owner {
+        assignments.push(crud_col("status", "todo"));
+        assignments.push(crud_col("owner_agent_id", DbValue::null()));
+        assignments.push(crud_col("owner_origin_json", DbValue::null()));
+        assignments.push(crud_col("started_at", DbValue::null()));
+    }
+    if reset_routing {
+        assignments.push(crud_col(
+            "routing_json",
+            serde_json::to_string(&crate::task_targets::Routing::Auto)?,
+        ));
+    }
 
     // Always bump updated_at.
     assignments.push(crud_col("updated_at", now));
@@ -9259,6 +9369,18 @@ fn update_task_inner(
     )?;
     if n == 0 {
         return Ok(None);
+    }
+    if release_owner {
+        insert_comment(
+            conn,
+            task_id,
+            "agent-gateway",
+            "system",
+            &format!(
+                "Task OS requirement changed to {}; released the incompatible claim to TODO for a compatible agent.",
+                next_os.unwrap_or("any")
+            ),
+        )?;
     }
 
     // Re-read the row to return a fully-consistent Task.
