@@ -4410,6 +4410,27 @@ fn optional_header(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+pub async fn memory_capabilities_handler() -> Json<serde_json::Value> {
+    Json(crate::memory_okf::capabilities())
+}
+
+fn memory_okf_requested(headers: &HeaderMap) -> bool {
+    optional_header(headers, "x-memory-capabilities").is_some_and(|value| {
+        value
+            .split(',')
+            .any(|token| token.trim() == crate::memory_okf::CAPABILITY)
+    })
+}
+
+fn project_memory_envelopes(memories: &mut [db::MemoryRecord], headers: &HeaderMap) {
+    if !memory_okf_requested(headers) {
+        for memory in memories {
+            memory.concept_hash = None;
+            memory.okf = None;
+        }
+    }
+}
+
 fn memory_push_source(headers: &HeaderMap) -> db::MemoryPushSource {
     db::MemoryPushSource {
         agent_id: optional_header(headers, "x-agent-id"),
@@ -4422,6 +4443,7 @@ fn memory_push_source(headers: &HeaderMap) -> db::MemoryPushSource {
 
 pub async fn list_memories_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(ident): Path<String>,
     Query(q): Query<ListMemoriesQuery>,
 ) -> Result<Json<db::MemorySearchResponse>> {
@@ -4453,13 +4475,14 @@ pub async fn list_memories_handler(
             "project not found".to_string(),
         ));
     }
-    Ok(Json(
-        response.expect("memory search response exists for project"),
-    ))
+    let mut response = response.expect("memory search response exists for project");
+    project_memory_envelopes(&mut response.memories, &headers);
+    Ok(Json(response))
 }
 
 pub async fn pull_memories_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(ident): Path<String>,
     Json(req): Json<PullMemoriesRequest>,
 ) -> Result<Json<db::MemoryPullResponse>> {
@@ -4490,9 +4513,9 @@ pub async fn pull_memories_handler(
             "project not found".to_string(),
         ));
     }
-    Ok(Json(
-        response.expect("memory pull response exists for project"),
-    ))
+    let mut response = response.expect("memory pull response exists for project");
+    project_memory_envelopes(&mut response.memories, &headers);
+    Ok(Json(response))
 }
 
 pub async fn push_memories_handler(

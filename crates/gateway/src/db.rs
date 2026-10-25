@@ -1310,6 +1310,20 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             ON gateway_memory_client_links(project_ident, gateway_memory_id);",
     )?;
 
+    // Additive, idempotent OKF migration; legacy rows remain NULL.
+    for column in ["concept_hash", "okf_json"] {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('gateway_memories') WHERE name=?1)",
+            [column],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            conn.execute_batch(&format!(
+                "ALTER TABLE gateway_memories ADD COLUMN {column} TEXT"
+            ))?;
+        }
+    }
+
     crate::task_cancel::initialize(conn)?;
     crate::task_events::initialize(conn)?;
     crate::task_dispatch::initialize(conn)?;
@@ -6070,6 +6084,10 @@ pub struct MemoryRecord {
     pub memory_type: String,
     pub tags: Vec<String>,
     pub content_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concept_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub okf: Option<serde_json::Value>,
     pub source_agent_id: Option<String>,
     pub source_hostname: Option<String>,
     pub source_client: Option<String>,
@@ -6113,6 +6131,10 @@ pub struct MemoryPushItem {
     pub tags: Option<Vec<String>>,
     #[serde(default)]
     pub content_hash: Option<String>,
+    #[serde(default)]
+    pub concept_hash: Option<String>,
+    #[serde(default)]
+    pub okf: Option<serde_json::Value>,
     #[serde(default, alias = "created_at")]
     pub client_created_at: Option<i64>,
     #[serde(default, alias = "updated_at")]
@@ -6436,6 +6458,19 @@ fn row_to_memory_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRecor
         memory_type: row.get(4)?,
         tags: parse_memory_tags(&tags),
         content_hash: row.get(6)?,
+        concept_hash: row.get(17)?,
+        okf: row
+            .get::<_, Option<String>>(18)?
+            .map(|raw| {
+                serde_json::from_str(&raw).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        18,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+            })
+            .transpose()?,
         source_agent_id: row.get(7)?,
         source_hostname: row.get(8)?,
         source_client: row.get(9)?,
@@ -6450,7 +6485,7 @@ fn row_to_memory_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRecor
     })
 }
 
-const MEMORY_SELECT_COLS: &str = "id, project_ident, server_revision, content, memory_type, tags, content_hash, source_agent_id, source_hostname, source_client, source_client_version, provenance_json, client_created_at, client_updated_at, created_at, updated_at, tombstoned_at";
+const MEMORY_SELECT_COLS: &str = "id, project_ident, server_revision, content, memory_type, tags, content_hash, source_agent_id, source_hostname, source_client, source_client_version, provenance_json, client_created_at, client_updated_at, created_at, updated_at, tombstoned_at, concept_hash, okf_json";
 
 fn get_memory_record(
     conn: &Connection,
@@ -6503,7 +6538,7 @@ fn find_memory_by_client_link(
                 gm.memory_type, gm.tags, gm.content_hash, gm.source_agent_id,
                 gm.source_hostname, gm.source_client, gm.source_client_version,
                 gm.provenance_json, gm.client_created_at, gm.client_updated_at,
-                gm.created_at, gm.updated_at, gm.tombstoned_at
+                gm.created_at, gm.updated_at, gm.tombstoned_at, gm.concept_hash, gm.okf_json
          FROM gateway_memory_client_links l
          JOIN gateway_memories gm
            ON gm.project_ident = l.project_ident
@@ -6643,6 +6678,16 @@ fn create_memory_record(
             crud_col("memory_type", write.memory_type),
             crud_col("tags", tags_json),
             crud_col("content_hash", write.content_hash),
+            crud_col("concept_hash", write.item.concept_hash.as_deref()),
+            crud_col(
+                "okf_json",
+                write
+                    .item
+                    .okf
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+            ),
             crud_col("source_agent_id", write.source.agent_id.as_deref()),
             crud_col("source_hostname", write.source.hostname.as_deref()),
             crud_col("source_client", write.client_id),
@@ -6685,6 +6730,21 @@ fn update_memory_record(
         .map(serde_json::to_string)
         .transpose()
         .context("serialize memory provenance")?;
+    let preserve = write.content_hash == record.content_hash;
+    let concept_hash = write.item.concept_hash.as_deref().or_else(|| {
+        if preserve && write.item.okf.is_none() {
+            record.concept_hash.as_deref()
+        } else {
+            None
+        }
+    });
+    let okf = write.item.okf.as_ref().or_else(|| {
+        if preserve && write.item.concept_hash.is_none() {
+            record.okf.as_ref()
+        } else {
+            None
+        }
+    });
     crud(conn).update(
         "gateway_memories",
         &[
@@ -6693,6 +6753,8 @@ fn update_memory_record(
             crud_col("memory_type", write.memory_type),
             crud_col("tags", tags_json),
             crud_col("content_hash", write.content_hash),
+            crud_col("concept_hash", concept_hash),
+            crud_col("okf_json", okf.map(serde_json::to_string).transpose()?),
             crud_col("source_agent_id", write.source.agent_id.as_deref()),
             crud_col("source_hostname", write.source.hostname.as_deref()),
             crud_col("source_client", write.client_id),
@@ -6776,6 +6838,17 @@ fn tombstone_memory_record(
         .ok_or_else(|| anyhow::anyhow!("tombstoned gateway memory was not readable"))
 }
 
+// Omitted fields are legacy writes, not requests to erase stored metadata.
+fn memory_envelope_matches(record: &MemoryRecord, item: &MemoryPushItem) -> bool {
+    item.concept_hash
+        .as_ref()
+        .is_none_or(|hash| record.concept_hash.as_ref() == Some(hash))
+        && item
+            .okf
+            .as_ref()
+            .is_none_or(|okf| record.okf.as_ref() == Some(okf))
+}
+
 fn push_one_memory(
     conn: &Connection,
     project_ident: &str,
@@ -6789,6 +6862,16 @@ fn push_one_memory(
     let tombstone = item.tombstone || item.deleted;
 
     if let Err(error) = validate_memory_scope(item, project_ident, is_global) {
+        return Ok(rejected_memory_result(
+            error,
+            client_id,
+            local_memory_id,
+            gateway_memory_id,
+        ));
+    }
+
+    if let Err(error) = crate::memory_okf::validate(item.concept_hash.as_deref(), item.okf.as_ref())
+    {
         return Ok(rejected_memory_result(
             error,
             client_id,
@@ -6897,9 +6980,14 @@ fn push_one_memory(
     };
 
     if let Some(record) = existing {
+        let envelope_matches = memory_envelope_matches(&record, item);
+
         if let Some(base) = item.base_gateway_revision {
             if base != record.server_revision {
-                if record.content_hash == content_hash && record.tombstoned_at.is_none() {
+                if record.content_hash == content_hash
+                    && record.tombstoned_at.is_none()
+                    && envelope_matches
+                {
                     let now = now_ms();
                     upsert_memory_client_link(
                         conn,
@@ -6923,7 +7011,10 @@ fn push_one_memory(
                     local_memory_id,
                 ));
             }
-        } else if record.content_hash != content_hash || record.tombstoned_at.is_some() {
+        } else if record.content_hash != content_hash
+            || record.tombstoned_at.is_some()
+            || !envelope_matches
+        {
             return Ok(conflict_memory_result(
                 &record,
                 None,
@@ -6955,6 +7046,7 @@ fn push_one_memory(
             .unwrap_or_else(|| record.tags.clone());
         if record.content_hash == content_hash
             && record.memory_type == memory_type
+            && envelope_matches
             && record.tags == tags
             && record.tombstoned_at.is_none()
         {
@@ -6996,6 +7088,14 @@ fn push_one_memory(
     }
 
     if let Some(duplicate) = find_active_memory_by_hash(conn, project_ident, &content_hash)? {
+        if !memory_envelope_matches(&duplicate, item) {
+            return Ok(conflict_memory_result(
+                &duplicate,
+                item.base_gateway_revision,
+                client_id,
+                local_memory_id,
+            ));
+        }
         let now = now_ms();
         upsert_memory_client_link(
             conn,
@@ -11709,6 +11809,190 @@ mod tests {
         .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].version, "superseded");
+    }
+
+    fn okf_fixture() -> MemoryPushItem {
+        serde_json::from_str(include_str!("../tests/fixtures/memory-okf-v1.json")).unwrap()
+    }
+
+    #[test]
+    fn memory_okf_round_trip_noop_conflict_legacy_edit_and_tombstone() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("proj")).unwrap();
+        insert_project(&conn, &test_project("other")).unwrap();
+        let source = MemoryPushSource::default();
+        let mut item = okf_fixture();
+        let push = |item: &MemoryPushItem| {
+            push_project_memories(&conn, "proj", &source, std::slice::from_ref(item)).unwrap()
+        };
+        let created = push(&item);
+        assert_eq!(created.results[0].action, "created");
+        let id = created.results[0].gateway_memory_id.clone().unwrap();
+        let pull = || pull_project_memories(&conn, "proj", None, &[], true, None).unwrap();
+        let record = pull().memories.remove(0);
+        assert_eq!(record.okf, item.okf);
+        assert_eq!(record.concept_hash, item.concept_hash);
+        assert!(serde_json::to_string(&record.okf)
+            .unwrap()
+            .contains("123456789012345678901234567890"));
+        // Independent capable client no-op retains every extension and revision.
+        item.client_id = Some("second-client".into());
+        item.local_memory_id = Some("second-local".into());
+        assert_eq!(push(&item).results[0].action, "linked");
+        assert_eq!(pull().server_revision, 1);
+        item.gateway_memory_id = Some(id.clone());
+        item.base_gateway_revision = Some(1);
+        item.okf.as_mut().unwrap()["future_extension"]["extra"] = serde_json::json!([1, 2, 3]);
+        assert_eq!(push(&item).results[0].action, "updated");
+        assert_eq!(pull().memories[0].okf, item.okf);
+        // Envelope-only changes cannot bypass the server revision.
+        item.okf.as_mut().unwrap()["revision"] = serde_json::json!(2);
+        assert_eq!(push(&item).results[0].action, "conflict");
+        item.base_gateway_revision = None;
+        assert_eq!(push(&item).results[0].action, "conflict");
+        // A legacy same-body push still links and does not erase the envelope.
+        let mut legacy = item.clone();
+        legacy.okf = None;
+        legacy.concept_hash = None;
+        legacy.base_gateway_revision = Some(1);
+        assert_eq!(push(&legacy).results[0].action, "linked");
+        assert!(pull().memories[0].okf.is_some());
+        // Cross-project explicit IDs never expose or mutate the record.
+        assert_eq!(
+            push_project_memories(&conn, "other", &source, &[item.clone()])
+                .unwrap()
+                .results[0]
+                .action,
+            "rejected"
+        );
+        // Legacy tag edits preserve envelopes; body edits invalidate stale semantics.
+        legacy.base_gateway_revision = Some(2);
+        legacy.tags = Some(vec!["changed".into()]);
+        assert_eq!(push(&legacy).results[0].action, "updated");
+        assert!(pull().memories[0].okf.is_some());
+        legacy.base_gateway_revision = Some(3);
+        legacy.content = Some("new body from legacy client".into());
+        legacy.content_hash = None;
+        assert_eq!(push(&legacy).results[0].action, "updated");
+        assert!(pull().memories[0].okf.is_none());
+        assert!(pull().memories[0].concept_hash.is_none());
+        legacy.base_gateway_revision = Some(4);
+        legacy.tombstone = true;
+        assert_eq!(push(&legacy).results[0].action, "tombstoned");
+        assert_eq!(pull().tombstones.len(), 1);
+        assert!(pull().memories.is_empty());
+        assert_eq!(push(&legacy).results[0].action, "conflict");
+        legacy.base_gateway_revision = Some(5);
+        assert_eq!(push(&legacy).results[0].action, "linked");
+    }
+
+    #[test]
+    fn memory_okf_rejects_invalid_envelopes_without_writes() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("proj")).unwrap();
+        let good = okf_fixture();
+        let mut bad = vec![];
+        for (field, value) in [
+            ("version", serde_json::json!(2)),
+            ("version", serde_json::json!("1")),
+            ("format", serde_json::json!("executable")),
+            ("revision", serde_json::json!(0)),
+            ("revision", serde_json::json!(1.5)),
+            ("semantic_hash", serde_json::json!("invalid")),
+            ("document", serde_json::json!([])),
+            ("document", serde_json::json!("nul\0text")),
+            (
+                "document",
+                serde_json::json!("x".repeat(crate::memory_okf::MAX_DOCUMENT_BYTES + 1)),
+            ),
+            (
+                "extension",
+                serde_json::json!("x".repeat(crate::memory_okf::MAX_ENVELOPE_BYTES)),
+            ),
+        ] {
+            let mut item = good.clone();
+            item.okf.as_mut().unwrap()[field] = value;
+            bad.push(item);
+        }
+        let mut missing = good.clone();
+        missing
+            .okf
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("document");
+        bad.push(missing);
+        let mut mismatch = good.clone();
+        mismatch.concept_hash = Some("b".repeat(64));
+        bad.push(mismatch);
+        let mut wrong_type = good.clone();
+        wrong_type.okf = Some(serde_json::json!([]));
+        bad.push(wrong_type);
+        let mut nested = serde_json::json!(null);
+        for _ in 0..crate::memory_okf::MAX_DEPTH {
+            nested = serde_json::json!([nested]);
+        }
+        let mut deep = good.clone();
+        deep.okf.as_mut().unwrap()["extension"] = nested;
+        bad.push(deep);
+        let mut wide = good.clone();
+        wide.okf.as_mut().unwrap()["extension"] =
+            serde_json::json!(vec![true; crate::memory_okf::MAX_NODES]);
+        bad.push(wide);
+        let mut wrong_scope = good.clone();
+        wrong_scope.scope = Some("global".into());
+        bad.push(wrong_scope);
+        let mut context = good.clone();
+        context.memory_type = Some("working_context".into());
+        bad.push(context);
+        for item in bad {
+            let result =
+                push_project_memories(&conn, "proj", &MemoryPushSource::default(), &[item])
+                    .unwrap();
+            assert_eq!(result.results[0].action, "rejected", "{result:?}");
+            assert_eq!(result.server_revision, 0);
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM gateway_memory_client_links",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn memory_okf_additive_migration_and_explicit_rollback_preserve_legacy_data() {
+        let conn = test_conn();
+        insert_project(&conn, &test_project("proj")).unwrap();
+        let mut legacy = okf_fixture();
+        legacy.okf = None;
+        legacy.concept_hash = None;
+        let result =
+            push_project_memories(&conn, "proj", &MemoryPushSource::default(), &[legacy]).unwrap();
+        let id = result.results[0].gateway_memory_id.as_deref().unwrap();
+        conn.execute_batch(include_str!("../../../docs/memory-okf-v1-rollback.sql"))
+            .unwrap();
+        let before: (String, String, i64) = conn
+            .query_row(
+                "SELECT content,content_hash,server_revision FROM gateway_memories WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        // Opening a pre-OKF schema applies the additive migration repeatedly.
+        apply_schema(&conn).unwrap();
+        apply_schema(&conn).unwrap();
+        let record = get_memory_record(&conn, "proj", id).unwrap().unwrap();
+        assert_eq!(
+            (record.content, record.content_hash, record.server_revision),
+            before
+        );
+        assert!(record.okf.is_none());
+        assert!(record.concept_hash.is_none());
     }
 
     #[test]

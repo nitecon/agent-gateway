@@ -1,0 +1,31 @@
+{
+  "local_memory_id": "11111111-1111-4111-8111-111111111111",
+  "client_id": "agent-memory-v1.12.0",
+  "project_ident": "proj",
+  "scope": "project",
+  "content": "Deployment uses gateway.service.",
+  "memory_type": "project",
+  "tags": [
+    "deployment"
+  ],
+  "content_hash": "cc8b8b90de390295c64a415f6629663adad37b9d1858980a7d26f2ac31b2113a",
+  "concept_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "okf": {
+    "version": 1,
+    "format": "okf-markdown",
+    "revision": 1,
+    "semantic_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "document": "---\nid: 11111111-1111-4111-8111-111111111111\ntype: Runbook\n---\n\nDeployment uses gateway.service.\n",
+    "future_extension": {
+      "nested": [
+        {
+          "enabled": true,
+          "url": "https://example.invalid/data-only"
+        }
+      ],
+      "precise": 123456789012345678901234567890
+    }
+  },
+  "created_at": 1786815842912,
+  "updated_at": 1786815842912
+}

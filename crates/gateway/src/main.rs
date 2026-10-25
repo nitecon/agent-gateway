@@ -2,6 +2,7 @@ mod channel;
 mod channels;
 mod db;
 mod execution_history;
+mod memory_okf;
 mod projects;
 mod routes;
 mod subtasks;
@@ -755,6 +756,7 @@ async fn main() -> Result<()> {
             "/v1/projects/{ident}/memories/push",
             post(routes::push_memories_handler),
         )
+        .route("/v1/memories/capabilities", get(routes::memory_capabilities_handler))
         .route(
             "/v1/memories/projects",
             get(routes::discover_memory_projects_handler),

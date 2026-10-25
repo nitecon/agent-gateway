@@ -35,3 +35,4 @@ jobs:
         run: |
           cargo build -p gateway
           python3 crates/gateway/tests/task_stream_smoke.py
+          python3 crates/gateway/tests/memory_okf_smoke.py

@@ -187,6 +187,12 @@ agent-tools docs chunks --query "spec artifact generate tasks"
 
 The API context is the canonical agent handoff surface for artifact workflows. It covers generic artifacts, design review rounds, spec manifests and task generation, artifact-backed API docs, idempotency/provenance headers, and the proposed `agent-tools docs export` contract.
 
+### Memory exchange
+
+Project/global memory sync supports optional [OKF v1 envelopes](docs/memory-okf-v1.md).
+Discover support at `GET /v1/memories/capabilities`; opt in to envelope responses
+with `X-Memory-Capabilities: okf-markdown-v1`. Legacy responses remain unchanged.
+
 ### Messaging
 
 | Method | Path | Description |
