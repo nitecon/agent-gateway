@@ -461,6 +461,17 @@ work or **Close** to move it to done. Agent requests cannot move a review task
 back into the queue, claim it, or complete/cancel it; a user makes that decision
 through the browser. Comments remain available while waiting. Fetch review
 items explicitly with `GET /v1/projects/:ident/tasks?status=user_review`.
+
+An explicit human transition from User review to TODO resets routing to `auto`
+for every ordinary task, releasing any prior exact-session target. If present,
+`autoreview-finding` is atomically removed while other labels (including OS
+requirements) are preserved. This allows compatible idle agents to pick it up.
+Bearer-only desktop PATCH `{"status":"todo"}` and board moves share this
+behavior. Comments, agent actions, same-column TODO updates and old
+return-to-queue comments do not count as triage approval. Agents cannot remove
+the hold label themselves. Findings already stuck in TODO need an explicit human
+move to User review and back; the gateway does not retroactively approve them.
+
 Dispatch-managed tasks retain their existing credential-bound workflow.
 
 #### Status transitions and `actions[]`

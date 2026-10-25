@@ -8948,7 +8948,7 @@ pub fn recover_task_claim(
             labels: None,
             hostname: None,
         };
-        update_task_inner(conn, project_ident, task_id, &update, None, false)?;
+        update_task_inner(conn, project_ident, task_id, &update, None, false, false)?;
         insert_comment(
             conn,
             task_id,
@@ -9096,7 +9096,15 @@ pub fn update_task(
     upd: &TaskUpdate<'_>,
     actor_agent_id: Option<&str>,
 ) -> Result<Option<Task>> {
-    update_task_inner(conn, project_ident, task_id, upd, actor_agent_id, true)
+    update_task_inner(
+        conn,
+        project_ident,
+        task_id,
+        upd,
+        actor_agent_id,
+        true,
+        false,
+    )
 }
 
 /// Human task-sidebar controls may edit/release/finish assigned ordinary tasks.
@@ -9116,9 +9124,9 @@ pub fn update_task_from_user(
         .into());
     }
     if upd.owner_agent_id.is_some() || upd.status == Some("in_progress") {
-        return update_task(conn, project, id, upd, None);
+        return update_task_inner(conn, project, id, upd, None, true, true);
     }
-    update_task_inner(conn, project, id, upd, None, false)
+    update_task_inner(conn, project, id, upd, None, false, true)
 }
 
 /// Only automatic delegated result propagation bypasses source ownership.
@@ -9128,7 +9136,31 @@ pub fn update_task_mirrored(
     task_id: &str,
     upd: &TaskUpdate<'_>,
 ) -> Result<Option<Task>> {
-    update_task_inner(conn, project_ident, task_id, upd, None, false)
+    update_task_inner(conn, project_ident, task_id, upd, None, false, false)
+}
+
+// Only an explicit human review -> TODO decision grants finding triage approval.
+fn resumed_finding_labels(
+    old_status: &str,
+    new_status: &str,
+    human_request: bool,
+    current_labels: &[String],
+    requested_labels: Option<&[String]>,
+) -> Option<Vec<String>> {
+    (human_request
+        && old_status == "user_review"
+        && new_status == "todo"
+        && current_labels
+            .iter()
+            .any(|label| label == "autoreview-finding"))
+    .then(|| {
+        requested_labels
+            .unwrap_or(current_labels)
+            .iter()
+            .filter(|label| *label != "autoreview-finding")
+            .cloned()
+            .collect()
+    })
 }
 
 fn update_task_inner(
@@ -9138,6 +9170,7 @@ fn update_task_inner(
     upd: &TaskUpdate<'_>,
     actor_agent_id: Option<&str>,
     enforce_owner: bool,
+    human_request: bool,
 ) -> Result<Option<Task>> {
     let project_ident = normalize_project_ident(project_ident);
     // Validate requested status early.
@@ -9166,6 +9199,20 @@ fn update_task_inner(
     if enforce_owner && crate::task_dispatch::managed(conn, task_id)? {
         return Err(crate::task_dispatch::Conflict(
             "dispatch tasks require the credential-bound dispatch API",
+        )
+        .into());
+    }
+    if (origin.is_some() || actor_agent_id.is_some())
+        && current
+            .labels
+            .iter()
+            .any(|label| label == "autoreview-finding")
+        && upd
+            .labels
+            .is_some_and(|labels| !labels.iter().any(|label| label == "autoreview-finding"))
+    {
+        return Err(crate::task_dispatch::Conflict(
+            "only a user may clear the review finding hold",
         )
         .into());
     }
@@ -9293,6 +9340,14 @@ fn update_task_inner(
         }
     }
 
+    let approved_labels = resumed_finding_labels(
+        &current.status,
+        &new_status,
+        human_request,
+        &current.labels,
+        upd.labels,
+    );
+
     // Build dynamic UPDATE.
     let mut assignments: Vec<CrudColumn<'_>> = Vec::new();
 
@@ -9308,7 +9363,7 @@ fn update_task_inner(
     if let Some(det) = upd.details {
         assignments.push(crud_col("details", det));
     }
-    if let Some(labels) = upd.labels {
+    if let Some(labels) = approved_labels.as_deref().or(upd.labels) {
         assignments.push(crud_col("labels", serialize_string_array(labels)));
     }
     if let Some(host) = upd.hostname {
@@ -9344,7 +9399,7 @@ fn update_task_inner(
         assignments.push(crud_col("owner_origin_json", DbValue::null()));
         assignments.push(crud_col("started_at", DbValue::null()));
     }
-    if reset_routing {
+    if reset_routing || (human_request && current.status == "user_review" && new_status == "todo") {
         assignments.push(crud_col(
             "routing_json",
             serde_json::to_string(&crate::task_targets::Routing::Auto)?,
@@ -9595,13 +9650,14 @@ pub fn delete_task(conn: &Connection, project_ident: &str, task_id: &str) -> Res
 }
 
 /// Current row snapshot read at the top of `reorder_tasks_in_column`:
-/// `(status, owner_agent_id, started_at, done_at)`.
+/// `(status, owner_agent_id, started_at, done_at, owner_origin, labels)`.
 type TaskStateSnapshot = (
     String,
     Option<String>,
     Option<i64>,
     Option<i64>,
     Option<crate::task_events::AgentOrigin>,
+    Option<String>,
 );
 
 /// Apply a client-driven order to one status column. For each id in `order`,
@@ -9658,7 +9714,7 @@ pub fn reorder_tasks_in_column(
         // Fetch current status + owner for this row, scoped to the project.
         let current: Option<TaskStateSnapshot> = {
             let mut stmt = conn.prepare(
-                "SELECT status, owner_agent_id, started_at, done_at, owner_origin_json
+                "SELECT status, owner_agent_id, started_at, done_at, owner_origin_json, labels
                  FROM tasks WHERE id = ?1 AND project_ident = ?2",
             )?;
             let mut rows = stmt.query_map(params![task_id, project_ident.as_str()], |r| {
@@ -9668,15 +9724,17 @@ pub fn reorder_tasks_in_column(
                     r.get::<_, Option<i64>>(2)?,
                     r.get::<_, Option<i64>>(3)?,
                     crate::task_events::read_origin(r, 4)?,
+                    r.get::<_, Option<String>>(5)?,
                 ))
             })?;
             rows.next().transpose()?
         };
 
-        let (old_status, old_owner, old_started_at, old_done_at, old_origin) = match current {
-            Some(v) => v,
-            None => anyhow::bail!("task '{task_id}' not found in project '{project_ident}'"),
-        };
+        let (old_status, old_owner, old_started_at, old_done_at, old_origin, old_labels) =
+            match current {
+                Some(v) => v,
+                None => anyhow::bail!("task '{task_id}' not found in project '{project_ident}'"),
+            };
         if old_status == "cancelled" {
             return Err(crate::task_dispatch::Conflict("cancelled tasks are terminal").into());
         }
@@ -9759,20 +9817,41 @@ pub fn reorder_tasks_in_column(
             }
         }
 
+        let approved_labels = resumed_finding_labels(
+            &old_status,
+            target_status,
+            origin.is_none() && actor_agent_id.is_none(),
+            &parse_labels(old_labels),
+            None,
+        );
+        let mut assignments = vec![
+            crud_col("status", target_status),
+            crud_col("rank", idx as i64),
+            crud_col("started_at", new_started_at),
+            crud_col("done_at", new_done_at),
+            crud_col("owner_agent_id", new_owner),
+            crud_col(
+                "owner_origin_json",
+                new_origin.as_ref().map(serde_json::to_string).transpose()?,
+            ),
+            crud_col("updated_at", now),
+        ];
+        if let Some(labels) = approved_labels {
+            assignments.push(crud_col("labels", serialize_string_array(&labels)));
+        }
+        if old_status == "user_review"
+            && target_status == "todo"
+            && origin.is_none()
+            && actor_agent_id.is_none()
+        {
+            assignments.push(crud_col(
+                "routing_json",
+                serde_json::to_string(&crate::task_targets::Routing::Auto)?,
+            ));
+        }
         crud(conn).update(
             "tasks",
-            &[
-                crud_col("status", target_status),
-                crud_col("rank", idx as i64),
-                crud_col("started_at", new_started_at),
-                crud_col("done_at", new_done_at),
-                crud_col("owner_agent_id", new_owner),
-                crud_col(
-                    "owner_origin_json",
-                    new_origin.as_ref().map(serde_json::to_string).transpose()?,
-                ),
-                crud_col("updated_at", now),
-            ],
+            &assignments,
             &[
                 crud_eq("id", task_id.as_str()),
                 crud_eq("project_ident", project_ident.as_str()),

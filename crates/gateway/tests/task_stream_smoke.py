@@ -386,6 +386,27 @@ def main():
         assert native.getresponse().status==401;native.close()
         assert len(api('/v1/execution/runs'))==1
         client.close()
+        for browser, finding_label in [(False,False),(True,False),(False,True),(True,True)]:
+            finding=api('/v1/projects/alpha/tasks', {'title':'Triaged finding', 'labels':(['autoreview-finding','os:linux','bug'] if finding_label else [])})
+            finding_path=f"/v1/projects/alpha/tasks/{finding['id']}"
+            human={'X-Agent-Id':None}
+            api(finding_path, {'status':'user_review'}, 'PATCH', headers=human)
+            with sqlite3.connect(FIXTURE/'gateway.db') as conn:
+                conn.execute('UPDATE tasks SET routing_json=? WHERE id=?', (json.dumps({'mode':'session','target':{'origin':REQUESTER,'generation':'old-generation'}}),finding['id']))
+            api(finding_path+'/comments', {'content':'A comment is not approval'}, headers=human)
+            assert ('autoreview-finding' in api(finding_path)['labels']) == finding_label
+            rejected(409, finding_path, {'status':'todo'}, origin=REQUESTER)
+            if finding_label: rejected(409, finding_path, {'labels':['os:linux','bug']}, origin=REQUESTER)
+            if browser:
+                req=urllib.request.Request(URL+finding_path, data=b'{"status":"todo"}', method='PATCH',
+                    headers={'Cookie':cookie('admin'),'X-Gateway-UI':'1','Content-Type':'application/json'})
+                with urllib.request.urlopen(req,timeout=10) as response:
+                    resumed=json.load(response)
+            else:
+                resumed=api(finding_path, {'status':'todo'}, 'PATCH', headers=human)
+            assert resumed['labels']==(['os:linux','bug'] if finding_label else []) and resumed['status']=='todo',resumed
+            assert resumed['routing']=={'mode':'auto'} and resumed['owner_origin'] is None
+            assert resumed['owner_agent_id'] is None and resumed['started_at'] is None and resumed['done_at'] is None
         print('Task-stream smoke passed:',URL,'fixture:',FIXTURE,flush=True)
         if '--hold' in sys.argv:
             print('Browser fixture login: fixture-admin / fixture-password-123 (member: fixture-member)',flush=True)

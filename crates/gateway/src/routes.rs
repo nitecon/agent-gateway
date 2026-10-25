@@ -9898,6 +9898,206 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn human_resume_requeues_ordinary_tasks_and_approves_findings_atomically() {
+        for finding in [false, true] {
+            for via_reorder in [false, true] {
+                let state = test_state();
+                let agent = native_task_headers();
+                let Json(created) = create_task_handler(
+                State(state.clone()), agent.clone(), Path("demo".into()),
+                Json(serde_json::from_value(serde_json::json!({
+                    "title": "Review task", "labels": if finding { vec!["autoreview-finding", "os:linux", "bug"] } else { vec![] }
+                })).unwrap()),
+            ).await.unwrap();
+                let id = created.task.id;
+                let path = || Path(("demo".into(), id.clone()));
+                let update =
+                    |value| Json(serde_json::from_value::<UpdateTaskRequest>(value).unwrap());
+                let _ = update_task_handler(
+                    State(state.clone()),
+                    agent.clone(),
+                    path(),
+                    update(serde_json::json!({"status":"user_review"})),
+                )
+                .await
+                .unwrap();
+                // Latest unrelated labels and a prior exact-session route live in the DB,
+                // not in a stale desktop GET. Resume must preserve the former, clear the latter.
+                {
+                    let conn = state.db.lock().unwrap();
+                    conn.execute("UPDATE tasks SET labels=?1, routing_json=?2 WHERE id=?3", rusqlite::params![
+                    serde_json::json!(if finding { vec!["autoreview-finding", "os:linux", "bug", "latest-label"] } else { vec![] }).to_string(),
+                    serde_json::json!({"mode":"session", "target":{
+                        "origin": crate::task_events::origin(&agent).unwrap().unwrap(), "generation":"old-generation"
+                    }}).to_string(), id,
+                ]).unwrap();
+                }
+                let _ = add_comment_handler(
+                    State(state.clone()),
+                    HeaderMap::new(),
+                    path(),
+                    Json(AddCommentRequest {
+                        content: "Please continue after this note".into(),
+                        author: None,
+                        author_type: None,
+                    }),
+                )
+                .await
+                .unwrap();
+                let Json(before) = get_task_handler(State(state.clone()), path())
+                    .await
+                    .unwrap();
+                assert_eq!(before.task.status, "user_review");
+                assert_eq!(
+                    before.task.labels.iter().any(|l| l == "autoreview-finding"),
+                    finding
+                );
+                let mut legacy_agent = HeaderMap::new();
+                legacy_agent.insert("x-agent-id", "agent-only-header".parse().unwrap());
+                for headers in [agent.clone(), legacy_agent] {
+                    for request in [
+                        serde_json::json!({"status":"todo"}),
+                        serde_json::json!({"labels":["os:linux", "bug"]}),
+                    ] {
+                        assert_eq!(
+                            update_task_handler(
+                                State(state.clone()),
+                                headers.clone(),
+                                path(),
+                                update(request)
+                            )
+                            .await
+                            .unwrap_err()
+                            .0,
+                            StatusCode::CONFLICT
+                        );
+                    }
+                }
+                if via_reorder {
+                    // The whole batch, including label removal, rolls back on a stale/missing row.
+                    assert!(reorder_tasks_handler(
+                        State(state.clone()),
+                        HeaderMap::new(),
+                        Path("demo".into()),
+                        Query(ReorderTasksQuery {
+                            goal: None,
+                            status: "todo".into()
+                        }),
+                        Json(ReorderTasksRequest {
+                            order: vec![id.clone(), "missing".into()]
+                        })
+                    )
+                    .await
+                    .is_err());
+                    let Json(rolled_back) = get_task_handler(State(state.clone()), path())
+                        .await
+                        .unwrap();
+                    assert_eq!(rolled_back.task.status, "user_review");
+                    assert_eq!(rolled_back.task.labels, before.task.labels);
+                    assert_eq!(
+                        serde_json::to_value(rolled_back.task.routing).unwrap(),
+                        serde_json::to_value(&before.task.routing).unwrap()
+                    );
+                    let _ = reorder_tasks_handler(
+                        State(state.clone()),
+                        HeaderMap::new(),
+                        Path("demo".into()),
+                        Query(ReorderTasksQuery {
+                            goal: None,
+                            status: "todo".into(),
+                        }),
+                        Json(ReorderTasksRequest {
+                            order: vec![id.clone()],
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                } else {
+                    let _ = update_task_handler(
+                        State(state.clone()),
+                        HeaderMap::new(),
+                        path(),
+                        update(serde_json::json!({"status":"todo", "owner_agent_id":null})),
+                    )
+                    .await
+                    .unwrap();
+                }
+                let Json(resumed) = get_task_handler(State(state.clone()), path())
+                    .await
+                    .unwrap();
+                assert_eq!(resumed.task.status, "todo");
+                assert_eq!(
+                    resumed.task.labels,
+                    if finding {
+                        vec!["os:linux", "bug", "latest-label"]
+                    } else {
+                        vec![]
+                    }
+                );
+                assert!(
+                    resumed.task.owner_agent_id.is_none() && resumed.task.owner_origin.is_none()
+                );
+                assert!(resumed.task.started_at.is_none() && resumed.task.done_at.is_none());
+                assert_eq!(
+                    serde_json::to_value(&resumed.task.routing).unwrap(),
+                    serde_json::json!({"mode":"auto"})
+                );
+                // OS requirements still gate the next compatible claimant.
+                let mut windows = agent.clone();
+                windows.insert("x-agent-os", "windows".parse().unwrap());
+                if finding {
+                    assert_eq!(
+                        update_task_handler(
+                            State(state.clone()),
+                            windows,
+                            path(),
+                            update(serde_json::json!({"status":"in_progress"}))
+                        )
+                        .await
+                        .unwrap_err()
+                        .0,
+                        StatusCode::CONFLICT
+                    );
+                }
+                let _ = update_task_handler(
+                    State(state.clone()),
+                    agent.clone(),
+                    path(),
+                    update(serde_json::json!({"status":"in_progress"})),
+                )
+                .await
+                .unwrap();
+            }
+        }
+        // Human comments, same-column TODO updates and ordinary creation cannot
+        // turn an untouched automatic finding into a triaged finding.
+        let state = test_state();
+        let Json(created) = create_task_handler(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("demo".into()),
+            Json(
+                serde_json::from_value(
+                    serde_json::json!({"title":"Untouched", "labels":["autoreview-finding"]}),
+                )
+                .unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        let path = || Path(("demo".into(), created.task.id.clone()));
+        let Json(unchanged) = update_task_handler(
+            State(state.clone()),
+            HeaderMap::new(),
+            path(),
+            Json(serde_json::from_value(serde_json::json!({"status":"todo"})).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unchanged.labels, vec!["autoreview-finding"]);
+    }
+
+    #[tokio::test]
     async fn user_review_holds_work_until_a_user_decides() {
         let state = test_state();
         let agent = native_task_headers();
