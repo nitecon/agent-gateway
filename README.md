@@ -320,7 +320,7 @@ For the human desktop task sidebar, use the distinct
 `POST /v1/projects/:ident/tasks/:id/assign` with the same `{target}` body and
 usual gateway bearer, without agent identity headers. It returns the acknowledged
 flat Task, including exact `owner_origin`. The target must come from the live
-ordinary `task-targets` directory and still match the project's repository and
+ordinary `task-targets` directory and still match the project's binding and
 generation. Invalid or stale targets return 409 without assignment or audit
 mutation. Human assignment records a user comment with null origin. Human task
 PATCH editing, release and completion, and POST comments, remain available for
@@ -333,8 +333,11 @@ Both user and agent assignments retain the 15-minute inactivity deadline.
 `POST /v1/projects/:ident/task-targets` advertises an actual native agent through
 the usual gateway bearer connection and complete native origin headers. The
 body is `{"generation":"<executor UUID>","canonical_remote":"<repository remote>"}`.
-There are no additional credentials. The server checks that the remote matches
-the project's registered canonical repository. Heartbeat at least every 60 seconds;
+There are no additional credentials. Remote-backed projects require a remote that
+matches the project's registered canonical repository. An explicitly selected
+registered ad-hoc project with no canonical remote accepts omitted/null
+`canonical_remote`; it returns null in heartbeat/discovery responses. A repo-kind
+project without a remote is not treated as an ad-hoc binding. Heartbeat at least every 60 seconds;
 availability expires after 120 seconds. A new generation replaces the old one
 for the same session/instance. Availability expiry does not release task ownership;
 the separate 15-minute task activity deadline still applies.
@@ -361,16 +364,17 @@ Task creation accepts optional `routing`:
 | `{"mode":"broadcast"}` | One unclaimed TODO; notify all matching workspace agents without claiming on their behalf. |
 | `{"mode":"session","target":<directory target>}` | One TODO reserved for that exact live agent in the initial INSERT; no start time. |
 
-Explicit non-auto modes require `canonical_remote` in the creation body, matching
-the server project. A supplied remote is also checked for auto mode. A stale,
+Explicit non-auto modes validate the server project binding: remote-backed
+projects require matching `canonical_remote`; registered ad-hoc projects without
+a remote accept omitted/null. A supplied remote is also checked for auto mode. A stale,
 replaced or cross-project session target returns 409 before any task/event is
 inserted. Human creation sends no agent origin headers; its event `origin` stays
 null even when its `task.owner_origin` names the selected agent.
 
 Task creation/detail/list responses and durable event task snapshots include
 `routing`; existing tasks default to `{"mode":"auto"}`. Consumers apply this
-notification intent to `task_created`, always enforcing repository and goal
-matching. Queue-only events stay on the board; broadcast fans out locally to
+notification intent to `task_created`, always enforcing repository or explicit
+local-root project binding, plus goal matching. Queue-only events stay on the board; broadcast fans out locally to
 matching agents. The existing WebSocket transports one event per task, not a
 separate task/claim per recipient. Clients must implement these delivery modes;
 older clients that ignore `routing` cannot provide queue-only/broadcast semantics.
@@ -378,6 +382,16 @@ Later events use current ownership/status: a `task_unclaimed` event after releas
 or inactivity can route normally regardless of the original session recipient.
 Task claims retain the existing single-owner arbitration and 15-minute expiry.
 The server does not schedule or start an executor.
+
+For local-only repositories, the client must explicitly persist the association
+between the actual local Git root/workspace identity and the chosen gateway
+ad-hoc project. A folder basename is insufficient. Null-remote events still carry
+`project_ident` and exact task ownership; clients route them only through that
+verified binding, never by treating null as a match for every workspace. Targets
+remain isolated by project and native session/instance/generation. If an ad-hoc
+project gains a canonical remote, its old local-only presence becomes ineligible
+until a new heartbeat supplies the matching repository. This does not add a Git
+remote to the workspace or relax remote-backed matching.
 
 #### Goal queues
 

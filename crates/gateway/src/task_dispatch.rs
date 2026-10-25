@@ -1000,7 +1000,7 @@ mod tests {
             )
             .route(
                 "/v1/projects/{ident}/tasks",
-                post(crate::routes::create_task_handler),
+                get(crate::routes::list_tasks_handler).post(crate::routes::create_task_handler),
             )
             .route(
                 "/v1/projects/{ident}/tasks/{id}/assign",
@@ -1913,6 +1913,193 @@ mod tests {
             .unwrap(),
             3
         );
+    }
+
+    #[tokio::test]
+    async fn local_only_adhoc_projects_keep_presence_tasks_and_events_project_scoped() {
+        let state = fixture(db::open(":memory:").unwrap());
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE projects SET kind='adhoc' WHERE ident='example'", [])
+            .unwrap();
+        let agent = Agent::new(&id(), "unused");
+        let beat = json!({"generation":agent.target.generation,"display_name":"Local actor","hostname":"Defcon1"});
+        let (status, presence) = desktop_http(
+            &state,
+            ordinary_headers(&agent),
+            "POST",
+            "/v1/projects/example/task-targets",
+            beat.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "local-only heartbeat: {presence}");
+        assert!(presence["canonical_remote"].is_null());
+        assert_eq!(presence["target"], json!(agent.target));
+        assert_eq!(
+            desktop_http(
+                &state,
+                ordinary_headers(&agent),
+                "POST",
+                "/v1/projects/example/task-targets",
+                json!({"generation":agent.target.generation,"canonical_remote":null})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let (_, directory) = desktop_http(
+            &state,
+            human_headers(),
+            "GET",
+            "/v1/projects/example/task-targets",
+            Value::Null,
+        )
+        .await;
+        assert!(directory["canonical_remote"].is_null());
+        assert_eq!(directory["targets"].as_array().unwrap().len(), 1);
+        let (status, task) = desktop_http(
+            &state,
+            human_headers(),
+            "POST",
+            "/v1/projects/example/tasks",
+            json!({"title":"Local only","routing":{"mode":"session","target":agent.target}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{task}");
+        assert_eq!(task["project_ident"], "example");
+        assert_eq!(task["owner_origin"], json!(agent.target.origin));
+        let (_, listed) = desktop_http(
+            &state,
+            human_headers(),
+            "GET",
+            "/v1/projects/example/tasks",
+            Value::Null,
+        )
+        .await;
+        assert!(listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["id"] == task["id"]));
+        let (_, other) = desktop_http(
+            &state,
+            human_headers(),
+            "GET",
+            "/v1/projects/destination/tasks",
+            Value::Null,
+        )
+        .await;
+        assert!(other.as_array().unwrap().is_empty());
+        {
+            let conn = state.db.lock().unwrap();
+            let event = task_events::list(&conn, &Default::default())
+                .unwrap()
+                .remove(0);
+            assert_eq!(event.project_ident, "example");
+            assert!(event.canonical_remote.is_none());
+            assert!(event.origin.is_none());
+            assert_eq!(event.task["owner_origin"], task["owner_origin"]);
+        }
+        // Missing remote is not a wildcard for repo-kind projects or unknown projects.
+        assert_eq!(
+            desktop_http(
+                &state,
+                ordinary_headers(&agent),
+                "POST",
+                "/v1/projects/destination/task-targets",
+                beat.clone()
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            desktop_http(
+                &state,
+                ordinary_headers(&agent),
+                "POST",
+                "/v1/projects/missing/task-targets",
+                beat.clone()
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        // Another explicit ad-hoc project cannot consume this project's target.
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE projects SET kind='adhoc' WHERE ident='destination'",
+                [],
+            )
+            .unwrap();
+        let (_, elsewhere) = desktop_http(
+            &state,
+            human_headers(),
+            "POST",
+            "/v1/projects/destination/tasks",
+            json!({"title":"Other project"}),
+        )
+        .await;
+        let other_path = format!(
+            "/v1/projects/destination/tasks/{}/assign",
+            elsewhere["id"].as_str().unwrap()
+        );
+        assert_eq!(
+            desktop_http(
+                &state,
+                human_headers(),
+                "POST",
+                &other_path,
+                json!({"target":agent.target})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        // Supplying a repository for a local-only binding is a mismatch.
+        assert_eq!(desktop_http(&state,ordinary_headers(&agent),"POST","/v1/projects/example/task-targets",json!({"generation":agent.target.generation,"canonical_remote":"github.com/acme/example"})).await.0,StatusCode::CONFLICT);
+        // If the project later gains a remote, old local presence stops being eligible.
+        state.db.lock().unwrap().execute("UPDATE projects SET kind='repo',canonical_remote='github.com/acme/example' WHERE ident='example'",[]).unwrap();
+        let (_, directory) = desktop_http(
+            &state,
+            human_headers(),
+            "GET",
+            "/v1/projects/example/task-targets",
+            Value::Null,
+        )
+        .await;
+        assert!(directory["targets"].as_array().unwrap().is_empty());
+        assert_eq!(
+            desktop_http(
+                &state,
+                ordinary_headers(&agent),
+                "POST",
+                "/v1/projects/example/task-targets",
+                beat
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            desktop_http(
+                &state,
+                human_headers(),
+                "POST",
+                "/v1/projects/example/tasks",
+                json!({"title":"No wildcard","routing":{"mode":"session","target":agent.target}})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        let (status,_)=desktop_http(&state,ordinary_headers(&agent),"POST","/v1/projects/example/task-targets",json!({"generation":agent.target.generation,"canonical_remote":"https://github.com/acme/example.git"})).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]

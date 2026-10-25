@@ -7264,7 +7264,7 @@ pub async fn create_task_handler(
     let task = spawn_blocking(move || -> Result<db::Task> {
         let conn = db.lock().unwrap();
         if !matches!(req.routing, crate::task_targets::Routing::Auto) || req.canonical_remote.is_some() {
-            crate::task_targets::require_remote(&conn, &ident_clone, req.canonical_remote.as_deref())?;
+            crate::task_targets::require_binding(&conn, &ident_clone, req.canonical_remote.as_deref())?;
         }
         Ok(crate::task_events::mutation(&conn, origin.as_ref(), |conn| {
         let task = db::insert_task_with_routing(

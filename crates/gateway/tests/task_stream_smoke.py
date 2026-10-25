@@ -217,6 +217,25 @@ def main():
         client.send({"type":"heartbeat"});client.receive("heartbeat_ack")
         duplicate=StreamSocket();duplicate.send({"type":"subscribe","protocol_version":1,"consumer_id":"fixture-cmux"})
         assert 'already connected' in duplicate.receive("error")["message"];duplicate.close()
+        # A local-only Git root uses an explicit ad-hoc project binding, never a fake remote.
+        local_root=FIXTURE/'local-games';local_root.mkdir()
+        subprocess.run(['git','-C',str(local_root),'init','-q'],check=True,capture_output=True)
+        assert not subprocess.check_output(['git','-C',str(local_root),'remote']).strip()
+        local_project=api('/v1/projects',{'ident':'local-games'})
+        assert local_project['kind']=='adhoc'
+        with sqlite3.connect(FIXTURE/'gateway.db') as conn:
+            assert conn.execute("SELECT canonical_remote FROM projects WHERE ident='local-games'").fetchone()[0] is None
+        local_presence=api('/v1/projects/local-games/task-targets',{'generation':str(uuid.uuid4())},origin=WORKER)
+        assert local_presence['canonical_remote'] is None
+        local_task=api('/v1/projects/local-games/tasks',{'title':'Local-only task','routing':{'mode':'session','target':local_presence['target']}})
+        event=receive_event(client,'task_created')
+        assert event['project_ident']=='local-games' and event['canonical_remote'] is None
+        assert event['task']['id']==local_task['id'] and event['task']['owner_origin']==WORKER
+        ack(client,event)
+        assert any(t['id']==local_task['id'] for t in api('/v1/projects/local-games/tasks'))
+        assert not any(t['id']==local_task['id'] for t in api('/v1/projects/alpha/tasks'))
+        rejected(409,'/v1/projects/local-games/tasks/'+local_task['id'],{'status':'in_progress'},origin=REQUESTER)
+        api('/v1/projects/local-games/tasks/'+local_task['id'],{'status':'in_progress'},'PATCH',origin=WORKER)
         # Human task routing through ordinary presence: no machine/session keys.
         presence=api('/v1/projects/alpha/task-targets',{'generation':str(uuid.uuid4()),'canonical_remote':'https://github.com/fixture/alpha.git','display_name':'Grace Hopper','hostname':'FixtureBox'},origin=REQUESTER)
         directory=api('/v1/projects/alpha/task-targets')
@@ -266,6 +285,8 @@ def main():
         process=start()
         client,hello=subscribe("fixture-cmux");assert hello["cursor"]==replay["id"]
         assert api('/v1/projects/alpha/tasks/'+routed['id'])['routing']==routed['routing']
+        assert api('/v1/projects/local-games/tasks/'+local_task['id'])['owner_origin']==WORKER
+        assert api('/v1/projects/local-games/task-targets')['canonical_remote'] is None
         delegation=api("/v1/projects/alpha/tasks/delegate",{"target_project_ident":"beta","title":"Incoming delegated task"},origin=REQUESTER)
         received=[receive_event(client)];ack(client,received[-1])
         for _ in range(3):

@@ -49,7 +49,7 @@ pub fn initialize(conn: &Connection) -> anyhow::Result<()> {
 
 pub fn connected(conn: &Connection, project: &str, target: &Target) -> anyhow::Result<bool> {
     Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM task_target_presence s JOIN projects p ON p.ident=s.project_ident AND p.canonical_remote=s.canonical_remote WHERE
+        "SELECT EXISTS(SELECT 1 FROM task_target_presence s JOIN projects p ON p.ident=s.project_ident AND (p.canonical_remote=s.canonical_remote OR (p.kind='adhoc' AND p.canonical_remote IS NULL AND s.canonical_remote='')) WHERE
         s.project_ident=?1 AND instance_id=?2 AND session_id=?3 AND origin_json=?4
         AND generation=?5 AND seen_at>=?6)",
         params![
@@ -69,7 +69,7 @@ pub fn connected(conn: &Connection, project: &str, target: &Target) -> anyhow::R
 pub struct Heartbeat {
     pub display_name: Option<String>,
     pub hostname: Option<String>,
-    pub canonical_remote: String,
+    pub canonical_remote: Option<String>,
     pub generation: String,
 }
 
@@ -92,12 +92,12 @@ pub async fn heartbeat(
     let hostname = label(req.hostname)?;
     let project = crate::projects::normalize_project_ident(&project);
     let conn = state.db.lock().unwrap();
-    let remote = require_remote(&conn, &project, Some(&req.canonical_remote))?;
+    let remote = require_binding(&conn, &project, req.canonical_remote.as_deref())?;
     let seen = db::now_ms();
     conn.execute("INSERT INTO task_target_presence(project_ident,instance_id,session_id,origin_json,generation,seen_at,canonical_remote,display_name,hostname)
         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(project_ident,instance_id,session_id)
         DO UPDATE SET origin_json=excluded.origin_json,generation=excluded.generation,seen_at=excluded.seen_at,canonical_remote=excluded.canonical_remote,display_name=excluded.display_name,hostname=excluded.hostname",
-        params![project,origin.instance_id,origin.session_id,serde_json::to_string(&origin)?,generation,seen,remote,display_name,hostname])?;
+        params![project,origin.instance_id,origin.session_id,serde_json::to_string(&origin)?,generation,seen,remote.as_deref().unwrap_or(""),display_name,hostname])?;
     Ok(Json(
         json!({"target":Target{origin,generation},"seen_at":seen,"expires_at":seen+TTL_MS,"canonical_remote":remote,"display_name":display_name,"hostname":hostname}),
     ))
@@ -113,7 +113,7 @@ pub async fn list(
         return Err(AppError(StatusCode::NOT_FOUND, "project not found".into()));
     }
     let mut stmt = conn.prepare(
-        "SELECT s.origin_json,s.generation,s.seen_at,s.display_name,s.hostname FROM task_target_presence s JOIN projects p ON p.ident=s.project_ident AND p.canonical_remote=s.canonical_remote
+        "SELECT s.origin_json,s.generation,s.seen_at,s.display_name,s.hostname FROM task_target_presence s JOIN projects p ON p.ident=s.project_ident AND (p.canonical_remote=s.canonical_remote OR (p.kind='adhoc' AND p.canonical_remote IS NULL AND s.canonical_remote=''))
         WHERE s.project_ident=?1 AND seen_at>=?2 ORDER BY instance_id,session_id",
     )?;
     let records = stmt
@@ -134,20 +134,22 @@ pub async fn list(
     Ok(Json(json!({"targets":targets,"canonical_remote":remote})))
 }
 
-/// Match repository URLs canonically; a display project name alone is insufficient.
-pub fn require_remote(
+/// Remote-backed projects require an exact repository match. Explicit ad-hoc
+/// project bindings may omit the remote only while the registry has none.
+pub fn require_binding(
     conn: &Connection,
     project: &str,
     supplied: Option<&str>,
-) -> Result<String, AppError> {
+) -> Result<Option<String>, AppError> {
     let project = db::get_project(conn, project)?
         .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "project not found".into()))?;
-    let remote = project.canonical_remote.ok_or_else(|| {
-        AppError(
-            StatusCode::CONFLICT,
-            "project has no canonical repository".into(),
-        )
-    })?;
+    let supplied = supplied.map(str::trim).filter(|s| !s.is_empty());
+    let Some(remote) = project.canonical_remote else {
+        if project.kind == db::PROJECT_KIND_ADHOC && supplied.is_none() {
+            return Ok(None);
+        }
+        return Err(AppError(StatusCode::CONFLICT, "project binding requires a matching canonical repository or an explicit ad-hoc project without a remote".into()));
+    };
     let actual = supplied.and_then(crate::projects::parse_remote);
     let expected = crate::projects::parse_remote(&remote);
     if actual.is_none()
@@ -159,7 +161,7 @@ pub fn require_remote(
             "canonical_remote must match the project repository".into(),
         ));
     }
-    Ok(remote)
+    Ok(Some(remote))
 }
 
 fn label(value: Option<String>) -> Result<Option<String>, AppError> {
