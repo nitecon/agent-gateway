@@ -995,6 +995,18 @@ mod tests {
     fn app(state: &AppState) -> Router {
         router()
             .route(
+                "/v1/tasks/capabilities",
+                get(crate::task_requester::capabilities),
+            )
+            .route(
+                "/v1/projects/{ident}/tasks/{id}/requester",
+                axum::routing::put(crate::task_requester::set),
+            )
+            .route(
+                "/v1/projects/{ident}/tasks/delegate",
+                post(crate::routes::delegate_task_handler),
+            )
+            .route(
                 "/v1/projects/{ident}/task-targets",
                 get(crate::task_targets::list).post(crate::task_targets::heartbeat),
             )
@@ -1670,6 +1682,289 @@ mod tests {
                 [],
             )
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn requester_survives_executor_changes_and_events_without_enrolling_peers() {
+        let state = fixture(db::open(":memory:").unwrap());
+        repository_fixture(&state);
+        let a = Agent::new(&id(), "unused");
+        let b = Agent::new(&id(), "unused");
+        let c = Agent::new(&id(), "unused");
+        let d = Agent::new(&id(), "unused");
+        for peer in [&a, &b, &c, &d] {
+            let (status,body) = desktop_http(&state, ordinary_headers(peer), "POST", "/v1/projects/example/task-targets",
+                json!({"generation":peer.target.generation,"canonical_remote":"github.com/acme/example"})).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let (_, caps) = desktop_http(
+            &state,
+            human_headers(),
+            "GET",
+            "/v1/tasks/capabilities",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(caps["requester_subscriptions"], 1);
+        let (status,created) = desktop_http(&state,ordinary_headers(&a),"POST","/v1/projects/example/tasks",
+            json!({"title":"Return results to A","requester":a.target,"canonical_remote":"github.com/acme/example",
+                "routing":{"mode":"session","target":b.target},"labels":["os:linux","keep"]})).await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(created["requester"], json!(a.target));
+        assert_eq!(created["owner_origin"], json!(b.target.origin));
+        let path = format!(
+            "/v1/projects/example/tasks/{}",
+            created["id"].as_str().unwrap()
+        );
+        let watcher = format!("{path}/requester");
+        for body in [json!({"requester":d.target}), json!({"requester":null})] {
+            assert_eq!(
+                desktop_http(&state, ordinary_headers(&d), "PUT", &watcher, body)
+                    .await
+                    .0,
+                StatusCode::CONFLICT
+            );
+        }
+        assert_eq!(
+            desktop_http(
+                &state,
+                ordinary_headers(&b),
+                "POST",
+                &format!("{path}/reassign"),
+                json!({"target":c.target})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        for (headers, status) in [
+            (ordinary_headers(&c), "in_progress"),
+            (ordinary_headers(&c), "user_review"),
+            (human_headers(), "todo"),
+        ] {
+            let (code, body) =
+                desktop_http(&state, headers, "PATCH", &path, json!({"status":status})).await;
+            assert_eq!(code, StatusCode::OK, "{body}");
+            assert_eq!(body["requester"], json!(a.target));
+        }
+        assert_eq!(
+            desktop_http(
+                &state,
+                human_headers(),
+                "POST",
+                &format!("{path}/assign"),
+                json!({"target":c.target})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            desktop_http(
+                &state,
+                ordinary_headers(&c),
+                "POST",
+                &format!("{path}/comments"),
+                json!({"content":"C result"})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let (code, done) = desktop_http(
+            &state,
+            ordinary_headers(&c),
+            "PATCH",
+            &path,
+            json!({"status":"done"}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{done}");
+        assert_eq!(done["requester"], json!(a.target));
+        {
+            let conn = state.db.lock().unwrap();
+            let mut stmt = conn.prepare("SELECT kind,task_json,origin_json FROM task_events WHERE json_extract(task_json,'$.id')=?1 ORDER BY id").unwrap();
+            let events = stmt
+                .query_map([created["id"].as_str().unwrap()], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            for kind in ["task_created", "task_commented", "task_completed"] {
+                let event = events.iter().rev().find(|e| e.0 == kind).unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Value>(&event.1).unwrap()["requester"],
+                    json!(a.target)
+                );
+                if kind != "task_created" {
+                    assert_eq!(
+                        serde_json::from_str::<Value>(event.2.as_ref().unwrap()).unwrap(),
+                        json!(c.target.origin)
+                    );
+                }
+            }
+        }
+        // A can unsubscribe after C completes without owning execution.
+        let (code, cleared) = desktop_http(
+            &state,
+            ordinary_headers(&a),
+            "PUT",
+            &watcher,
+            json!({"requester":null}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{cleared}");
+        assert!(cleared["requester"].is_null());
+        // Human workflow defaults to no subscriber, and can explicitly set/clear one.
+        let (_, human) = desktop_http(
+            &state,
+            human_headers(),
+            "POST",
+            "/v1/projects/example/tasks",
+            json!({"title":"Human"}),
+        )
+        .await;
+        assert!(human["requester"].is_null());
+        let hp = format!(
+            "/v1/projects/example/tasks/{}/requester",
+            human["id"].as_str().unwrap()
+        );
+        let (code, chosen) = desktop_http(
+            &state,
+            human_headers(),
+            "PUT",
+            &hp,
+            json!({"requester":a.target}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{chosen}");
+        assert_eq!(chosen["requester"], json!(a.target));
+        assert_eq!(
+            desktop_http(
+                &state,
+                human_headers(),
+                "PUT",
+                &hp,
+                json!({"requester":null})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            desktop_http(&state, human_headers(), "PUT", &hp, json!({}))
+                .await
+                .0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        // Cross-project delegation watches the SOURCE mirror, never a foreign-project target.
+        let (code,delegated) = desktop_http(&state,ordinary_headers(&a),"POST","/v1/projects/example/tasks/delegate",
+            json!({"title":"Delegated results","target_project_ident":"destination","requester":a.target})).await;
+        assert_eq!(code, StatusCode::OK, "{delegated}");
+        assert_eq!(delegated["source_task"]["requester"], json!(a.target));
+        assert!(delegated["target_task"]["requester"].is_null());
+    }
+
+    #[tokio::test]
+    async fn requester_rejects_stale_foreign_and_wrong_os_atomically() {
+        let state = fixture(db::open(":memory:").unwrap());
+        repository_fixture(&state);
+        let a = Agent::new(&id(), "unused");
+        let foreign = Agent::new(&id(), "unused");
+        for (agent, project) in [(&a, "example"), (&foreign, "destination")] {
+            assert_eq!(desktop_http(&state,ordinary_headers(agent),"POST",&format!("/v1/projects/{project}/task-targets"),
+                json!({"generation":agent.target.generation,"canonical_remote":format!("github.com/acme/{project}")})).await.0,StatusCode::OK);
+        }
+        let mut stale = a.target.clone();
+        stale.generation = id();
+        for (headers, target, labels) in [
+            (human_headers(), stale.clone(), json!([])),
+            (human_headers(), foreign.target.clone(), json!([])),
+            (human_headers(), a.target.clone(), json!(["os:windows"])),
+            (ordinary_headers(&foreign), a.target.clone(), json!([])),
+        ] {
+            let before: i64 = state
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))
+                .unwrap();
+            let (code, body) = desktop_http(
+                &state,
+                headers,
+                "POST",
+                "/v1/projects/example/tasks",
+                json!({"title":"Rejected","requester":target,"labels":labels}),
+            )
+            .await;
+            assert_eq!(code, StatusCode::CONFLICT, "{body}");
+            assert_eq!(
+                before,
+                state
+                    .db
+                    .lock()
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get::<_, i64>(0))
+                    .unwrap()
+            );
+        }
+        // A source watcher rejection must roll back the already-inserted destination and its event.
+        let counts = || {
+            let conn = state.db.lock().unwrap();
+            conn.query_row(
+                "SELECT (SELECT COUNT(*) FROM tasks),(SELECT COUNT(*) FROM task_events)",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .unwrap()
+        };
+        let before = counts();
+        let (code,body) = desktop_http(&state,ordinary_headers(&a),"POST","/v1/projects/example/tasks/delegate",
+            json!({"title":"Rollback delegation","target_project_ident":"destination","requester":stale})).await;
+        assert_eq!(code, StatusCode::CONFLICT, "{body}");
+        assert_eq!(counts(), before);
+        let (_, created) = desktop_http(
+            &state,
+            human_headers(),
+            "POST",
+            "/v1/projects/example/tasks",
+            json!({"title":"Keep state","requester":a.target}),
+        )
+        .await;
+        let path = format!(
+            "/v1/projects/example/tasks/{}/requester",
+            created["id"].as_str().unwrap()
+        );
+        assert_eq!(
+            desktop_http(
+                &state,
+                human_headers(),
+                "PUT",
+                &path,
+                json!({"requester":stale})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        let conn = state.db.lock().unwrap();
+        let task = db::get_task_detail(&conn, "example", created["id"].as_str().unwrap())
+            .unwrap()
+            .unwrap()
+            .task;
+        assert_eq!(task.requester, Some(a.target.clone()));
+        assert_eq!(task.updated_at, created["updated_at"].as_i64().unwrap());
+        conn.execute(
+            "UPDATE task_target_presence SET generation=?1 WHERE project_ident='example'",
+            [id()],
+        )
+        .unwrap();
+        assert!(crate::task_requester::validate(&conn, "example", &[], Some(&a.target)).is_err());
     }
 
     #[tokio::test]

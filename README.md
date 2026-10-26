@@ -416,6 +416,54 @@ project gains a canonical remote, its old local-only presence becomes ineligible
 until a new heartbeat supplies the matching repository. This does not add a Git
 remote to the workspace or relax remote-backed matching.
 
+#### Requester result subscriptions
+
+`GET /v1/tasks/capabilities` returns `{"requester_subscriptions":1}` when the
+server supports this contract. Older servers do not support requester selection;
+clients must check capability and compare the stored requester in acknowledgments
+before reporting a subscription as accepted.
+
+Tasks have a nullable `requester`, separate from executor ownership, reporter,
+and `routing`. It is one exact target from the same project's `task-targets`
+directory:
+
+```json
+{"origin":{"session_id":"<UUID>","instance_id":"<UUID>","provider":"codex","os":"linux"},"generation":"<UUID>"}
+```
+
+`POST /v1/projects/:ident/tasks` accepts optional `requester` with that shape.
+An agent opts in by sending its own complete native origin headers and its
+current advertised target; a different caller-supplied origin is rejected.
+Human creation sends no agent identity headers and may select a current target.
+Omission/null defaults to no subscriber, including for migrated tasks. Task
+creation, detail, list and event snapshots expose the exact stored requester.
+
+`PUT /v1/projects/:ident/tasks/:id/requester` requires a body containing
+`{"requester":<target>}` or `{"requester":null}` and returns the full stored task.
+A human using the existing bearer connection or browser session may set/clear
+it. The exact owning agent may subscribe itself or clear it; an existing
+requester may refresh its own generation or unsubscribe without owning execution.
+Other agents cannot enroll themselves, select a different origin, or clear the
+subscription. No extra credentials are required. Set/create validates live
+same-project presence, exact generation and task OS compatibility under the task
+write lock; rejected requests leave the task unchanged.
+
+`POST /v1/projects/:ident/tasks/delegate` accepts the same optional requester for
+its **source tracking task**. The destination task has no requester; the existing
+mirrored comments/completion return the result to the source project. Failure to
+validate the source subscription rolls back the entire delegation.
+
+The subscription remains stored until explicitly changed/cleared or the task is
+deleted, independently of claim, reassignment, inactivity, requeue, User review
+and completion. Presence expiry/replacement does not rewrite it. Comment and
+completion event snapshots carry the requester even when the event origin is a
+different executor. Existing historical events are unchanged. Clients may use
+this metadata for result-only notices to the exact still-current requester,
+while preserving project/goal/OS eligibility, freshness and existing executor
+filtering. It never grants execution ownership, widens server broadcasting or
+changes task retrieval/done filtering. Delivery expiry/deduplication remain client
+responsibilities; this API does not replay notices to replacement executions.
+
 #### Goal queues
 
 Tasks can carry an optional `goal`, such as `release` or `authentication-refresh`.

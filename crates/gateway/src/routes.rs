@@ -6834,6 +6834,7 @@ pub struct ListTasksQuery {
 
 #[derive(Deserialize)]
 pub struct CreateTaskRequest {
+    pub requester: Option<crate::task_dispatch::Target>,
     pub canonical_remote: Option<String>,
     #[serde(default)]
     pub routing: crate::task_targets::Routing,
@@ -6852,6 +6853,7 @@ pub struct CreateTaskRequest {
 
 #[derive(Deserialize)]
 pub struct DelegateTaskRequest {
+    pub requester: Option<crate::task_dispatch::Target>,
     pub target_project_ident: String,
     pub title: String,
     pub description: Option<String>,
@@ -7303,7 +7305,7 @@ pub async fn create_task_handler(
             crate::task_targets::require_binding(&conn, &ident_clone, req.canonical_remote.as_deref())?;
         }
         Ok(crate::task_events::mutation(&conn, origin.as_ref(), |conn| {
-        let task = db::insert_task_with_routing(
+        let task = db::insert_task_with_requester(
             conn,
             &ident_clone,
             &title,
@@ -7314,6 +7316,7 @@ pub async fn create_task_handler(
             &reporter,
             goal.as_deref(),
             &req.routing,
+            req.requester.as_ref(),
         )?;
         if task.goal.is_none() && task.owner_agent_id.is_none() && task.status == "todo"
             && !matches!(task.routing, crate::task_targets::Routing::Unassigned) {
@@ -7387,7 +7390,7 @@ pub async fn delegate_task_handler(
             &reporter,
         )?;
         let source_title = format!("{title} (DELEGATED)");
-        let source_task = db::insert_delegated_task(
+        let source_task = db::insert_delegated_task_with_requester(
             conn,
             &db::DelegatedTaskInsert {
                 project_ident: &source_ident,
@@ -7400,6 +7403,7 @@ pub async fn delegate_task_handler(
                 target_project_ident: &target_ident,
                 target_task_id: &target_task.id,
             },
+            req.requester.as_ref(),
         )?;
         let delegation = db::insert_task_delegation(
             conn,
@@ -10396,6 +10400,7 @@ mod tests {
             owner_agent_id: None,
             owner_origin: None,
             routing: Default::default(),
+            requester: None,
             reporter: "agent".to_string(),
             created_at: 1,
             updated_at: 1,

@@ -1192,6 +1192,7 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             "ALTER TABLE tasks ADD COLUMN routing_json TEXT NOT NULL DEFAULT '{\"mode\":\"auto\"}'",
         )?;
     }
+    crate::task_requester::initialize(conn)?;
     crate::task_targets::initialize(conn)?;
     crate::execution_history::initialize(conn)?;
 
@@ -7718,6 +7719,7 @@ pub const TASK_DONE_FALLOFF_MS: i64 = 7 * 24 * 60 * 60 * 1000; // 7 days
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Task {
     pub routing: crate::task_targets::Routing,
+    pub requester: Option<crate::task_dispatch::Target>,
     pub id: String,
     pub project_ident: String,
     pub title: String,
@@ -7773,6 +7775,7 @@ pub struct TaskDelegation {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TaskSummary {
     pub routing: crate::task_targets::Routing,
+    pub requester: Option<crate::task_dispatch::Target>,
     pub id: String,
     pub title: String,
     pub goal: Option<String>,
@@ -8342,6 +8345,7 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         delegated_to_task_id: row.get(17)?,
         owner_origin: crate::task_events::read_origin(row, 18)?,
         goal: row.get(19)?,
+        requester: crate::task_requester::read(row, 21)?,
         routing: serde_json::from_str(&row.get::<_, String>(20)?).map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(20, rusqlite::types::Type::Text, Box::new(e))
         })?,
@@ -8351,7 +8355,7 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
 const TASK_SELECT_COLS: &str =
     "id, project_ident, title, description, details, status, rank, labels, \
      hostname, owner_agent_id, reporter, created_at, updated_at, started_at, done_at, \
-     kind, delegated_to_project_ident, delegated_to_task_id, owner_origin_json, goal, routing_json";
+     kind, delegated_to_project_ident, delegated_to_task_id, owner_origin_json, goal, routing_json, requester_json";
 
 /// Reclaim assigned TODO and ordinary in-progress tasks after [`TASK_RECLAIM_MS`]
 /// without comments or task actions (`updated_at` activity). Reclaimed tasks are
@@ -8455,6 +8459,7 @@ pub fn insert_task(
         None,
         true,
         None,
+        None,
     )
 }
 
@@ -8482,6 +8487,7 @@ pub fn insert_unassigned_dispatch_task(
         None,
         None,
         false,
+        None,
         None,
     )
 }
@@ -8523,12 +8529,13 @@ pub fn insert_task_with_goal(
         goal,
         true,
         None,
+        None,
     )
 }
 
-/// Ordinary desktop routing is applied in the initial INSERT, independently of audit origin.
+/// Routing and requester are applied in the initial INSERT for lifecycle snapshots.
 #[allow(clippy::too_many_arguments)]
-pub fn insert_task_with_routing(
+pub fn insert_task_with_requester(
     conn: &Connection,
     project: &str,
     title: &str,
@@ -8539,6 +8546,7 @@ pub fn insert_task_with_routing(
     reporter: &str,
     goal: Option<&str>,
     routing: &crate::task_targets::Routing,
+    requester: Option<&crate::task_dispatch::Target>,
 ) -> Result<Task> {
     insert_task_record(
         conn,
@@ -8553,6 +8561,7 @@ pub fn insert_task_with_routing(
         goal,
         true,
         Some(routing),
+        requester,
     )
 }
 
@@ -8570,6 +8579,7 @@ fn insert_task_record(
     goal: Option<&str>,
     assign_submitter: bool,
     routing: Option<&crate::task_targets::Routing>,
+    requester: Option<&crate::task_dispatch::Target>,
 ) -> Result<Task> {
     let project_ident = normalize_project_ident(project_ident);
     let goal = normalize_task_goal(goal)?;
@@ -8584,6 +8594,7 @@ fn insert_task_record(
     let labels_json = serialize_string_array(labels);
     let routing = routing.cloned().unwrap_or_default();
     let required_os = task_required_os(labels)?;
+    crate::task_requester::validate(conn, &project_ident, labels, requester)?;
     let owner_origin = match &routing {
         crate::task_targets::Routing::Session { target } => {
             if os_mismatch(required_os, Some(&target.origin)) {
@@ -8619,6 +8630,10 @@ fn insert_task_record(
             crud_col("title", title),
             crud_col("goal", goal),
             crud_col("routing_json", serde_json::to_string(&routing)?),
+            crud_col(
+                "requester_json",
+                requester.map(serde_json::to_string).transpose()?,
+            ),
             crud_col("description", description),
             crud_col("details", details),
             crud_col("status", "todo"),
@@ -8645,6 +8660,7 @@ fn insert_task_record(
     )?;
 
     Ok(Task {
+        requester: requester.cloned(),
         routing,
         id,
         project_ident,
@@ -8670,6 +8686,14 @@ fn insert_task_record(
 }
 
 pub fn insert_delegated_task(conn: &Connection, task: &DelegatedTaskInsert<'_>) -> Result<Task> {
+    insert_delegated_task_with_requester(conn, task, None)
+}
+
+pub fn insert_delegated_task_with_requester(
+    conn: &Connection,
+    task: &DelegatedTaskInsert<'_>,
+    requester: Option<&crate::task_dispatch::Target>,
+) -> Result<Task> {
     let target = normalize_project_ident(task.target_project_ident);
     insert_task_record(
         conn,
@@ -8684,6 +8708,7 @@ pub fn insert_delegated_task(conn: &Connection, task: &DelegatedTaskInsert<'_>) 
         None,
         true,
         None,
+        requester,
     )
 }
 
@@ -8721,7 +8746,7 @@ pub fn list_tasks(
                     t.owner_agent_id, t.hostname, t.reporter,
                     (SELECT COUNT(*) FROM task_comments tc WHERE tc.task_id = t.id),
                     t.created_at, t.updated_at, t.kind,
-                    t.delegated_to_project_ident, t.delegated_to_task_id, t.goal, t.routing_json
+                    t.delegated_to_project_ident, t.delegated_to_task_id, t.goal, t.routing_json, t.requester_json
              FROM tasks t
              WHERE t.project_ident = ?1
                AND t.status IN ({in_clause})
@@ -8734,7 +8759,7 @@ pub fn list_tasks(
                     t.owner_agent_id, t.hostname, t.reporter,
                     (SELECT COUNT(*) FROM task_comments tc WHERE tc.task_id = t.id),
                     t.created_at, t.updated_at, t.kind,
-                    t.delegated_to_project_ident, t.delegated_to_task_id, t.goal, t.routing_json
+                    t.delegated_to_project_ident, t.delegated_to_task_id, t.goal, t.routing_json, t.requester_json
              FROM tasks t
              WHERE t.project_ident = ?1
                AND t.status IN ({in_clause})
@@ -8772,6 +8797,7 @@ pub fn list_tasks(
                 delegated_to_project_ident: r.get(12)?,
                 delegated_to_task_id: r.get(13)?,
                 goal: r.get(14)?,
+                requester: crate::task_requester::read(r, 16)?,
                 routing: serde_json::from_str(&r.get::<_, String>(15)?).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
                         15,

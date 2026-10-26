@@ -9,6 +9,7 @@ mod subtasks;
 mod task_cancel;
 mod task_dispatch;
 mod task_events;
+mod task_requester;
 mod task_targets;
 mod ui;
 mod ui_auth;
@@ -621,6 +622,8 @@ async fn main() -> Result<()> {
 
     // API routes require bearer auth.
     let api = Router::new()
+        .route("/v1/tasks/capabilities", get(task_requester::capabilities))
+        .route("/v1/projects/{ident}/tasks/{id}/requester", put(task_requester::set))
         .route("/v1/projects/{ident}/task-targets", get(task_targets::list).post(task_targets::heartbeat))
         .route("/v1/projects/{ident}/tasks/{id}/reassign", post(routes::reassign_task_handler))
         .route("/v1/projects/{ident}/tasks/{id}/assign", post(routes::assign_task_handler))

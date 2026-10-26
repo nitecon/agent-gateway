@@ -241,11 +241,13 @@ def main():
         directory=api('/v1/projects/alpha/task-targets')
         assert directory['targets'][0]['target']==presence['target']
         assert presence['display_name']=='Grace Hopper' and directory['targets'][0]['hostname']=='FixtureBox'
-        routed=api('/v1/projects/alpha/tasks',{'title':'Human selected a connected agent','canonical_remote':'github.com/fixture/alpha','routing':{'mode':'session','target':presence['target']}})
+        routed=api('/v1/projects/alpha/tasks',{'title':'Human selected a connected agent','requester':presence['target'],'canonical_remote':'github.com/fixture/alpha','routing':{'mode':'session','target':presence['target']}})
         event=receive_event(client,'task_created')
         assert event['task']['id']==routed['id'] and event['origin'] is None
         assert event['task']['routing']==routed['routing'] and event['task']['owner_origin']==REQUESTER
         assert routed['status']=='todo' and routed['started_at'] is None
+        assert routed['requester']==presence['target'] and event['task']['requester']==presence['target']
+        assert api('/v1/tasks/capabilities')['requester_subscriptions']==1
         ack(client,event)
         worker_presence=api('/v1/projects/alpha/task-targets',{'generation':str(uuid.uuid4()),'canonical_remote':'github.com/fixture/alpha'},origin=WORKER)
         human={'X-Agent-Id':None}
@@ -256,7 +258,8 @@ def main():
         api('/v1/projects/alpha/tasks/'+routed['id']+'/comments',{'content':'User follow-up'},headers=human)
         event=receive_event(client,'task_commented');assert event['origin'] is None;ack(client,event)
         api('/v1/projects/alpha/tasks/'+routed['id'],{'status':'done'},'PATCH',headers=human)
-        event=receive_event(client,'task_completed');assert event['origin'] is None and event['task']['owner_origin']==WORKER;ack(client,event)
+        event=receive_event(client,'task_completed');assert event['origin'] is None and event['task']['owner_origin']==WORKER
+        assert event['task']['requester']==presence['target'];ack(client,event)
         for mode in ['unassigned','broadcast']:
             queued=api('/v1/projects/alpha/tasks',{'title':'Desktop '+mode,'canonical_remote':'github.com/fixture/alpha','routing':{'mode':mode}})
             event=receive_event(client,'task_created')
@@ -287,7 +290,7 @@ def main():
         assert api('/v1/projects/alpha/tasks/'+routed['id'])['routing']==assigned['routing']
         assert api('/v1/projects/local-games/tasks/'+local_task['id'])['owner_origin']==WORKER
         assert api('/v1/projects/local-games/task-targets')['canonical_remote'] is None
-        delegation=api("/v1/projects/alpha/tasks/delegate",{"target_project_ident":"beta","title":"Incoming delegated task"},origin=REQUESTER)
+        delegation=api("/v1/projects/alpha/tasks/delegate",{"target_project_ident":"beta","title":"Incoming delegated task","requester":presence["target"]},origin=REQUESTER)
         received=[receive_event(client)];ack(client,received[-1])
         for _ in range(3):
             received.append(receive_event(client));ack(client,received[-1])
@@ -295,6 +298,8 @@ def main():
         assert received[0]["task"]["id"]==delegation["target_task"]["id"]
         assert received[0]["delegation"]["source_project_ident"]=="alpha"
         assert received[1]["task"]["kind"]=="delegated"
+        assert received[1]["task"]["requester"]==presence["target"]
+        assert received[0]["task"]["requester"] is None
         assert all(e["origin"]==REQUESTER for e in received)
         target_path=f"/v1/projects/beta/tasks/{delegation['target_task']['id']}"
         source_path=f"/v1/projects/alpha/tasks/{delegation['source_task']['id']}"
@@ -334,6 +339,7 @@ def main():
         process.terminate();process.wait(timeout=10);process=start()
         client,hello=subscribe("fixture-cmux")
         assert api(target_path)["owner_origin"]==WORKER
+        assert api(source_path)["requester"]==presence["target"]
         rejected(409,target_path,{"status":"done"},origin=REQUESTER)
         child=api(f"/v1/projects/alpha/tasks/{pending['id']}/subtasks",{"title":"Generated child"},origin=WORKER)
         event=receive_event(client,"task_created");assert event["task"]["id"]==child["id"] and event["origin"]==WORKER;ack(client,event)
@@ -354,6 +360,8 @@ def main():
         assert [e["kind"] for e in completed]==['task_completed','task_commented','task_completed']
         assert all(e["origin"]==WORKER for e in completed)
         assert completed[0]["comment"]["origin"]==REQUESTER
+        assert completed[1]["task"]["requester"]==presence["target"]
+        assert completed[2]["task"]["requester"]==presence["target"]
         assert completed[1]["comment"]["author"]=="agent-gateway" and completed[1]["comment"]["origin"]==WORKER
         assert api(source_path)["status"]=="done" and api(source_path)["comments"][-1]["origin"]==WORKER
         large=api("/v1/projects/alpha/tasks",{"title":"<script>fixture</script>","specification":("🦀\n"+TOKEN)*10000})
@@ -407,6 +415,11 @@ def main():
             assert resumed['labels']==(['os:linux','bug'] if finding_label else []) and resumed['status']=='todo',resumed
             assert resumed['routing']=={'mode':'auto'} and resumed['owner_origin'] is None
             assert resumed['owner_agent_id'] is None and resumed['started_at'] is None and resumed['done_at'] is None
+        for requester in [presence['target'], None]:
+            req=urllib.request.Request(URL+source_path+'/requester',data=json.dumps({'requester':requester}).encode(),method='PUT',
+                headers={'Cookie':cookie('admin'),'X-Gateway-UI':'1','Content-Type':'application/json'})
+            with urllib.request.urlopen(req,timeout=10) as response:
+                assert json.load(response)['requester']==requester
         print('Task-stream smoke passed:',URL,'fixture:',FIXTURE,flush=True)
         if '--hold' in sys.argv:
             print('Browser fixture login: fixture-admin / fixture-password-123 (member: fixture-member)',flush=True)

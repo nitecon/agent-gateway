@@ -245,6 +245,7 @@ fn task_json(alias: &str) -> String {
     ));
     entries.push(format!("'owner_origin',json({alias}.owner_origin_json)"));
     entries.push(format!("'routing',json({alias}.routing_json)"));
+    entries.push(format!("'requester',json({alias}.requester_json)"));
     format!("json_object({})", entries.join(","))
 }
 
