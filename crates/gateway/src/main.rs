@@ -3,6 +3,7 @@ mod channels;
 mod db;
 mod execution_history;
 mod memory_okf;
+mod migration_snapshot;
 mod projects;
 mod routes;
 mod subtasks;
@@ -882,6 +883,10 @@ async fn main() -> Result<()> {
         .route(
             "/v1/patterns/{id}/comments",
             get(routes::list_pattern_comments_handler).post(routes::add_pattern_comment_handler),
+        )
+        .route(
+            "/v1/admin/migration/snapshot",
+            get(migration_snapshot::snapshot),
         )
         .route("/v1/users", get(routes::list_users).post(routes::create_user))
         .route("/v1/users/me", get(routes::current_user))

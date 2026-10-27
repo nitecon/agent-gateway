@@ -18,7 +18,7 @@ whatsapp = []
 axum = { version = "0.8", features = ["json", "http1", "multipart", "form", "query", "ws"] }
 tokio = { version = "1", features = ["full"] }
 serenity = { version = "0.12", optional = true, default-features = false, features = ["client", "gateway", "model", "rustls_backend"] }
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled", "backup"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 dotenvy = "0.15"
@@ -26,6 +26,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.10"
 hex = "0.4"
+tempfile = "3"
+tokio-util = { version = "0.7", features = ["io"] }
 hmac = "0.12"
 tower = "0.5"
 async-trait = "0.1"

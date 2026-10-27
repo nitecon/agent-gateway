@@ -711,6 +711,26 @@ Keyboard: `g h/a/p/t/s` jumps between sections, `j`/`k` move the selection,
 Enter opens it, `r` focuses the reply box, `e` resolves, `?` shows the help
 overlay. Home, Activity, and the Inbox refresh themselves while idle.
 
+### Migration snapshot
+
+`GET /v1/admin/migration/snapshot` returns a consistent SQLite Online Backup of
+the whole application database (every record and index, including committed
+WAL pages) for the amux migration wizard. It requires
+`Authorization: Bearer $GATEWAY_API_KEY`; browser sessions get 401. The
+snapshot contains database secrets, so treat it as operator-only.
+
+The response is `application/vnd.sqlite3` with `Content-Length`,
+`Cache-Control: private, no-store` and `X-Amux-Snapshot-Sha256` (64 lowercase
+hex of the body). The file uses a rollback journal, so it is one self-contained
+database. Only one snapshot runs at a time (others get 429). The temporary copy
+is deleted when the download completes or is cancelled. The source database is
+not modified, and no `.env` or other host files are read; there are no path parameters.
+
+```sh
+curl -fsS -H "Authorization: Bearer $GATEWAY_API_KEY" -D headers.txt \
+  -o snapshot.db https://gateway.example/v1/admin/migration/snapshot
+```
+
 ---
 
 ## Multi-machine setup
