@@ -1194,6 +1194,7 @@ fn apply_schema(conn: &Connection) -> Result<()> {
     }
     crate::task_requester::initialize(conn)?;
     crate::task_targets::initialize(conn)?;
+    crate::task_reviews::initialize(conn)?;
     crate::execution_history::initialize(conn)?;
 
     conn.execute_batch(
@@ -8613,6 +8614,9 @@ fn insert_task_record(
         }
         _ => None,
     };
+    if let Some(origin) = owner_origin.as_ref() {
+        crate::task_reviews::ensure_reviewer(labels, Some(origin), None)?;
+    }
     let owner_agent_id = owner_origin.as_ref().map(|o| o.session_id.clone());
 
     let rank: i64 = conn.query_row(
@@ -9037,6 +9041,7 @@ fn assign_task_inner(
         )
         .into());
     }
+    crate::task_reviews::ensure_reviewer(&previous.labels, Some(&target.origin), None)?;
     let caller = crate::task_events::current_origin(conn)?;
     if human {
         if caller.is_some() {
@@ -9242,6 +9247,9 @@ fn update_task_inner(
         )
         .into());
     }
+    if let Some(labels) = upd.labels {
+        crate::task_reviews::preserve_metadata(&current.labels, labels)?;
+    }
     // Stored labels predate validation, so only new labels are rejected.
     let current_os = task_required_os(&current.labels).ok().flatten();
     let next_os = match upd.labels {
@@ -9301,6 +9309,13 @@ fn update_task_inner(
             "claiming agent OS does not match the task os: label",
         )
         .into());
+    }
+    if (transitioning && new_status == "in_progress") || upd.owner_agent_id.flatten().is_some() {
+        crate::task_reviews::ensure_reviewer(
+            &current.labels,
+            origin.as_ref(),
+            upd.owner_agent_id.flatten().or(actor_agent_id),
+        )?;
     }
     // Moving to another OS returns an incompatible claim to the queue; it never
     // falls back to an agent on a different OS.
@@ -9791,6 +9806,11 @@ pub fn reorder_tasks_in_column(
                 }
             }
             if target_status == "in_progress" {
+                crate::task_reviews::ensure_reviewer(
+                    &parse_labels(old_labels.clone()),
+                    origin.as_ref(),
+                    actor_agent_id,
+                )?;
                 new_origin = origin.clone();
             }
             if matches!(target_status, "todo" | "user_review") {

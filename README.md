@@ -416,6 +416,34 @@ project gains a canonical remote, its old local-only presence becomes ineligible
 until a new heartbeat supplies the matching repository. This does not add a Git
 remote to the workspace or relax remote-backed matching.
 
+#### Queued completion reviews
+
+`POST /v1/projects/:ident/tasks/:id/review` takes an empty body and uses the
+normal gateway authentication. For a completed source task it atomically
+creates or returns one ordinary review task per `(source_task_id, done_at)`.
+The response is the full task JSON (200). An unfinished source returns 409;
+review tasks (`task-review`) and delegated source tracking mirrors return 204
+to prevent recursive or duplicate cross-project reviews. Reopening a source
+blocks review creation until it is completed again, with a new completion key.
+
+The review starts as unowned TODO with auto routing, no submitting-agent claim,
+and labels `task-review`, `review-of:<source UUID>`,
+`review-exclude:<original owner session UUID>` when an owner is recorded, plus
+its source's OS requirement. Clients put these ordinary tasks through their
+normal FIFO scheduler and select a different agent. Gateway claims, board moves,
+assignment and reassignment enforce the reviewer exclusion. Agent claims need a
+native origin when an exclusion is recorded; display names cannot establish
+reviewer independence. Source/exclusion marker labels cannot be edited away.
+Other metadata edits and ordinary task retrieval continue to work.
+
+The specification points to the source and its comments and requests a read-only
+review under KISS/YAGNI. Reviewers post results on the source and review task,
+queue confirmed findings as normal tasks, then mark the review done. No legacy
+review-completion receipt is required. The server enqueues only when called;
+it does not inject review prompts or start agents. Concurrent/retried calls
+reuse the same stored review, and creation/event/mapping failures roll back
+atomically. Existing tasks and lifecycle event formats are unchanged.
+
 #### Requester result subscriptions
 
 `GET /v1/tasks/capabilities` returns `{"requester_subscriptions":1}` when the

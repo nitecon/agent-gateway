@@ -995,6 +995,10 @@ mod tests {
     fn app(state: &AppState) -> Router {
         router()
             .route(
+                "/v1/projects/{ident}/tasks/{id}/review",
+                post(crate::task_reviews::create),
+            )
+            .route(
                 "/v1/tasks/capabilities",
                 get(crate::task_requester::capabilities),
             )
@@ -1682,6 +1686,253 @@ mod tests {
                 [],
             )
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_reviews_http_enforces_independence_and_stable_completion_keys() {
+        let state = fixture(db::open(":memory:").unwrap());
+        repository_fixture(&state);
+        let author = Agent::new(&id(), "unused");
+        let peer = Agent::new(&id(), "unused");
+        for agent in [&author, &peer] {
+            assert_eq!(desktop_http(&state,ordinary_headers(agent),"POST","/v1/projects/example/task-targets",
+                json!({"generation":agent.target.generation,"canonical_remote":"github.com/acme/example"})).await.0,StatusCode::OK);
+        }
+        let (_, source) = desktop_http(
+            &state,
+            ordinary_headers(&author),
+            "POST",
+            "/v1/projects/example/tasks",
+            json!({"title":"Completed work","labels":["os:linux"]}),
+        )
+        .await;
+        let path = format!(
+            "/v1/projects/example/tasks/{}",
+            source["id"].as_str().unwrap()
+        );
+        assert_eq!(
+            desktop_http(
+                &state,
+                human_headers(),
+                "POST",
+                &format!("{path}/review"),
+                Value::Null
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            desktop_http(
+                &state,
+                ordinary_headers(&author),
+                "PATCH",
+                &path,
+                json!({"status":"done"})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let mut requests = Vec::new();
+        for _ in 0..8 {
+            let state = state.clone();
+            let endpoint = format!("{path}/review");
+            requests.push(tokio::spawn(async move {
+                desktop_http(&state, human_headers(), "POST", &endpoint, Value::Null).await
+            }));
+        }
+        let mut review = Value::Null;
+        for request in requests {
+            let (code, body) = request.await.unwrap();
+            assert_eq!(code, StatusCode::OK, "{body}");
+            if review.is_null() {
+                review = body;
+            } else {
+                assert_eq!(review["id"], body["id"]);
+            }
+        }
+        assert!(review["owner_origin"].is_null() && review["owner_agent_id"].is_null());
+        assert_eq!(review["routing"], json!({"mode":"auto"}));
+        let rp = format!(
+            "/v1/projects/example/tasks/{}",
+            review["id"].as_str().unwrap()
+        );
+        assert_eq!(
+            desktop_http(
+                &state,
+                ordinary_headers(&author),
+                "PATCH",
+                &rp,
+                json!({"status":"in_progress"})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            desktop_http(
+                &state,
+                ordinary_headers(&author),
+                "POST",
+                "/v1/projects/example/tasks/reorder?status=in_progress",
+                json!({"order":[review["id"]]})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            desktop_http(
+                &state,
+                human_headers(),
+                "POST",
+                &format!("{rp}/assign"),
+                json!({"target":author.target})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            desktop_http(
+                &state,
+                human_headers(),
+                "PATCH",
+                &rp,
+                json!({"labels":["os:linux"]})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        let mut labels = review["labels"].as_array().unwrap().clone();
+        labels.push(json!("bug"));
+        assert_eq!(
+            desktop_http(
+                &state,
+                human_headers(),
+                "PATCH",
+                &rp,
+                json!({"labels":labels})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            desktop_http(
+                &state,
+                ordinary_headers(&peer),
+                "PATCH",
+                &rp,
+                json!({"status":"in_progress"})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            desktop_http(
+                &state,
+                ordinary_headers(&peer),
+                "POST",
+                &format!("{rp}/reassign"),
+                json!({"target":author.target})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            desktop_http(
+                &state,
+                ordinary_headers(&peer),
+                "PATCH",
+                &rp,
+                json!({"status":"done"})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            desktop_http(
+                &state,
+                human_headers(),
+                "POST",
+                &format!("{rp}/review"),
+                Value::Null
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+        // Reopening removes completion eligibility, and a new completion has its own review.
+        assert_eq!(
+            desktop_http(
+                &state,
+                human_headers(),
+                "PATCH",
+                &path,
+                json!({"status":"todo"})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            desktop_http(
+                &state,
+                human_headers(),
+                "POST",
+                &format!("{path}/review"),
+                Value::Null
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            desktop_http(
+                &state,
+                human_headers(),
+                "PATCH",
+                &path,
+                json!({"status":"done"})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let (code, next) = desktop_http(
+            &state,
+            human_headers(),
+            "POST",
+            &format!("{path}/review"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{next}");
+        assert_ne!(review["id"], next["id"]);
+        let (_, delegation) = desktop_http(
+            &state,
+            ordinary_headers(&author),
+            "POST",
+            "/v1/projects/example/tasks/delegate",
+            json!({"title":"Delegated work","target_project_ident":"destination"}),
+        )
+        .await;
+        let skip = format!(
+            "/v1/projects/example/tasks/{}/review",
+            delegation["source_task"]["id"].as_str().unwrap()
+        );
+        assert_eq!(
+            desktop_http(&state, human_headers(), "POST", &skip, Value::Null)
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
     }
 
     #[tokio::test]

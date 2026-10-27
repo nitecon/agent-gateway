@@ -420,6 +420,45 @@ def main():
                 headers={'Cookie':cookie('admin'),'X-Gateway-UI':'1','Content-Type':'application/json'})
             with urllib.request.urlopen(req,timeout=10) as response:
                 assert json.load(response)['requester']==requester
+        # Completion review creation is an ordinary empty-body API, atomic across hosts.
+        from concurrent.futures import ThreadPoolExecutor
+        source=api('/v1/projects/alpha/tasks',{'title':'Reviewable work','labels':['os:linux']},origin=REQUESTER)
+        review_source=f"/v1/projects/alpha/tasks/{source['id']}"
+        rejected(409,review_source+'/review',{},method='POST')
+        rejected(401,review_source+'/review',{},method='POST',headers={'Authorization':None})
+        api(review_source,{'status':'done'},'PATCH',origin=REQUESTER)
+        before_tail=api('/v1/task-events')[0]['id']
+        with sqlite3.connect(FIXTURE/'gateway.db') as conn:
+            before_count=conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0]
+            conn.execute("CREATE TRIGGER fail_review_mapping BEFORE INSERT ON task_reviews BEGIN SELECT RAISE(ABORT,'review mapping rollback'); END")
+        rejected(500,review_source+'/review',{},method='POST')
+        assert api('/v1/task-events')[0]['id']==before_tail
+        with sqlite3.connect(FIXTURE/'gateway.db') as conn:
+            assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0]==before_count
+            conn.execute('DROP TRIGGER fail_review_mapping')
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            reviews=list(pool.map(lambda _:api(review_source+'/review',method='POST'),range(8)))
+        review=reviews[0]
+        assert all(r['id']==review['id'] for r in reviews)
+        assert review['status']=='todo' and review['owner_origin'] is None and review['owner_agent_id'] is None
+        assert review['routing']=={'mode':'auto'} and 'os:linux' in review['labels']
+        assert 'review-exclude:'+REQUESTER['session_id'] in review['labels']
+        rp=f"/v1/projects/alpha/tasks/{review['id']}"
+        rejected(409,rp,{'status':'in_progress'},origin=REQUESTER)
+        rejected(409,rp+'/assign',{'target':presence['target']},method='POST',headers={'X-Agent-Id':None})
+        rejected(409,rp,{'labels':['os:linux']},headers={'X-Agent-Id':None})
+        reviewer={**REQUESTER,'session_id':str(uuid.uuid4())}
+        api(rp,{'status':'in_progress'},'PATCH',origin=reviewer)
+        api(rp+'/comments',{'content':'Read-only review complete; no findings'},origin=reviewer)
+        api(review_source+'/comments',{'content':'Independent review complete; no findings'},origin=reviewer)
+        api(rp,{'status':'done'},'PATCH',origin=reviewer)
+        for skip in [rp,source_path]:
+            req=urllib.request.Request(URL+skip+'/review',method='POST',headers={'Authorization':'Bearer '+TOKEN})
+            with urllib.request.urlopen(req,timeout=10) as response:
+                assert response.status==204 and response.read()==b''
+        process.terminate();process.wait(timeout=10);process=start()
+        assert api(review_source+'/review',method='POST')['id']==review['id']
+        assert api(rp)['status']=='done'
         print('Task-stream smoke passed:',URL,'fixture:',FIXTURE,flush=True)
         if '--hold' in sys.argv:
             print('Browser fixture login: fixture-admin / fixture-password-123 (member: fixture-member)',flush=True)
