@@ -80,28 +80,32 @@ pub async fn snapshot(
         )
     })?;
     let database = state.db.clone();
-    let (file, path, size, digest) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let temp = tempfile::Builder::new()
-            .prefix(TEMP_PREFIX)
-            .suffix(".db")
-            .tempfile()?;
-        database
-            .lock()
-            .unwrap()
-            .backup(rusqlite::MAIN_DB, temp.path(), None)?;
-        // A rollback-journal header keeps the snapshot a single self-contained file.
-        rusqlite::Connection::open(temp.path())?.query_row(
-            "PRAGMA journal_mode=DELETE",
-            [],
-            |_| Ok(()),
-        )?;
-        let (mut file, path) = temp.into_parts();
-        let mut hasher = Sha256::new();
-        let size = std::io::copy(&mut file, &mut hasher)?;
-        file.seek(SeekFrom::Start(0))?;
-        Ok((file, path, size, hex::encode(hasher.finalize())))
-    })
-    .await??;
+    // The worker owns the permit so a cancelled request cannot admit another
+    // snapshot while this one is still preparing. It is last so an abandoned
+    // result deletes its file before releasing admission.
+    let (file, path, size, digest, permit) =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let temp = tempfile::Builder::new()
+                .prefix(TEMP_PREFIX)
+                .suffix(".db")
+                .tempfile()?;
+            database
+                .lock()
+                .unwrap()
+                .backup(rusqlite::MAIN_DB, temp.path(), None)?;
+            // A rollback-journal header keeps the snapshot a single self-contained file.
+            rusqlite::Connection::open(temp.path())?.query_row(
+                "PRAGMA journal_mode=DELETE",
+                [],
+                |_| Ok(()),
+            )?;
+            let (mut file, path) = temp.into_parts();
+            let mut hasher = Sha256::new();
+            let size = std::io::copy(&mut file, &mut hasher)?;
+            file.seek(SeekFrom::Start(0))?;
+            Ok((file, path, size, hex::encode(hasher.finalize()), permit))
+        })
+        .await??;
     let body = Snapshot {
         file: tokio::fs::File::from_std(file),
         _path: path,
@@ -304,6 +308,44 @@ mod tests {
         assert_eq!(leftover_snapshots(), before + 1);
         drop(cancelled);
         assert_eq!(leftover_snapshots(), before);
+
+        // Cancelling during preparation keeps the slot until the worker finishes.
+        let (release, locked) = std::sync::mpsc::channel::<()>();
+        let (held, wait_held) = std::sync::mpsc::channel();
+        let holder = {
+            let database = database.clone();
+            std::thread::spawn(move || {
+                let _guard = database.lock().unwrap();
+                held.send(()).unwrap();
+                locked.recv().unwrap();
+            })
+        };
+        wait_held.recv().unwrap();
+        let pending = tokio::spawn(snapshot(State(state.clone()), auth.clone()));
+        while leftover_snapshots() == before {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        let retry = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            snapshot(State(state.clone()), auth.clone()),
+        )
+        .await;
+        assert_eq!(
+            retry.expect("retry was admitted").unwrap_err().0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        while SNAPSHOTS.available_permits() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            leftover_snapshots(),
+            before,
+            "cancelled worker removes its file"
+        );
         snapshot(State(state), auth).await.unwrap();
     }
 }
